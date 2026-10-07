@@ -10,20 +10,25 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
-import shutil
 import subprocess
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 log = logging.getLogger("qqbridge.agenttools")
 
 MAX_READ_BYTES = 256 * 1024
 MAX_WRITE_BYTES = 1024 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024
+MAX_FETCH_BYTES = 512 * 1024
+DEFAULT_CMD_TIMEOUT = 15          # 秒；超时就掐，别拖住整轮
+
+ALLOWED_SCHEMES = ("http", "https")
 
 BANNED = [
     r"\bformat\b", r"\bmkfs\b", r"\bshutdown\b", r"\breboot\b",
@@ -155,7 +160,7 @@ class LocalTools:
                      "SUCCEEDED")
         return {"pattern": pattern, "matches": hits[:limit], "scanned": scanned}
 
-    def run_command(self, command: str, cwd: str = ".", timeout: int = 30) -> dict:
+    def run_command(self, command: str, cwd: str = ".", timeout: int = DEFAULT_CMD_TIMEOUT) -> dict:
         cmd = (command or "").strip()
         if not cmd:
             raise ToolError("命令不能为空。")
@@ -169,7 +174,7 @@ class LocalTools:
             proc = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", cmd],
                 cwd=str(work), capture_output=True, text=True,
-                timeout=max(1, min(int(timeout), 120)), encoding="utf-8", errors="replace",
+                timeout=max(1, min(int(timeout), 60)), encoding="utf-8", errors="replace",
             )
             out = (proc.stdout or "")[:MAX_OUTPUT_BYTES]
             err = (proc.stderr or "")[:8192]
@@ -186,6 +191,33 @@ class LocalTools:
                      "SUCCEEDED" if code == 0 else "NONZERO")
         return {"ok": code == 0, "exit_code": code, "stdout": out, "stderr": err,
                 "seconds": round(time.time() - t0, 2)}
+
+    def fetch_url(self, url: str, max_bytes: int = 200000, strip_html: bool = True) -> dict:
+        """抓一个网页/接口并返回正文。比让模型拼 curl 省好几步。"""
+        target = (url or "").strip()
+        parsed = urlparse(target)
+        if parsed.scheme not in ALLOWED_SCHEMES or not parsed.hostname:
+            self._record("fetch_url", target, {}, "DENIED", "只允许 http/https")
+            raise ToolError("只允许抓取 http/https 地址。")
+        import httpx
+        try:
+            with httpx.Client(timeout=20.0, follow_redirects=True,
+                              headers={"User-Agent": "Mozilla/5.0 (qqbridge)"}) as client:
+                resp = client.get(target)
+                raw = resp.content[: min(int(max_bytes), MAX_FETCH_BYTES)]
+                text = raw.decode(resp.encoding or "utf-8", errors="replace")
+        except Exception as exc:
+            self._record("fetch_url", target, {}, "FAILED", str(exc)[:200])
+            raise ToolError(f"抓取失败：{exc}") from None
+        if strip_html and "html" in (resp.headers.get("content-type") or ""):
+            text = re.sub(r"<script[\s\S]*?</script>", " ", text, flags=re.I)
+            text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.I)
+            text = re.sub(r"<[^>]+>", " ", text)
+            text = re.sub(r"\s{2,}", " ", text).strip()
+        self._record("fetch_url", target,
+                     {"status": resp.status_code, "bytes": len(raw)}, "SUCCEEDED")
+        return {"url": target, "status": resp.status_code, "content": text[:max_bytes],
+                "bytes": len(raw)}
 
     # ---------- 给模型看的 schema ----------
     @staticmethod
@@ -213,16 +245,32 @@ class LocalTools:
                     "pattern": {"type": "string"}, "path": {"type": "string", "default": "."},
                     "limit": {"type": "integer", "default": 50}}, "required": ["pattern"]}}},
             {"type": "function", "function": {
-                "name": "run_command", "description": "在工作区内执行 PowerShell 命令（最长 120 秒）",
+                "name": "fetch_url",
+                "description": "抓取一个 http/https 网页或 API 并返回正文（自动去 HTML 标签）。"
+                               "要查资料、看网页内容时用这个，不要用 curl 拼命令。",
+                "parameters": {"type": "object", "properties": {
+                    "url": {"type": "string"}}, "required": ["url"]}}},
+            {"type": "function", "function": {
+                "name": "run_command",
+                "description": "执行一条 PowerShell 命令（最长 60 秒，默认 15 秒）。"
+                               "仅用于本地文件/程序操作；抓网页请用 fetch_url。一次只跑一条。",
                 "parameters": {"type": "object", "properties": {
                     "command": {"type": "string"}, "cwd": {"type": "string", "default": "."},
-                    "timeout": {"type": "integer", "default": 30}}, "required": ["command"]}}},
+                    "timeout": {"type": "integer", "default": 15}}, "required": ["command"]}}},
         ]
+
+    async def dispatch_async(self, name: str, args: dict) -> dict:
+        """**异步分发**：同步工具一律丢到线程池，绝不阻塞事件循环。
+
+        历史教训：run_command 是同步 subprocess.run，直接在 async 里调用会把
+        整个服务卡住 —— 一个 21 秒的 curl 期间，HTTP 和 WebSocket 全部无响应。
+        """
+        return await asyncio.to_thread(self.dispatch, name, args)
 
     def dispatch(self, name: str, args: dict) -> dict:
         fn = {"list_dir": self.list_dir, "read_file": self.read_file,
               "write_file": self.write_file, "search_files": self.search_files,
-              "run_command": self.run_command}.get(name)
+              "run_command": self.run_command, "fetch_url": self.fetch_url}.get(name)
         if fn is None:
             raise ToolError(f"未知工具 {name}")
         try:

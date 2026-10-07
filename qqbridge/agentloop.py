@@ -12,7 +12,7 @@ from .llm import LLM, LLMError
 
 log = logging.getLogger("qqbridge.agentloop")
 
-DEFAULT_MAX_STEPS = 6
+DEFAULT_MAX_STEPS = 30      # 别用步数卡死任务；靠工具自身的超时兜底
 
 
 class AgentLoop:
@@ -64,7 +64,8 @@ class AgentLoop:
                 except ValueError:
                     args = {}
                 try:
-                    result = self.tools.dispatch(name, args)
+                    # 走 async 分发：阻塞工具在线程池里跑，不卡事件循环
+                    result = await self.tools.dispatch_async(name, args)
                     ok = True
                 except Exception as exc:
                     result = {"error": str(exc)[:300]}

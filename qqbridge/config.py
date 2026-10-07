@@ -52,7 +52,10 @@ class Config:
         self.llm_api_base = (os.environ.get("LLM_API_BASE") or "https://api.deepseek.com").rstrip("/")
         self.llm_api_key = (os.environ.get("LLM_API_KEY") or os.environ.get("DEEPSEEK_API_KEY") or "").strip()
         self.llm_model = (os.environ.get("LLM_MODEL") or "deepseek-chat").strip()
-        self.llm_max_tokens = _int("LLM_MAX_TOKENS", 1024)
+        self.llm_max_tokens = _int("LLM_MAX_TOKENS", 2048)
+        self.llm_thinking = (os.environ.get("LLM_THINKING") or "disabled").strip().lower()
+        self.llm_reasoning_effort = (os.environ.get("LLM_REASONING_EFFORT") or "").strip().lower()
+        self.llm_timeout = float((os.environ.get("LLM_TIMEOUT") or "60").strip() or 60)
         self.llm_temperature_raw = (os.environ.get("LLM_TEMPERATURE") or "1.0").strip()
         try:
             self.llm_temperature = float(self.llm_temperature_raw)
@@ -65,7 +68,7 @@ class Config:
         # 内置 Agent：允许模型读写文件、执行命令（替代外部 Agent 宿主）
         self.agent_enabled = _bool("AGENT_ENABLED", True)
         self.agent_root = (os.environ.get("AGENT_ROOT") or str(ROOT)).strip()
-        self.agent_max_steps = _int("AGENT_MAX_STEPS", 6)
+        self.agent_max_steps = _int("AGENT_MAX_STEPS", 30)
 
         raw_watch = (os.environ.get("WATCH_GROUPS") or "").strip()
         self.watch_groups = {x.strip() for x in raw_watch.replace("，", ",").split(",") if x.strip()}
@@ -121,6 +124,7 @@ class Config:
                 "has_key": bool(self.llm_api_key),
                 "max_tokens": self.llm_max_tokens,
                 "temperature": self.llm_temperature,
+                "thinking": self.llm_thinking or "default",
             },
             "system_prompt_file": self.system_prompt_file,
             "auto_reply": self.auto_reply,

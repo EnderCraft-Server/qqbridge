@@ -21,13 +21,17 @@ class LLMError(RuntimeError):
 
 class LLM:
     def __init__(self, api_base: str, api_key: str, model: str,
-                 timeout: float = 90.0, max_tokens: int = 1024, temperature: float = 1.0):
+                 timeout: float = 60.0, max_tokens: int = 2048, temperature: float = 1.0,
+                 thinking: str = "disabled", reasoning_effort: str = ""):
         self.api_base = (api_base or "").rstrip("/")
         self.api_key = api_key or ""
         self.model = model or ""
         self.timeout = timeout
         self.max_tokens = max_tokens
         self.temperature = temperature
+        # thinking=disabled 关掉思考链（省 token、省时间）；要开就设 enabled
+        self.thinking = (thinking or "").strip().lower()
+        self.reasoning_effort = (reasoning_effort or "").strip().lower()
         self.last_error = ""
         self.calls = 0
         self.prompt_tokens = 0
@@ -43,6 +47,9 @@ class LLM:
             "api_base": self.api_base,
             "model": self.model,
             "has_key": bool(self.api_key),
+            "thinking": self.thinking or "default",
+            "reasoning_effort": self.reasoning_effort or "default",
+            "timeout": self.timeout,
             "calls": self.calls,
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
@@ -74,6 +81,11 @@ class LLM:
             "temperature": self.temperature,
             "stream": False,
         }
+        # DeepSeek 的思考开关：thinking.type = enabled/disabled
+        if self.thinking in ("enabled", "disabled"):
+            body["thinking"] = {"type": self.thinking}
+        if self.reasoning_effort in ("low", "high", "max") and self.thinking != "disabled":
+            body["reasoning_effort"] = self.reasoning_effort
         if tools:
             body["tools"] = tools
         url = f"{self.api_base}/chat/completions"
