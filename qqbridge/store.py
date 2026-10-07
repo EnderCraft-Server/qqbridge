@@ -136,6 +136,15 @@ class Store:
                        (key, time.time(), json.dumps(result, ensure_ascii=False)))
 
     # ---------- durable scalars ----------
+    def max_event_id(self) -> int:
+        """Highest event id ever persisted. Used to seed the bus sequence on first run."""
+        try:
+            with self.connect() as db:
+                row = db.execute("SELECT MAX(event_id) AS m FROM messages").fetchone()
+            return int(row["m"] or 0)
+        except (sqlite3.Error, TypeError, ValueError):
+            return 0
+
     def get_state(self, key: str, default=None):
         """Read a persisted scalar. Returns default when absent or unreadable."""
         try:

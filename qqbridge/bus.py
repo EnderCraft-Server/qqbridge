@@ -23,8 +23,12 @@ class EventBus:
         # external poller (e.g. dsh-qqbridge-wake) keeps its own monotonic cursor, sees every
         # new id as "already processed", and silently stops waking anyone until it is restarted.
         self._store = store
-        self._seq_value = self._load_int("bus.seq", 0)
+        # Seed from persisted state; on the first run after an upgrade, fall back to the highest
+        # event id already in the message log so the sequence never steps backwards even once.
+        self._seq_value = max(self._load_int("bus.seq", 0), self._seed_from_history())
         self._seq = itertools.count(self._seq_value + 1)
+        if self._seq_value:
+            self._save_int("bus.seq", self._seq_value)
         self._processed = self._load_int("bus.cursor", 0)   # cursor: highest id handed to the model
         self._last_own_send = 0.0
         self.cooldown = cooldown_seconds
@@ -46,6 +50,15 @@ class EventBus:
             return max(0, int(self._store.get_state(key, default)))
         except (TypeError, ValueError):
             return default
+
+    def _seed_from_history(self) -> int:
+        """Highest event id already in the message log (0 when unavailable)."""
+        if self._store is None or not hasattr(self._store, "max_event_id"):
+            return 0
+        try:
+            return max(0, int(self._store.max_event_id()))
+        except (TypeError, ValueError):
+            return 0
 
     def _save_int(self, key: str, value: int) -> None:
         if self._store is not None:
