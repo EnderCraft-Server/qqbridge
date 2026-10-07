@@ -45,6 +45,10 @@ DEFAULTS = {
     "themes": DEFAULT_THEMES,
     "max_chars": 80,
     "history": [],
+    # 下面两项是运行状态，但必须一起持久化：load() 只接受 DEFAULTS 里的键，
+    # 少了它们就会出现「每次重启都忘记上次发过、于是立刻又发一条」。
+    "last_post_at": 0,
+    "last_text": "",
 }
 
 

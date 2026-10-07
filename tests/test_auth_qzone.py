@@ -85,7 +85,14 @@ assert "late" not in day, "深夜主题不该出现在下午:" + str(day)
 assert "late" in night, "深夜主题应当出现在夜里:" + str(night)
 q.save({"quiet_hours": [["23:30", "08:00"]]})
 assert q.in_quiet_hours(_at("02:00")) is True and q.in_quiet_hours(_at("12:00")) is False
-ok.append("QzoneAuto: 到点判定/生成/发送/静默时段/主题时间窗/落库 全部正确")
+# 关键回归：last_post_at 必须能跨重启读回来，否则每次重启都会立刻再发一条
+q.save({"enabled": True, "mode": "interval", "interval_hours": 12, "min_gap_hours": 4,
+        "quiet_hours": [], "last_post_at": time.time()})
+q2 = QzoneAuto(tmp / "qzone.json", FakeLLM(), FakeBot())
+assert q2.cfg.get("last_post_at"), "重启后 last_post_at 丢了，会立刻重复发说说"
+assert q2.due() is False, "刚发过、min_gap 内，重启后不应立刻再发"
+assert q2.status()["posted"] == 1, "历史也要读得回来"
+ok.append("QzoneAuto: 到点判定/生成/发送/静默时段/主题时间窗/落库/重启不重复发 全部正确")
 
 # ---- 路由（不跑 lifespan，避免连 OneBot）----
 tmp2 = tmp / "app"; tmp2.mkdir()
