@@ -312,7 +312,7 @@ def create_app() -> FastAPI:
                    else __import__("pathlib").Path(config.system_prompt_file))
     if not prompt_path.is_absolute():
         prompt_path = config.data_dir.parent / config.system_prompt_file
-    agent = QqAgent(llm, load_system_prompt(prompt_path, DEFAULT_SYSTEM))
+    agent = QqAgent(llm, load_system_prompt(prompt_path, DEFAULT_SYSTEM), store=store)
     local_tools = LocalTools(Path(config.agent_root) if config.agent_root else config.ROOT, store)
     agent_loop = AgentLoop(llm, local_tools, max_steps=config.agent_max_steps, store=store)
     bot = OneBot(config.http, config.ws, config.token, config.ws_token)

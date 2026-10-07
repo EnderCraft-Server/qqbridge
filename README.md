@@ -103,6 +103,22 @@ SYSTEM_PROMPT_FILE=data/system_prompt.md # 人格文件，改完热加载
 
 调用统计（次数 / tokens）在控制台的「模型」卡片里实时显示。
 
+### 输出解析与安全兜底
+
+模型被要求以 JSON 回复。解析按五档处理，**任何一档都不会把原始 JSON 发进群**：
+
+| how | 场景 | 行为 |
+|---|---|---|
+| `ok` | 直接是合法 JSON | 正常取 reply |
+| `fenced` | 被 ```json 包裹 | 剥壳后取 reply |
+| `embedded` | JSON 前后夹了别的话 | 抠出第一个 `{...}` 块 |
+| `plain` | 本来就是一句人话 | 当纯文本发 |
+| `failed` | **看着像 JSON 但坏了（截断/畸形）** | **改判沉默**，并写审计 `decide_parse_failed` |
+
+> 这条兜底是踩过坑加的：带 reasoning 的模型会把推理 token 也算进 `max_tokens`，
+> JSON 被截断时，早期版本会把整段 `{"reply": ...}` 原样发到群里。
+> 现在遇到 `failed` 一律闭嘴。用 reasoning 模型时建议 `LLM_MAX_TOKENS>=2048`。
+
 ## 配置
 
 见 `.env.example`。关键项：

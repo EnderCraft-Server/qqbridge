@@ -50,8 +50,9 @@ class History:
 
 
 class QqAgent:
-    def __init__(self, llm: LLM, system_prompt: str = "", history_size: int = 30):
+    def __init__(self, llm: LLM, system_prompt: str = "", history_size: int = 30, store=None):
         self.llm = llm
+        self.store = store
         self.system_prompt = system_prompt or DEFAULT_SYSTEM
         self.histories: dict[str, History] = {}
         self.history_size = history_size
@@ -113,26 +114,90 @@ class QqAgent:
         ]
         self.decisions += 1
         out = await self.llm.chat(messages)
-        raw = out["text"] or "{}"
-        # 容忍模型包了 markdown 代码块
-        if raw.startswith("```"):
-            raw = raw.strip("`").strip()
-            if raw.lower().startswith("json"):
-                raw = raw[4:].strip()
-        try:
-            data = json.loads(raw)
-        except ValueError:
-            # 解析失败：把原文当回复，但截断防刷屏
-            data = {"reply": raw.splitlines()[0][:200] if raw else "", "reason": "解析失败，按原文发送"}
+        raw = out["text"] or ""
+        data, how = parse_decision(raw)
 
         reply = (data.get("reply") or "").strip()
         if len(reply) > 500:
             reply = reply[:500]
+        # 解析异常时宁可不说话，也绝不把 JSON/推理内容发进群
+        if how == "failed" and reply:
+            log.warning("decide: JSON 解析失败，改判沉默。原文前 200 字：%s", raw[:200])
+            if self.store:
+                try:
+                    self.store.audit("auto", "decide_parse_failed", key,
+                                     {"raw": raw[:400]}, "SKIPPED")
+                except Exception:
+                    pass
+            reply = ""
+        data["_how"] = how
         if reply:
             self.replies += 1
         else:
             self.silences += 1
-        return {"reply": reply, "reason": str(data.get("reason") or "")[:200], "key": key}
+        reason = str(data.get("reason") or "")[:200]
+        if how != "ok":
+            reason = f"[{how}] " + reason
+        return {"reply": reply, "reason": reason, "key": key, "parse": how}
+
+
+def parse_decision(raw: str) -> tuple[dict, str]:
+    """把模型输出解析成 {reply, reason}。
+
+    返回 (data, how)，how 取值：
+      ok       直接就是合法 JSON
+      fenced   剥掉 markdown 代码块后是合法 JSON
+      embedded 从文本里抠出第一个 {...} 后解析成功
+      plain    不是 JSON，当纯文本回复
+      failed   看着像 JSON 但解析不了 —— 调用方必须改判沉默，绝不能发出去
+    """
+    text = (raw or "").strip()
+    if not text:
+        return {"reply": "", "reason": ""}, "ok"
+
+    def try_load(candidate: str):
+        try:
+            obj = json.loads(candidate)
+            return obj if isinstance(obj, dict) else None
+        except ValueError:
+            return None
+
+    obj = try_load(text)
+    if obj is not None:
+        return obj, "ok"
+
+    stripped = text
+    if stripped.startswith("```"):
+        stripped = stripped.strip("`").strip()
+        if stripped[:4].lower() == "json":
+            stripped = stripped[4:].strip()
+        obj = try_load(stripped)
+        if obj is not None:
+            return obj, "fenced"
+
+    # 从文本里抠第一个大括号块（模型偶尔会在 JSON 前后加话）
+    start = stripped.find("{")
+    if start >= 0:
+        depth, end = 0, -1
+        for idx in range(start, len(stripped)):
+            ch = stripped[idx]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = idx
+                    break
+        if end > start:
+            obj = try_load(stripped[start:end + 1])
+            if obj is not None:
+                return obj, "embedded"
+
+    # 到这里说明没解析出 JSON。区分「本来就是纯文本」和「像 JSON 但坏了」
+    looks_like_json = stripped[:1] in ("{", "[") or '"reply"' in stripped
+    if looks_like_json:
+        return {"reply": "", "reason": "JSON 解析失败"}, "failed"
+    return {"reply": stripped.splitlines()[0][:200], "reason": "纯文本回复"}, "plain"
 
 
 def load_system_prompt(path: Path, fallback: str = "") -> str:
