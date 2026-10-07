@@ -68,6 +68,41 @@ class Store:
             ).fetchall()
         return [dict(r) for r in reversed(rows)]
 
+    def recent_events(self, limit: int = 200) -> list:
+        """最近的消息（跨群），按 event_id 升序，形状和 EventBus 里的记录一致。
+
+        给启动回填用：进程重启后环形缓冲是空的，控制台会显示「暂无消息」，
+        看起来像机器人没在收消息 —— 其实库里全都有，只是没灌回去。
+        """
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM messages WHERE event_id IS NOT NULL"
+                " ORDER BY event_id DESC LIMIT ?", (int(limit),)).fetchall()
+        out = []
+        for row in reversed(rows):
+            d = dict(row)
+            try:
+                segments = json.loads(d.get("segments") or "[]")
+            except ValueError:
+                segments = []
+            out.append({
+                "id": d.get("event_id") or 0,
+                "at": d.get("at") or 0.0,
+                "platform": "qq",
+                "message_type": "group",
+                "group_id": str(d.get("group_id") or ""),
+                "user_id": str(d.get("user_id") or ""),
+                "sender": d.get("sender") or "",
+                "role": "",
+                "message_id": str(d.get("message_id") or ""),
+                "text": d.get("text") or "",
+                "segments": segments,
+                "is_self": bool(d.get("is_self")),
+                "mentions_me": bool(d.get("mentions_me")),
+                "keyword_hit": None,
+            })
+        return out
+
     def search(self, query: str, group_id: str = "", limit: int = 20) -> list:
         sql = "SELECT * FROM messages WHERE text LIKE ?"
         args = [f"%{query}%"]

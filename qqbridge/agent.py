@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from collections import deque
 from pathlib import Path
@@ -88,6 +89,87 @@ class QqAgent:
             "silences": self.silences,
             "system_prompt_chars": len(self.system_prompt),
         }
+
+    async def decide_batch(self, batch: list[dict], *, fresh_from: int = 0) -> dict:
+        """**整段**判断：把最近一段对话交给模型，让它决定要不要插一句。
+
+        和按条 decide() 的根本区别：看的是「这一段」，不是「这一条」。
+        人就是这个节奏 —— 隔一会儿扫一眼，判断整段值不值得接，
+        而不是被每一条消息牵着回一句。这比逐条调 engagement 靠谱得多。
+
+        fresh_from 之前的消息只是上下文（已经看过的），之后的是这次新冒出来的。
+
+        只负责「闲聊要不要接、接什么」。**不判断有没有活要干** ——
+        那件事由 autoreply 直接分派给内置 Agent，不掺和到这里来：
+        Agent 是多步带工具的东西，让它在批量闲聊的 JSON 里捎带决定，
+        既是两套逻辑搅在一起，也容易把该干的活降级成一句敷衍。
+
+        返回 {reply, reason, key, parse, fresh, mention}。
+        """
+        if not self.llm.configured:
+            raise LLMError("模型未配置。")
+
+        key = (batch[-1].get("group_id") or "?") if batch else "?"
+
+        lines = []
+        fresh_count = 0
+        fresh_mention = False
+        for ev in batch:
+            who = "我" if ev.get("is_self") else (ev.get("sender") or ev.get("user_id") or "?")
+            text = render_text(ev)
+            is_fresh = ev.get("id", 0) > fresh_from
+            if is_fresh:
+                fresh_count += 1
+                if ev.get("mentions_me"):
+                    fresh_mention = True
+            lines.append(("[新] " if is_fresh else "    ") + f"{who}：{text}")
+
+        hint = (
+            "上面是你上次看群之后，群里新冒出来的一段（带 [新] 标记的那几行），"
+            "前面没标记的是你已经在场看过的上下文，用来看懂在聊什么。\n\n"
+            "你现在刚拿起手机扫了一眼。\n"
+            "- 有人 @ 你、或者点了你的名字 —— **必须回一句**。\n"
+            "- 除此之外，**大多数时候你什么都不想说**。只有这段里真有让你想插一句的东西"
+            "（有梗、能怼、你懂行、有话接）才回。\n"
+            "- 只是「冒泡」「打卡」「早」「在吗」这种刷存在感的、或者单独一个「。」「？」「6」，一律不接。\n"
+            "- 回就回一句，别逐条点评、别总结、别复述。\n"
+            "- 不想说就留空 reply —— 这是最常见的正确答案。"
+        )
+        if fresh_count > 0 and not fresh_mention:
+            hint += "\n\n（这一段里没有人 @ 你。）"
+
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": "以下是这个群最近的对话：\n" + "\n".join(lines)},
+            {"role": "user", "content":
+                hint + '\n\n以 JSON 回复：{"reply": "要发的话", "reason": "一句理由"}。只输出 JSON。'},
+        ]
+        self.decisions += 1
+        out = await self.llm.chat(messages)
+        raw = out.get("text") or ""
+        data, how = parse_decision(raw)
+        reply, reason = "", ""
+        if how == "failed":
+            log.warning("decide_batch: 输出解析失败，改判沉默。原文前 200 字：%s", raw[:200])
+            if self.store:
+                try:
+                    self.store.audit("auto", "decide_parse_failed", key, {"raw": raw[:400]}, "SKIPPED")
+                except Exception:
+                    pass
+        else:
+            reply = (data.get("reply") or "").strip()
+            reason = str(data.get("reason") or "")[:200]
+            reply, _ = clean_reply(json.dumps({"reply": reply}, ensure_ascii=False))
+        if len(reply) > 800:
+            reply = reply[:800]
+        if reply:
+            self.replies += 1
+        else:
+            self.silences += 1
+        if how != "ok":
+            reason = f"[{how}] " + reason
+        return {"reply": reply, "reason": reason, "key": key,
+                "parse": how, "fresh": fresh_count, "mention": fresh_mention}
 
     async def decide(self, ev: dict, *, force: bool = False) -> dict:
         """让模型决定这条要不要接。返回 {reply, reason}。"""
@@ -200,6 +282,48 @@ def parse_decision(raw: str) -> tuple[dict, str]:
     if looks_like_json:
         return {"reply": "", "reason": "JSON 解析失败"}, "failed"
     return {"reply": tidy_plain(stripped), "reason": "纯文本回复"}, "plain"
+
+
+CQ_LABEL = [
+    (re.compile(r"\[CQ:image,[^\]]*\]"), "[图片]"),
+    (re.compile(r"\[CQ:face,[^\]]*\]"), "[表情]"),
+    (re.compile(r"\[CQ:record,[^\]]*\]"), "[语音]"),
+    (re.compile(r"\[CQ:video,[^\]]*\]"), "[视频]"),
+    (re.compile(r"\[CQ:at,qq=(\d+)[^\]]*\]"), r"@\1"),
+    (re.compile(r"\[CQ:reply,[^\]]*\]"), ""),
+    (re.compile(r"\[CQ:[^\]]*\]"), ""),
+]
+
+
+def render_text(ev: dict) -> str:
+    """把一条消息渲染成给模型看的文本。
+
+    优先用已经解析好的 segments —— 图片、表情只留个标记，
+    别把一长串 CQ 码塞进上下文，既费 token 又干扰判断。
+    没有 segments 时退回对 raw_message 做替换。
+    """
+    parts: list[str] = []
+    for seg in ev.get("segments") or []:
+        kind = seg.get("type")
+        if kind == "text":
+            parts.append(seg.get("text") or "")
+        elif kind == "image":
+            parts.append("[图片]")
+        elif kind == "at":
+            parts.append("@" + str(seg.get("qq") or ""))
+        elif kind == "face":
+            parts.append("[表情]")
+        elif kind == "record":
+            parts.append("[语音]")
+        elif kind == "video":
+            parts.append("[视频]")
+    text = "".join(parts).strip()
+    if not text:
+        text = ev.get("text") or ""
+        for pat, rep in CQ_LABEL:
+            text = pat.sub(rep, text)
+        text = text.strip()
+    return (text or "[非文字内容]").replace("\n", " ")[:300]
 
 
 def tidy_plain(text: str) -> str:
