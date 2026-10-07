@@ -21,11 +21,13 @@ log = logging.getLogger("qqbridge.autoreply")
 
 class AutoReply:
     def __init__(self, bus, store, agent, bot, control, *, enabled: bool = True,
-                 idle_seconds: float = 1.5, max_per_minute: int = 8, agent_loop=None):
+                 idle_seconds: float = 1.5, max_per_minute: int = 8, agent_loop=None,
+                 agent_timeout: float = 90.0):
         self.bus = bus
         self.store = store
         self.agent = agent
         self.agent_loop = agent_loop
+        self.agent_timeout = agent_timeout
         self.bot = bot
         self.control = control
         self.enabled = enabled
@@ -116,9 +118,12 @@ class AutoReply:
         """agent 模式：把消息交给内置 Agent（带文件/命令工具）。"""
         key = ev.get("group_id") or ev.get("user_id") or "?"
         who = ev.get("sender") or ev.get("user_id")
+        mentioned = bool(ev.get("mentions_me"))
         task = (
             f"群 {ev.get('group_id') or '私聊'} · {who}：{ev.get('text') or ''}\n\n"
-            "有活就干，干完回一句。没活就随便回一句。只输出要发到群里的那句话。"
+            + ("【这条直接 @ 了你，必须回一句话，不能空】\n" if mentioned else "")
+            + "有活就干（用工具办），干完回一句；没活就直接回一句。\n"
+            "无论如何都要给出那句要发到群里的话 —— 留空只在完全无话可说时才允许。"
         )
         system = (self.agent.system_prompt or "") + (
             "\n\n【覆盖上面的 JSON 格式要求】不要输出 JSON，直接说人话。\n"
@@ -132,15 +137,30 @@ class AutoReply:
             "调研类任务最多查 2~3 次就给结论，别死磕。回话要短。"
         )
         try:
-            out = await self.agent_loop.run(system, task)
-            # 双保险：即使模型仍吐了 JSON，也在发送前净化成一句话
+            # 整体超时：agent 再能干也不能把整轮拖死
+            out = await asyncio.wait_for(self.agent_loop.run(system, task),
+                                         timeout=self.agent_timeout)
             reply, how = clean_reply(out.get("text") or "")
             if how == "failed":
                 log.warning("agent 模式：输出解析失败，改判沉默")
+        except asyncio.TimeoutError:
+            self.errors += 1
+            log.warning("agent 模式超时（%.0fs），本轮放弃", self.agent_timeout)
+            reply = ""
         except Exception as exc:
             self.errors += 1
             log.warning("agent mode failed: %s", exc)
             reply = ""
+        # agent 没给出话（超时/报错/沉默）时，回退到闲聊模式兜底 ——
+        # 尤其被 @ 时不能因为工具链出问题就彻底不吭声
+        if not reply:
+            try:
+                fallback = await self.agent.decide(ev)
+                reply = fallback.get("reply") or ""
+                if reply:
+                    log.info("agent 模式无输出，已回退 chat 兜底")
+            except Exception:
+                log.exception("agent fallback failed")
         self.agent.decisions += 1
         if reply:
             self.agent.replies += 1

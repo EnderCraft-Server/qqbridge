@@ -653,12 +653,34 @@ def _ingest(event: dict, bus: EventBus, store: Store, control: "Control" = None)
                 return
             try:
                 control.set_agent_mode(sw, actor=sender, reason=raw.strip()[:80])
+                if control.paused():
+                    control.set("auto", actor=sender, reason="随模式切换自动恢复")
                 _reply(control, gid, "已切到 " + sw + " 模式"
                        + ("（只响应管理员，可调用文件/命令工具）" if sw == "agent" else "（群友闲聊）"))
                 log.info("switch: %s -> %s by %s", raw.strip()[:30], sw, sender)
             except Exception as exc:
                 _reply(control, gid, "切换失败：" + str(exc)[:120])
             return
+
+        # 自然语言切换：「使用agent模式执行：xxx」/「使用chat模式执行」
+        natural = commands.parse_natural_switch(raw)
+        if natural:
+            mode, rest = natural
+            gid = event.get("group_id") or event.get("user_id")
+            if sender not in config.admins:
+                _reply(control, gid, "只有管理员能切换模式。")
+                return
+            control.set_agent_mode(mode, actor=sender, reason=raw.strip()[:80])
+            if control.paused():
+                control.set("auto", actor=sender, reason="随模式切换自动恢复")
+            _reply(control, gid, "已切到 " + mode + " 模式"
+                   + ("（只响应管理员，可调用文件/命令工具）" if mode == "agent" else "（群友闲聊）"))
+            if rest:
+                # 带指令的切换：把剩下的内容当成一条待派发的消息
+                event = {**event, "raw_message": rest, "message": rest}
+                log.info("natural switch: %s + 派发 %r", mode, rest[:40])
+            else:
+                return
 
         target = commands.parse(raw)
         if target:
