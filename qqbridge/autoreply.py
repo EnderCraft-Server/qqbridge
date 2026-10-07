@@ -168,6 +168,32 @@ class AutoReply:
             self.agent.silences += 1
         return {"reply": reply[:800], "reason": "agent 模式", "key": key}
 
+    FORCED_FALLBACK = "在，你说。"
+
+    async def _forced_reply(self, ev: dict) -> str:
+        """被 @ 时的硬兜底：模型没给话就再问一次，只要一句人话。
+        再不行用固定短句 —— 被点名还不吭声，用户只会觉得机器人死了。"""
+        who = ev.get("sender") or ev.get("user_id") or "有人"
+        key = ev.get("group_id") or ev.get("user_id") or "?"
+        try:
+            hist = self.agent.history(key).messages()[-10:]
+            out = await asyncio.wait_for(self.agent.llm.chat([
+                {"role": "system", "content": self.agent.system_prompt},
+                *hist,
+                {"role": "user", "content":
+                    f"【系统】{who} 刚刚 @ 了你，内容是：「{ev.get('text') or ''}」。\n"
+                    "直接说你要发到群里的那一句话。不要 JSON、不要解释、不要引号，一句就够。"},
+            ]), timeout=self.agent_timeout)
+            text = clean_reply(out.get("text") or "")[0] or (out.get("text") or "")
+            text = text.strip().strip('"').strip()
+            if text:
+                log.info("@ 兜底回复：%s", text[:50])
+                return text[:200]
+        except Exception as exc:
+            log.warning("@ 兜底回复失败：%s", exc)
+        log.info("@ 兜底也没问出话，用固定短句")
+        return self.FORCED_FALLBACK
+
     async def _tick(self):
         if not self.agent or not self.agent.llm.configured:
             return
@@ -211,6 +237,13 @@ class AutoReply:
             reply, how = clean_reply(reply)
             if not reply:
                 log.warning("发送前净化：输出被判定为不可发送（%s），改判沉默", how)
+        # 被 @ 就必须有回音。模型沉默、解析失败、超时、agent 链路报错，
+        # 统统走兜底 —— 被点名还不吭声，用户只会以为机器人死了。
+        if not reply and ev.get("mentions_me"):
+            reply = await self._forced_reply(ev)
+            decided["reason"] = ((decided.get("reason") or "") + " ← @ 兜底").strip()
+            self.agent.replies += 1
+            self.agent.silences = max(0, self.agent.silences - 1)
         if reply:
             gid = ev.get("group_id") or ev.get("user_id") or ""
             try:
