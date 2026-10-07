@@ -209,13 +209,13 @@
           <button id="save-sched" style="margin-top:16px">保存</button>
         </div>
         <div class="card">
-          <h2>行为模式</h2>
-          <div class="sub">群里发 <code>/switch agent</code> 或 <code>/switch chat</code> 也能切（仅管理员）</div>
-          <div class="row">
-            <button class="ghost" data-agent="chat">chat 群友闲聊</button>
-            <button class="ghost" data-agent="agent">agent 只认管理员 + 调工具</button>
+          <h2>接话规则（全自动）</h2>
+          <div class="sub">不需要手动切模式，按发送者自动分流</div>
+          <div class="hint">
+            <b>管理员</b> → 走 agent 路径：AI 自己判断是闲聊还是派活，<b>能读写文件、执行命令</b><br>
+            <b>其他人</b> → 走 chat 路径：只聊天，不碰文件<br>
+            被 @ 的消息优先处理，且不受每分钟上限限制。
           </div>
-          <div class="hint" id="agent-hint">—</div>
         </div>
         <div class="card">
           <h2>运行开关</h2><div class="sub">群里发 /stop /start /auto 也能切（仅管理员）</div>
@@ -338,11 +338,9 @@ async function refresh() {
     $("c-ws").innerHTML = '<i class="dot ' + (s.bot.ws_connected ? "on" : "off") + '"></i>' + (s.bot.ws_connected ? "QQ 已连接" : "QQ 断开");
     const modeCls = ctl.mode === "auto" ? "on" : "off";
     $("c-mode").innerHTML = '<i class="dot ' + modeCls + '"></i>' + esc(ctl.mode || "auto");
-    $("c-auto").textContent = (ctl.agent_mode === "agent" ? "agent 模式" : "chat 模式");
+    $("c-auto").textContent = "全自动分流";
     $("mode-hint").textContent = ctl.paused ? ("已暂停（由 " + (ctl.by || "?") + " 触发：" + (ctl.reason || "") + "）") : "运行中";
-    $("agent-hint").textContent = ctl.agent_mode === "agent"
-      ? "只响应管理员，可读写文件、执行命令（每一步都记日志）"
-      : "群友闲聊：所有人都能聊，模型不会碰文件";
+
 
     $("stats").innerHTML = [
       ["队列总量", b.stored, ""], ["待处理 @我", b.pending_high, b.pending_high ? "hi" : ""],
@@ -413,8 +411,6 @@ $("save-prompt").onclick = () => save(() => api("/api/prompt", { method: "POST",
 document.querySelectorAll("[data-set]").forEach((x) => x.onclick = () => { $("interval").value = x.dataset.set; });
 document.querySelectorAll("[data-mode]").forEach((x) => x.onclick = () => save(() =>
   api("/api/control", { method: "POST", body: JSON.stringify({ mode: x.dataset.mode }) }), "已切换：" + x.dataset.mode));
-document.querySelectorAll("[data-agent]").forEach((x) => x.onclick = () => save(() =>
-  api("/api/control", { method: "POST", body: JSON.stringify({ agent_mode: x.dataset.agent }) }), "已切换：" + x.dataset.agent + " 模式"));
 
 async function loadPrompt() {
   try { const r = await api("/api/prompt");

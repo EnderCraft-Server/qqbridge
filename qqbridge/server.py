@@ -372,6 +372,13 @@ def create_app() -> FastAPI:
         _MAIN_LOOP = asyncio.get_running_loop()
         _BOT = bot
         await bot.start(on_event=lambda ev: _ingest(ev, bus, store, control))
+        # 关键：OneBot 启动后才拿得到自己的 QQ 号。bus 没有 self_id 的话，
+        # mentions_me 永远判 False —— @ 消息就进不了高优先级队列。
+        if bot.self_id:
+            bus.self_id = str(bot.self_id)
+            log.info("bus.self_id = %s（@ 判定已启用）", bus.self_id)
+        else:
+            log.warning("拿不到 self_id，@ 消息将无法识别")
         await sched.start()
         await autoreply.start()
         app.state.session_task = asyncio.create_task(_run_manager())
@@ -641,53 +648,18 @@ def _ingest(event: dict, bus: EventBus, store: Store, control: "Control" = None)
         raw = event.get("raw_message") or ""
         sender = str(event.get("user_id") or "")
 
-        # /switch agent | /switch chat
-        sw = commands.parse_switch(raw)
-        if sw:
-            gid = event.get("group_id") or event.get("user_id")
-            if sender not in config.admins:
-                _reply(control, gid, "只有管理员能切换模式。")
-                return
-            if sw == "?":
-                _reply(control, gid, "用法：/switch agent 只听管理员并允许调工具；/switch chat 恢复群友闲聊")
-                return
-            try:
-                control.set_agent_mode(sw, actor=sender, reason=raw.strip()[:80])
-                if control.paused():
-                    control.set("auto", actor=sender, reason="随模式切换自动恢复")
-                _reply(control, gid, "已切到 " + sw + " 模式"
-                       + ("（只响应管理员，可调用文件/命令工具）" if sw == "agent" else "（群友闲聊）"))
-                log.info("switch: %s -> %s by %s", raw.strip()[:30], sw, sender)
-            except Exception as exc:
-                _reply(control, gid, "切换失败：" + str(exc)[:120])
-            return
-
-        # 自然语言切换：「使用agent模式执行：xxx」/「使用chat模式执行」
-        natural = commands.parse_natural_switch(raw)
-        if natural:
-            mode, rest = natural
-            gid = event.get("group_id") or event.get("user_id")
-            if sender not in config.admins:
-                _reply(control, gid, "只有管理员能切换模式。")
-                return
-            control.set_agent_mode(mode, actor=sender, reason=raw.strip()[:80])
-            if control.paused():
-                control.set("auto", actor=sender, reason="随模式切换自动恢复")
-            _reply(control, gid, "已切到 " + mode + " 模式"
-                   + ("（只响应管理员，可调用文件/命令工具）" if mode == "agent" else "（群友闲聊）"))
-            if rest:
-                # 带指令的切换：把剩下的内容当成一条待派发的消息
-                event = {**event, "raw_message": rest, "message": rest}
-                log.info("natural switch: %s + 派发 %r", mode, rest[:40])
-            else:
-                return
-
+        # 运行开关：/stop 与 /auto（带明确回执）
         target = commands.parse(raw)
         if target:
-            if sender in config.admins:
-                control.set(target, actor=sender, reason=raw.strip()[:80])
-                log.info("control: %s -> %s by %s", raw.strip()[:20], target, sender)
-                return              # 命令本身不入库、不入队
+            gid = event.get("group_id") or event.get("user_id")
+            if sender not in config.admins:
+                _reply(control, gid, "只有管理员能切换运行状态。")
+                return
+            control.set(target, actor=sender, reason=raw.strip()[:80])
+            _reply(control, gid, commands.reply_for(target))
+            log.info("control: %s -> %s by %s", raw.strip()[:20], target, sender)
+            return                  # 命令本身不入库、不入队
+
     record = bus.push(event)
     if record:
         try:
