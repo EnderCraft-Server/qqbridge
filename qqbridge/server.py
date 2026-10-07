@@ -372,6 +372,8 @@ def create_app() -> FastAPI:
     app.state.local_tools = local_tools
     app.state.auth = auth
     app.state.qzone = qzone
+    app.state.sched = sched
+    app.state.control = control
 
     @app.on_event("startup")
     async def _startup():

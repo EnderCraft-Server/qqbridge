@@ -37,6 +37,11 @@ class Scheduler:
         self.turns: list[dict] = []
         self._task = None
         self._stop = asyncio.Event()
+        # 设置一改就戳一下，让循环立刻按新间隔重新排期。
+        # 否则把间隔从 300 秒改成 10 秒，用户还得再等最多 300 秒才看到变化，
+        # 表现就是「控制台改了没用」。
+        self._wake = asyncio.Event()
+        self._dirty = True
         self.load()
 
     # ---------- settings ----------
@@ -58,7 +63,10 @@ class Scheduler:
                     self.settings[k] = v
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.settings, ensure_ascii=False, indent=1), encoding="utf-8")
-        self.next_run = time.time() + float(self.settings["interval_seconds"])
+        interval = max(5.0, float(self.settings.get("interval_seconds") or 60))
+        self.next_run = time.time() + interval
+        self._dirty = True
+        self._wake.set()          # 唤醒循环，让改动马上生效
         return self.settings
 
     # ---------- quiet hours ----------
@@ -112,14 +120,22 @@ class Scheduler:
             except (TypeError, ValueError):
                 interval = 60.0
             interval = max(5.0, interval)
-            self.next_run = time.time() + interval
 
-            # sleep, but wake early if asked to stop
-            spent = 0.0
-            while spent < interval and not self._stop.is_set():
-                step = min(1.0, interval - spent)
-                await asyncio.sleep(step)
-                spent += step
+            # 刚改过设置（或刚启动）就立刻跑一轮，不等满一个周期
+            wait = 0.0 if self._dirty else interval
+            self._dirty = False
+            self.next_run = time.time() + wait
+
+            if wait > 0:
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=wait)
+                    self._wake.clear()
+                    self._dirty = True      # 设置变了，用新间隔重新排期
+                    continue
+                except asyncio.TimeoutError:
+                    pass
+                except asyncio.CancelledError:
+                    raise
             if self._stop.is_set():
                 break
 
