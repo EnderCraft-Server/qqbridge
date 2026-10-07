@@ -115,27 +115,22 @@ class QqAgent:
         self.decisions += 1
         out = await self.llm.chat(messages)
         raw = out["text"] or ""
-        data, how = parse_decision(raw)
-
-        reply = (data.get("reply") or "").strip()
+        reply, how = clean_reply(raw)
         if len(reply) > 500:
             reply = reply[:500]
-        # 解析异常时宁可不说话，也绝不把 JSON/推理内容发进群
-        if how == "failed" and reply:
-            log.warning("decide: JSON 解析失败，改判沉默。原文前 200 字：%s", raw[:200])
+        if how == "failed":
+            log.warning("decide: 输出解析失败，改判沉默。原文前 200 字：%s", raw[:200])
             if self.store:
                 try:
                     self.store.audit("auto", "decide_parse_failed", key,
                                      {"raw": raw[:400]}, "SKIPPED")
                 except Exception:
                     pass
-            reply = ""
-        data["_how"] = how
         if reply:
             self.replies += 1
         else:
             self.silences += 1
-        reason = str(data.get("reason") or "")[:200]
+        reason = str((parse_decision(raw)[0].get("reason") if how in ("ok", "fenced", "embedded") else "") or "")[:200]
         if how != "ok":
             reason = f"[{how}] " + reason
         return {"reply": reply, "reason": reason, "key": key, "parse": how}
@@ -198,6 +193,25 @@ def parse_decision(raw: str) -> tuple[dict, str]:
     if looks_like_json:
         return {"reply": "", "reason": "JSON 解析失败"}, "failed"
     return {"reply": stripped.splitlines()[0][:200], "reason": "纯文本回复"}, "plain"
+
+
+def clean_reply(raw: str) -> tuple[str, str]:
+    """发送前的最后一道净化：保证进群的永远是一句人话，不会是 JSON。
+
+    不管是 chat 模式还是 agent 模式，模型都可能吐 JSON —— 前者因为提示词要求，
+    后者因为复用了同一份提示词。这里统一兜住。
+
+    返回 (要发送的文本, 判定结果)。判定为 failed 时文本为空 = 沉默。
+    """
+    text, how = parse_decision(raw)
+    if how == "ok":
+        return (text.get("reply") or "").strip(), how
+    if how in ("fenced", "embedded"):
+        return (text.get("reply") or "").strip(), how
+    if how == "plain":
+        return (text.get("reply") or "").strip(), how
+    # failed：像 JSON 但解析不了 —— 宁可沉默
+    return "", how
 
 
 def load_system_prompt(path: Path, fallback: str = "") -> str:

@@ -13,6 +13,7 @@ import asyncio
 import logging
 import time
 
+from .agent import clean_reply
 from .config import config
 
 log = logging.getLogger("qqbridge.autoreply")
@@ -122,12 +123,17 @@ class AutoReply:
             "直接给出要发到群里的那句话（可以引用做事的结果），不要输出过程、不要客套。"
         )
         system = (self.agent.system_prompt or "") + (
-            "\n\n你可以调用工具读写文件、执行命令。不知道就先看一眼再动手。"
-            "做完只回一句人话，别写报告。"
+            "\n\n【以下覆盖上面所有格式要求】这次不要输出 JSON，不要输出 {\"reply\": ...}。"
+            "你有一条消息要发到 QQ 群里，直接用大白话把它说出来就行。\n"
+            "你可以调用工具读写文件、执行命令；不知道就先看一眼再动手。"
+            "做完只回那一句要发的话，别写报告、别列步骤、别解释。"
         )
         try:
             out = await self.agent_loop.run(system, task)
-            reply = (out.get("text") or "").strip()
+            # 双保险：即使模型仍吐了 JSON，也在发送前净化成一句话
+            reply, how = clean_reply(out.get("text") or "")
+            if how == "failed":
+                log.warning("agent 模式：输出解析失败，改判沉默")
         except Exception as exc:
             self.errors += 1
             log.warning("agent mode failed: %s", exc)
@@ -172,6 +178,12 @@ class AutoReply:
 
         # 无论接不接，这条都算处理过
         through = ev["id"]
+        # 最后一道防线：发送前再净化一次。无论哪个模式、哪条路径产出的 reply，
+        # 只要它看起来是 JSON，就在这里被拆掉或改判沉默。
+        if reply:
+            reply, how = clean_reply(reply)
+            if not reply:
+                log.warning("发送前净化：输出被判定为不可发送（%s），改判沉默", how)
         if reply:
             gid = ev.get("group_id") or ev.get("user_id") or ""
             try:
