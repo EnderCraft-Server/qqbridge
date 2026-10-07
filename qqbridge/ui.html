@@ -692,7 +692,11 @@ async function refresh() {
     $("c-ws").innerHTML = '<i class="dot ' + (s.bot.ws_connected ? "on" : "off") + '"></i>' + (s.bot.ws_connected ? "QQ 已连接" : "QQ 断开");
     const modeCls = ctl.mode === "auto" ? "on" : "off";
     $("c-mode").innerHTML = '<i class="dot ' + modeCls + '"></i>' + esc(ctl.mode || "auto");
-    $("c-auto").textContent = "全自动分流";
+    // 别写死：关掉自动接话时这里也得跟着变，否则用户以为还在自动说话
+    $("c-auto").textContent = s.config.auto_reply
+      ? (ctl.paused ? "自动接话已暂停" : "自动接话中")
+      : "自动接话已关闭";
+    $("c-auto").style.color = (s.config.auto_reply && !ctl.paused) ? "" : "var(--bad)";
     $("mode-hint").textContent = ctl.paused ? ("已暂停（由 " + (ctl.by || "?") + " 触发：" + (ctl.reason || "") + "）") : "运行中";
 
 
@@ -794,7 +798,8 @@ async function loadGroups(refresh = 0) {
     groupCache = (r.groups || []).map((g) => ({ ...g, sel: r.watch_all ? true : !!g.watched }));
     renderGroups();
   } catch (e) {
-    $("watch-list").innerHTML = '<div class="empty">读取群列表失败：' + esc(e.message) + '</div>';
+    $("watch-list").innerHTML = '<div class="empty">读取群列表失败：' + esc(e.message) +
+      '<br>如果提示 404 / Not Found，说明 qqbridge 还是改动前启动的旧进程，重启一下就好。</div>';
   }
 }
 
