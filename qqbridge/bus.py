@@ -145,6 +145,93 @@ class EventBus:
         with self._lock:
             self._last_own_send = time.time()
 
+    def backfill(self, records: list) -> int:
+        """启动时把库里的历史消息灌回环形缓冲，让控制台一开机就有东西看。
+
+        重启后缓冲是空的，控制台显示「暂无消息」，看着像机器人没在收消息 ——
+        其实库里一条不少，只是没灌回来。
+
+        两种记录都收：
+          id <= cursor  已经处理过的，照常展示
+          id >  cursor  上次没来得及处理的（正好在关机前那一下），**只展示、不补回**
+        —— 重启后去回一条几小时前的消息，比漏掉它更奇怪。
+        所以顺手把游标推过去，避免 autoreply 把它们当新消息重新回一遍。
+
+        群过滤条件和 push 保持一致，否则控制台会看到实时路径永远看不到的群。
+        """
+        added: list = []
+        unprocessed = 0
+        with self._lock:
+            have = {e["id"] for e in self._events}
+            for rec in sorted(records, key=lambda r: r.get("id") or 0):
+                eid = int(rec.get("id") or 0)
+                if eid <= 0 or eid in have:
+                    continue
+                gid = str(rec.get("group_id") or "")
+                if self.watch_groups and gid not in self.watch_groups \
+                        and rec.get("message_type") == "group":
+                    continue
+                if eid > self._processed:
+                    unprocessed += 1
+                added.append(rec)
+                have.add(eid)
+            if added:
+                # 必须整体重排：新事件可能已经先进了缓冲，
+                # 直接 append 历史会变成 [新, 旧, 旧…]，控制台里顺序全乱。
+                merged = sorted(list(self._events) + added, key=lambda r: r.get("id") or 0)
+                self._events.clear()
+                self._events.extend(merged[-self._events.maxlen:])
+            newest = max(have) if have else 0
+            if newest > self._processed:
+                self._processed = newest
+                self._save_int("bus.cursor", newest)
+                # 和 mark_processed 一样顺手把队列里过期的清掉，
+                # 否则 pending() 还会把游标之后已经作废的 id 报出来
+                self._pending_high = [i for i in self._pending_high if i > newest]
+                self._pending_mid = [i for i in self._pending_mid if i > newest]
+                self._pending_low = [i for i in self._pending_low if i > newest]
+        if added:
+            log.info("启动回填 %d 条历史消息到控制台缓冲%s", len(added),
+                     f"，其中 {unprocessed} 条是上次没处理完的（只展示、不补回）"
+                     if unprocessed else "")
+        return len(added)
+
+    # ---------- 批量视图（接话循环用这个，不再按条取） ----------
+    def unseen(self, limit: int = 200) -> list:
+        """上次「看过」之后新来的消息，按 id 升序。
+
+        这是接话循环唯一的时间线：一次拿到一整段，而不是一条一条地取。
+        不包含自己的发言 —— 自己说的不用回。
+        """
+        with self._lock:
+            cut = self._processed
+            return [e for e in self._events if e["id"] > cut and not e["is_self"]][:limit]
+
+    def context(self, limit: int = 40) -> list:
+        """给模型看的上下文：最近 limit 条（**含自己说过的话**），按 id 升序。
+
+        只看「新消息」是不够的 —— 得知道在聊什么，才知道这句要不要接。
+        """
+        with self._lock:
+            return list(self._events)[-limit:]
+
+    def mark_looked(self, through_id: int) -> int:
+        """整段处理完之后推进「已看过」标记。
+
+        和 mark_processed 的区别在语义：批处理模式下，标记之内 = 都喂给模型看过了，
+        所以不存在「跳读」，也就不该报 skip 警告。
+        调用点只有一个：_tick 处理完这一整批之后，推进到这批的最后一条。
+        推进位置永远等于「模型真的看过的那条」，不可能越过没看过的消息。
+        """
+        through_id = int(through_id)
+        with self._lock:
+            self._processed = max(self._processed, through_id)
+            self._pending_high = [i for i in self._pending_high if i > through_id]
+            self._pending_mid = [i for i in self._pending_mid if i > through_id]
+            self._pending_low = [i for i in self._pending_low if i > through_id]
+            self._save_int("bus.cursor", self._processed)
+            return self._processed
+
     # ---------- read ----------
     def _get(self, event_id: int) -> dict | None:
         for rec in self._events:

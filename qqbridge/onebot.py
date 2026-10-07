@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 
 import httpx
 import websockets
@@ -78,15 +79,24 @@ class OneBot:
 
     # ---------- WebSocket ----------
     async def _ws_loop(self):
+        """常驻事件流。三条纪律：
+
+        1. connected 必须随时反映真实状态 —— 控制台右上角的「QQ 已连接」是排查
+           「收不到消息」的第一入口，它撒谎的话后面全是白费功夫。
+        2. 每次重连之前都要睡一下。原来正常断开（服务端主动关）走的是 async for
+           自然结束那条路，不经过 except，于是不 sleep 直接重连：
+           对方要是「接了立刻关」，这里就成了死循环猛敲对面。
+        3. 退避只有连着活得够久才重置，否则短连接会把退避重置成 1 秒，同样等于没有。
+        """
         backoff = 1.0
         headers = self._ws_headers()
         while not self._stop.is_set():
+            started = time.monotonic()
             try:
                 async with websockets.connect(
                     self.ws, additional_headers=headers, ping_interval=20, ping_timeout=20
                 ) as sock:
                     self.connected = True
-                    backoff = 1.0
                     log.info("event stream connected: %s", self.ws)
                     async for raw in sock:
                         try:
@@ -99,14 +109,20 @@ class OneBot:
                                 self.on_event(event)
                             except Exception:
                                 log.exception("event handler failed")
+                log.warning("event stream closed by peer; reconnect in %.0fs", backoff)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.connected = False
                 log.warning("event stream lost (%s); retry in %.0fs", exc, backoff)
-                try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=backoff)
-                except asyncio.TimeoutError:
-                    pass
-                backoff = min(backoff * 2, 30.0)
+            finally:
+                self.connected = False
+
+            # 活过 30 秒才算「连上了」，短命连接继续按退避往上翻
+            if time.monotonic() - started > 30.0:
+                backoff = 1.0
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=backoff)
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(backoff * 2, 30.0)
         self.connected = False

@@ -380,6 +380,12 @@ def create_app() -> FastAPI:
         global _MAIN_LOOP, _BOT
         _MAIN_LOOP = asyncio.get_running_loop()
         _BOT = bot
+        # 先回填再开工：反过来的话，WS 循环可能已经塞进来几条，
+        # 回填把游标推过去之后就留下几条没人管的僵尸 pending。
+        try:
+            bus.backfill(store.recent_events(config.ring_size))
+        except Exception:
+            log.exception("启动回填历史消息失败（控制台会从空列表开始）")
         await bot.start(on_event=lambda ev: _ingest(ev, bus, store, control))
         # 关键：OneBot 启动后才拿得到自己的 QQ 号。bus 没有 self_id 的话，
         # mentions_me 永远判 False —— @ 消息就进不了高优先级队列。
