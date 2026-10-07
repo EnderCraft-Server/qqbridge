@@ -317,8 +317,13 @@ def create_app() -> FastAPI:
                 "user_id": e["user_id"], "sender": e["sender"], "text": e["text"],
                 "mentions_me": e["mentions_me"], "keyword_hit": e.get("keyword_hit"),
             })
+        # The advertised cursor must only cover events we actually delivered. Taking the max
+        # over the raw id>cursor set instead would skip past filtered-out events (our own
+        # messages, other groups' traffic) and silently drop real messages the caller never saw.
+        # When nothing is delivered we do not advance, so the caller re-polls cheaply.
+        delivered = max((e["id"] for e in out), default=None)
         return {"events": out, "count": len(out),
-                "cursor": max([e["id"] for e in events], default=cursor),
+                "cursor": cursor if delivered is None else delivered,
                 "empty": not out}
 
     @app.get("/api/audit")
