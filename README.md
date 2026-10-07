@@ -1,4 +1,4 @@
-﻿# qqbridge
+# qqbridge
 
 QQ ↔ MCP 桥：把 QQ 群聊接进 Agent，**没有消息时不产生任何模型调用**。
 
@@ -128,6 +128,40 @@ SYSTEM_PROMPT_FILE=data/system_prompt.md # 人格文件，改完热加载
 
 **安全用法**：只用服务器返回的 cursor；判断"有没有新消息"用 `list_pending` 或
 `/api/events`，不要只看 `poll_events` 的空返回；发现游标跳跃立刻停止。
+
+## 内置 Agent（替代外部宿主）
+
+bot 自己能读写文件、执行命令 —— 不需要在电脑上另外常开一个 Agent 宿主。
+
+```dotenv
+AGENT_ENABLED=true      # 关掉则只有聊天，没有文件/命令能力
+AGENT_ROOT=             # 操作根目录，越界一律拒绝；留空=仓库根目录
+AGENT_MAX_STEPS=6       # 单次任务最多几步工具调用
+```
+
+可用工具：`list_dir` `read_file` `write_file` `search_files` `run_command`
+
+### 每一次读写都留痕
+
+**所有读取与写入逐行记录到 `data/agent.log`**（JSON Lines），同时写入 SQLite 审计表：
+
+```json
+{"at":"2026-10-07 17:52:07","action":"write_file","target":"...\\data\\x.txt","detail":{"bytes":12},"state":"SUCCEEDED"}
+{"at":"2026-10-07 17:52:08","action":"run_command","target":"format C: /y","detail":{},"state":"DENIED","result":"命中危险命令黑名单"}
+```
+
+外部 MCP 客户端也能调用它：`agent_run(task=\"...\")` 派活、`agent_log(limit=40)` 看读写记录。
+
+### 安全边界
+
+| 约束 | 行为 |
+|---|---|
+| 路径越界 | 直接拒绝（`只允许操作 <AGENT_ROOT> 之内的路径`） |
+| 单次读 | ≤ 256 KB |
+| 单次写 | ≤ 1 MB |
+| 命令超时 | ≤ 120 秒 |
+| 危险命令 | 黑名单拦截（format / mkfs / shutdown / rm -rf / 等），记 `DENIED` |
+| 调用方 | `agent_run` 仅限 `ADMIN_IDS` |
 
 ## 控制台
 

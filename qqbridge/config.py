@@ -62,6 +62,10 @@ class Config:
         self.system_prompt_file = (os.environ.get("SYSTEM_PROMPT_FILE") or "data/system_prompt.md").strip()
         # 是否让 bot 自己决定接话（关掉则只做 MCP 工具，不主动发言）
         self.auto_reply = _bool("AUTO_REPLY", True)
+        # 内置 Agent：允许模型读写文件、执行命令（替代外部 Agent 宿主）
+        self.agent_enabled = _bool("AGENT_ENABLED", True)
+        self.agent_root = (os.environ.get("AGENT_ROOT") or str(ROOT)).strip()
+        self.agent_max_steps = _int("AGENT_MAX_STEPS", 6)
 
         raw_watch = (os.environ.get("WATCH_GROUPS") or "").strip()
         self.watch_groups = {x.strip() for x in raw_watch.replace("，", ",").split(",") if x.strip()}
@@ -120,6 +124,11 @@ class Config:
             },
             "system_prompt_file": self.system_prompt_file,
             "auto_reply": self.auto_reply,
+            "agent": {
+                "enabled": self.agent_enabled,
+                "root": self.agent_root,
+                "max_steps": self.agent_max_steps,
+            },
         }
 
 

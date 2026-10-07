@@ -1,4 +1,4 @@
-﻿"""In-memory event bus with a ring buffer and trigger rules.
+"""In-memory event bus with a ring buffer and trigger rules.
 
 The whole point: the model never waits. Events accumulate here (cheap, no model
 cost) and the agent pulls whatever is pending whenever it happens to run.

@@ -1,4 +1,4 @@
-﻿# QQ 桥 (qqbridge) — 自研 OneBot + MCP
+# QQ 桥 (qqbridge) — 自研 OneBot + MCP
 
 替代 Tulpa 的最小可用实现：直接吃 SnowLuma 的 OneBot v11 接口，
 把 QQ 常用能力包成 MCP 工具，**并且不用 wait 阻塞循环**。

@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 import uvicorn
@@ -22,6 +23,8 @@ from .bus import EventBus
 from .config import config
 from .onebot import OneBot
 from .agent import QqAgent, load_system_prompt, DEFAULT_SYSTEM
+from .agentloop import AgentLoop
+from .agenttools import LocalTools
 from .autoreply import AutoReply
 from .control import Control
 from .llm import LLM
@@ -255,6 +258,31 @@ def build_tools(box: Toolbox, rules: Rules, sched: Scheduler):
                      target_uin: str = "", **kw):
         return await box.qzone_comment(actor, tid, content, idempotency_key, target_uin)
 
+    @tool("agent_run", "让内置 Agent 执行一个任务（可读写文件、跑命令）。所有读写都记日志。",
+          {"type": "object", "properties": {
+              "actor": {"type": "string"},
+              "task": {"type": "string", "description": "要它做什么，说清楚目标和范围"},
+              "max_steps": {"type": "integer", "default": 6}},
+           "required": ["actor", "task"], "additionalProperties": False})
+    async def _agent_run(actor: str, task: str, max_steps: int = 6, **kw):
+        if str(actor) not in config.admins:
+            raise Denied(f"{actor} 不是管理员，不能用内置 Agent。")
+        if not config.agent_enabled:
+            raise Denied("AGENT_ENABLED=false，内置 Agent 未启用。")
+        if max_steps and int(max_steps) != agent_loop.max_steps:
+            agent_loop.max_steps = max(1, min(int(max_steps), 20))
+        system = agent.system_prompt + "\n\n你还可以使用工具读写文件、执行命令。改动前先看清楚目标。"
+        return await agent_loop.run(system, task)
+
+    @tool("agent_log", "查看内置 Agent 的文件读写/命令执行日志。", {"type": "object",
+          "properties": {"limit": {"type": "integer", "default": 40}}, "additionalProperties": False})
+    async def _agent_log(limit: int = 40, **kw):
+        p = local_tools.log_path
+        if not p.is_file():
+            return {"lines": [], "note": "还没有记录"}
+        rows = p.read_text(encoding="utf-8", errors="replace").splitlines()
+        return {"lines": rows[-max(1, min(int(limit), 200)):], "total": len(rows)}
+
     @tool("audit_tail", "查看最近的操作审计记录。", {"type": "object",
           "properties": {"limit": {"type": "integer", "default": 30}}, "additionalProperties": False})
     async def _audit(limit: int = 30, **kw):
@@ -279,6 +307,8 @@ def create_app() -> FastAPI:
     if not prompt_path.is_absolute():
         prompt_path = config.data_dir.parent / config.system_prompt_file
     agent = QqAgent(llm, load_system_prompt(prompt_path, DEFAULT_SYSTEM))
+    local_tools = LocalTools(Path(config.agent_root) if config.agent_root else config.ROOT, store)
+    agent_loop = AgentLoop(llm, local_tools, max_steps=config.agent_max_steps, store=store)
     bot = OneBot(config.http, config.ws, config.token, config.ws_token)
     autoreply = AutoReply(bus, store, agent, bot, control, enabled=config.auto_reply)
     box = Toolbox(bot, bus, store)
@@ -324,6 +354,8 @@ def create_app() -> FastAPI:
     app.state.llm = llm
     app.state.agent = agent
     app.state.autoreply = autoreply
+    app.state.agent_loop = agent_loop
+    app.state.local_tools = local_tools
 
     @app.on_event("startup")
     async def _startup():
@@ -370,6 +402,7 @@ def create_app() -> FastAPI:
             "llm": llm.describe(),
             "agent": agent.status(),
             "autoreply": autoreply.status(),
+            "agent_loop": agent_loop.status(),
         }
 
     @app.get("/api/events")
