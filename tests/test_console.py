@@ -11,13 +11,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import qqbridge.config as cfgmod
 from qqbridge.config import config
 
+# 真实的 .env 必须先拍张快照。这套测试会调用 persist_permissions()，
+# 只要它认错了根目录，就会把 api_base=example.com 之类的测试值写进仓库配置，
+# 上一次就是这么把线上机器人的模型地址冲掉、让它彻底不说话的。
+REAL_ENV = Path(__file__).resolve().parent.parent / ".env"
+REAL_ENV_BEFORE = REAL_ENV.read_bytes() if REAL_ENV.is_file() else None
+
 tmp = Path(tempfile.mkdtemp(prefix="qqbridge_console_"))
-# 关键：persist_permissions() 用的是模块级的 ROOT，只改 config.ROOT 是拦不住的，
-# 会把测试值写进仓库里真实的 .env（这个坑我自己先踩了一次）。
-cfgmod.ROOT = tmp
+# 只改实例级 ROOT。故意不去动模块级 ROOT —— 万一 persist_permissions()
+# 又改回读模块变量，下面的快照断言会立刻炸出来，而不是悄悄污染真实配置。
 config.ROOT = tmp
 config.data_dir = tmp / "data"         # 和真实布局一致：ROOT/data/，prompt 路径才落在临时目录里
 config.data_dir.mkdir(parents=True, exist_ok=True)
@@ -130,13 +134,12 @@ assert c.post("/api/auth/login", json={"username": "admin", "password": "newpw12
 assert c.post("/api/auth/password", json={"old": "错的", "new": "another12345"}).status_code == 400
 ok.append("后台账号：改密码后旧会话失效、旧密码登不上、新密码可用")
 
-# ---------- 10. 真实 .env 没被测试污染 ----------
-real_env = Path(__file__).resolve().parent.parent / ".env"
-if real_env.is_file():
-    txt = real_env.read_text(encoding="utf-8")
-    assert "WATCH_GROUPS=111,222" not in txt, "测试污染了真实 .env！"
-    assert "1060667115" in txt and "111,222" not in txt, "真实 .env 的监控群被改掉了"
-ok.append("测试全程没有污染仓库里真实的 .env")
+# ---------- 10. 真实 .env 一个字节都不能变 ----------
+real_after = REAL_ENV.read_bytes() if REAL_ENV.is_file() else None
+assert real_after == REAL_ENV_BEFORE, (
+    "测试改动了仓库里真实的 .env！这会把线上机器人的模型地址 / 监控范围冲掉。"
+    "检查 persist_permissions() 是不是又去读模块级 ROOT 了。")
+ok.append("测试全程没有动仓库里真实的 .env（逐字节比对）")
 
 # ---------- 11. 改巡检间隔要立刻生效，不能等满旧周期 ----------
 import asyncio, time

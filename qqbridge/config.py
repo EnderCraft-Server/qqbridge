@@ -34,6 +34,10 @@ def owners() -> set:
 
 class Config:
     def __init__(self):
+        # 实例级根目录。persist_permissions() 曾经直接用模块级 ROOT，
+        # 结果测试里改 config.ROOT 拦不住它，把测试值写进了仓库真实的 .env。
+        # 现在只认 self.ROOT，改一处就够。
+        self.ROOT = ROOT
         self.http = (os.environ.get("ONEBOT_HTTP") or "http://127.0.0.1:3000").rstrip("/")
         self.ws = (os.environ.get("ONEBOT_WS") or "ws://127.0.0.1:3001").strip()
         self.token = (os.environ.get("ONEBOT_TOKEN") or "").strip()
@@ -76,7 +80,7 @@ class Config:
 
     def persist_permissions(self):
         """Write the safety switches back to .env so they survive a restart."""
-        path = ROOT / ".env"
+        path = Path(getattr(self, "ROOT", ROOT)) / ".env"
         try:
             lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
         except OSError:
