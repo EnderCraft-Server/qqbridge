@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from mcp.server.lowlevel import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
@@ -25,9 +25,11 @@ from .onebot import OneBot
 from .agent import QqAgent, load_system_prompt, DEFAULT_SYSTEM
 from .agentloop import AgentLoop
 from .agenttools import LocalTools
+from .auth import AGREEMENT_VERSION, EULA, TERMS, Auth
 from .autoreply import AutoReply
 from .control import Control
 from .llm import LLM
+from .qzone_auto import QzoneAuto
 from .rules import Rules
 from . import commands
 from .scheduler import Scheduler
@@ -318,6 +320,8 @@ def create_app() -> FastAPI:
     local_tools = LocalTools(Path(config.agent_root) if config.agent_root else config.ROOT, store)
     agent_loop = AgentLoop(llm, local_tools, max_steps=config.agent_max_steps, store=store)
     bot = OneBot(config.http, config.ws, config.token, config.ws_token)
+    auth = Auth(config.data_dir / "auth.json")
+    qzone = QzoneAuto(config.data_dir / "qzone.json", llm, bot, store)
     autoreply = AutoReply(bus, store, agent, bot, control, enabled=config.auto_reply,
                           agent_loop=agent_loop)
     box = Toolbox(bot, bus, store)
@@ -365,6 +369,8 @@ def create_app() -> FastAPI:
     app.state.autoreply = autoreply
     app.state.agent_loop = agent_loop
     app.state.local_tools = local_tools
+    app.state.auth = auth
+    app.state.qzone = qzone
 
     @app.on_event("startup")
     async def _startup():
@@ -381,10 +387,12 @@ def create_app() -> FastAPI:
             log.warning("拿不到 self_id，@ 消息将无法识别")
         await sched.start()
         await autoreply.start()
+        await qzone.start()
         app.state.session_task = asyncio.create_task(_run_manager())
 
     @app.on_event("shutdown")
     async def _shutdown():
+        await qzone.stop()
         await autoreply.stop()
         await sched.stop()
         await bot.stop()
@@ -404,10 +412,106 @@ def create_app() -> FastAPI:
     async def ui_page():
         return HTMLResponse(UI.read_text(encoding="utf-8"))
 
+    COOKIE = "qqbridge_session"
+
     def _ui_auth(request: Request):
-        token = request.headers.get("x-bridge-token") or request.query_params.get("token")
-        if token != config.mcp_token:
-            raise __import__("fastapi").HTTPException(401, "unauthorized")
+        """控制台接口的鉴权：优先登录态 cookie，其次兼容 mcp_token（脚本自动化）。"""
+        hdr = request.headers.get("x-bridge-token")
+        if hdr and config.mcp_token and hdr == config.mcp_token:
+            return
+        token = request.cookies.get(COOKIE) or request.query_params.get("session") or ""
+        if auth.check(token):
+            return
+        raise HTTPException(401, "未登录或登录已过期")
+
+    # ---------- 登录 / 协议 ----------
+    def _set_session(response: Response, token: str):
+        response.set_cookie(COOKIE, token, max_age=7 * 24 * 3600, httponly=True,
+                            samesite="lax", path="/")
+
+    @app.get("/api/auth/state")
+    async def auth_state(request: Request):
+        token = request.cookies.get(COOKIE) or request.query_params.get("session") or ""
+        st = auth.state()
+        st["logged_in"] = auth.check(token)
+        return st
+
+    @app.get("/api/auth/agreements")
+    async def auth_agreements():
+        return {"version": AGREEMENT_VERSION, "terms": TERMS, "eula": EULA}
+
+    @app.post("/api/auth/accept")
+    async def auth_accept(request: Request, response: Response):
+        """首次进入：勾选同意协议 + 设置后台账号密码。"""
+        body = await request.json()
+        if not body.get("agreed"):
+            raise HTTPException(400, "需要先同意《使用须知》与《最终用户许可协议》")
+        user = str(body.get("username") or "")
+        pwd = str(body.get("password") or "")
+        try:
+            auth.accept(user, pwd)          # 记录协议同意 + 建账号
+            token = auth.login(user, pwd)   # 随即建立登录态
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        _set_session(response, token)
+        store.audit("gui", "auth_init", auth.data.get("username", ""),
+                    {"agreement": AGREEMENT_VERSION}, "SUCCEEDED")
+        return {"ok": True, "username": auth.data.get("username", "")}
+
+    @app.post("/api/auth/login")
+    async def auth_login(request: Request, response: Response):
+        body = await request.json()
+        try:
+            token = auth.login(str(body.get("username") or ""), str(body.get("password") or ""))
+        except ValueError as exc:
+            store.audit("gui", "auth_login", str(body.get("username") or ""), {}, "DENIED")
+            raise HTTPException(401, str(exc))
+        _set_session(response, token)
+        store.audit("gui", "auth_login", auth.data.get("username", ""), {}, "SUCCEEDED")
+        return {"ok": True, "username": auth.data.get("username", "")}
+
+    @app.post("/api/auth/logout")
+    async def auth_logout(request: Request, response: Response):
+        auth.logout(request.cookies.get(COOKIE) or "")
+        response.delete_cookie(COOKIE, path="/")
+        return {"ok": True}
+
+    @app.post("/api/auth/password")
+    async def auth_password(request: Request):
+        _ui_auth(request)
+        body = await request.json()
+        try:
+            auth.change_password(str(body.get("old") or ""), str(body.get("new") or ""))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        store.audit("gui", "auth_password", auth.data.get("username", ""), {}, "SUCCEEDED")
+        return {"ok": True}
+
+    @app.get("/api/qzone")
+    async def api_qzone(request: Request):
+        _ui_auth(request)
+        return qzone.status()
+
+    @app.post("/api/qzone")
+    async def api_qzone_set(request: Request):
+        _ui_auth(request)
+        patch = await request.json()
+        qzone.save(patch)
+        store.audit("gui", "set_qzone", "qzone", {k: v for k, v in patch.items() if k != "history"},
+                    "SUCCEEDED")
+        return qzone.status()
+
+    @app.post("/api/qzone/post")
+    async def api_qzone_post(request: Request):
+        """立刻发一条（用于测试主题与口吻）。"""
+        _ui_auth(request)
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+        out = await qzone.post_once(force_theme=str(body.get("theme") or ""))
+        return out
 
     @app.get("/api/state")
     async def api_state(request: Request):
@@ -422,6 +526,8 @@ def create_app() -> FastAPI:
             "agent": agent.status(),
             "autoreply": autoreply.status(),
             "agent_loop": agent_loop.status(),
+            "qzone": qzone.brief(),
+            "auth": auth.state(),
         }
 
     @app.get("/api/events")
