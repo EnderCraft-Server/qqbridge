@@ -98,8 +98,15 @@ class QqAgent:
         hist = self.history(key)
         # 当前这条已由 observe 写入历史；再拼一条指令
         ctx = hist.messages()[-self.history_size:]
-        hint = "有人 @ 了你，必须回一句。" if ev.get("mentions_me") else \
-               ("这条命中了你想跟的话题。" if ev.get("keyword_hit") else "群里有新消息。")
+        # 默认应该是沉默：没点名、没命中关键词、也没人问你的时候，
+        # 明确告诉模型「不必每条都接，挑你真正想说的那条」，它才会真的挑。
+        if ev.get("mentions_me"):
+            hint = "有人 @ 了你，必须回一句。"
+        elif ev.get("keyword_hit"):
+            hint = "这条命中了你想跟的话题。真有意思就接，只是撞词就留空。"
+        else:
+            hint = ("群里有新消息。**没意思就留空，不必每条都接** —— "
+                    "挑你真正想说的那条回，想不到说什么就沉默。")
         if force:
             hint += "（群主点名让你说话）"
 
@@ -109,7 +116,7 @@ class QqAgent:
             {"role": "user", "content": (
                 f"【系统】{hint}\n"
                 "以 JSON 回复：{\"reply\": \"要发的话\", \"reason\": \"简短理由\"}。"
-                "不想说话就把 reply 留空。只输出 JSON。"
+                "不想说话就把 reply 留空 —— 这很常见，别勉强凑话。只输出 JSON。"
             )},
         ]
         self.decisions += 1
