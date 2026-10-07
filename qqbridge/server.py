@@ -306,7 +306,9 @@ def create_app() -> FastAPI:
     bus.control = control
     sched = Scheduler(config.data_dir / "scheduler.json", bus, store)
     llm = LLM(config.llm_api_base, config.llm_api_key, config.llm_model,
-              max_tokens=config.llm_max_tokens, temperature=config.llm_temperature)
+              max_tokens=config.llm_max_tokens, temperature=config.llm_temperature,
+              thinking=config.llm_thinking, reasoning_effort=config.llm_reasoning_effort,
+              timeout=config.llm_timeout)
     prompt_path = (config.data_dir.parent / config.system_prompt_file
                    if not config.system_prompt_file.startswith("/")
                    else __import__("pathlib").Path(config.system_prompt_file))

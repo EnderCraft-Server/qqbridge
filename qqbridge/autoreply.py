@@ -117,16 +117,19 @@ class AutoReply:
         key = ev.get("group_id") or ev.get("user_id") or "?"
         who = ev.get("sender") or ev.get("user_id")
         task = (
-            f"来自 QQ 群 {ev.get('group_id') or '私聊'} 的消息，发送者 {who}（uid {ev.get('user_id')}）：\n"
-            f"{ev.get('text') or ''}\n\n"
-            "判断：如果这是在派活，就用工具办好并简短汇报；如果只是闲聊，就正常回一句。\n"
-            "直接给出要发到群里的那句话（可以引用做事的结果），不要输出过程、不要客套。"
+            f"群 {ev.get('group_id') or '私聊'} · {who}：{ev.get('text') or ''}\n\n"
+            "有活就干，干完回一句。没活就随便回一句。只输出要发到群里的那句话。"
         )
         system = (self.agent.system_prompt or "") + (
-            "\n\n【以下覆盖上面所有格式要求】这次不要输出 JSON，不要输出 {\"reply\": ...}。"
-            "你有一条消息要发到 QQ 群里，直接用大白话把它说出来就行。\n"
-            "你可以调用工具读写文件、执行命令；不知道就先看一眼再动手。"
-            "做完只回那一句要发的话，别写报告、别列步骤、别解释。"
+            "\n\n【覆盖上面的 JSON 格式要求】不要输出 JSON，直接说人话。\n"
+            "工具（一次选对，别反复试）：\n"
+            "  fetch_url(url)         查网页/API —— 要上网就用这个，不要拼 curl\n"
+            "  read_file(path)        读文件\n"
+            "  write_file(path,content) 写文件\n"
+            "  list_dir(path)         列目录\n"
+            "  search_files(pattern)  按文件名找\n"
+            "  run_command(cmd)       跑本地命令（仅本地文件/程序，别用来上网）\n"
+            "调研类任务最多查 2~3 次就给结论，别死磕。回话要短。"
         )
         try:
             out = await self.agent_loop.run(system, task)
