@@ -22,7 +22,7 @@ log = logging.getLogger("qqbridge.autoreply")
 class AutoReply:
     def __init__(self, bus, store, agent, bot, control, *, enabled: bool = True,
                  idle_seconds: float = 1.5, max_per_minute: int = 8, agent_loop=None,
-                 agent_timeout: float = 90.0, settle_seconds: float = 6.0,
+                 agent_timeout: float = 90.0, settle_seconds: float = 3.0,
                  max_batch_age: float = 45.0, batch_limit: int = 200,
                  context_size: int = 40):
         self.bus = bus
