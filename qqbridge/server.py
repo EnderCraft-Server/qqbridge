@@ -470,6 +470,15 @@ def create_app() -> FastAPI:
         store.audit("gui", "set_prompt", str(prompt_path), {"chars": len(text)}, "SUCCEEDED")
         return {"prompt": agent.system_prompt, "chars": len(agent.system_prompt)}
 
+    @app.get("/api/agent_log")
+    async def api_agent_log(request: Request, limit: int = 30):
+        _ui_auth(request)
+        p = local_tools.log_path
+        if not p.is_file():
+            return {"lines": [], "total": 0}
+        rows = p.read_text(encoding="utf-8", errors="replace").splitlines()
+        return {"lines": rows[-max(1, min(int(limit), 200)):], "total": len(rows)}
+
     @app.post("/api/llm")
     async def api_llm(request: Request):
         _ui_auth(request)

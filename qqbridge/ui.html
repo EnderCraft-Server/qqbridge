@@ -6,196 +6,275 @@
 <title>qqbridge</title>
 <style>
   :root{
-    --bg:#0b0d12; --card:#151922; --line:#232837; --line2:#2d3345;
-    --fg:#e8ecf4; --dim:#7f8899; --dim2:#5b6478;
-    --ok:#34d399; --warn:#fbbf24; --bad:#f87171; --accent:#5b9dff; --accent2:#a78bfa;
-    --radius:14px;
+    --background:oklch(99% .004 240);
+    --card:oklch(100% 0 0);
+    --fg:oklch(20% .03 250);
+    --muted:oklch(96% .012 240);
+    --muted-fg:oklch(50% .02 250);
+    --primary:oklch(68.5% .155 230);
+    --primary-fg:oklch(99% .005 240);
+    --accent:oklch(94% .03 230);
+    --accent-fg:oklch(35% .07 230);
+    --border:oklch(92% .01 240);
+    --ring:oklch(68.5% .155 230);
+    --sidebar:oklch(94% .008 240);
+    --sidebar-fg:oklch(25% .03 250);
+    --ok:oklch(69.6% .17 162.48);
+    --warn:oklch(76.9% .188 70.08);
+    --bad:oklch(63.7% .237 25.331);
+    --radius:.75rem;
   }
   *{box-sizing:border-box}
-  body{
-    margin:0;min-height:100vh;
-    background:
-      radial-gradient(1100px 600px at 15% -10%, #1b2540 0%, transparent 60%),
-      radial-gradient(900px 500px at 110% 10%, #241a3a 0%, transparent 55%),
-      var(--bg);
-    color:var(--fg);font:14px/1.6 "Segoe UI Variable","Segoe UI",system-ui,sans-serif;
-    -webkit-font-smoothing:antialiased;
-  }
-  header{position:sticky;top:0;z-index:10;backdrop-filter:blur(14px);
-    background:rgba(11,13,18,.78);border-bottom:1px solid var(--line);
-    padding:14px 28px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
-  .logo{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;
-    background:linear-gradient(135deg,var(--accent),var(--accent2));font-weight:800;color:#08101f;font-size:15px}
-  header h1{font-size:16px;margin:0;font-weight:650}
-  header .sub{color:var(--dim2);font-size:12px;margin-left:-8px}
+  html,body{height:100%}
+  body{margin:0;background:var(--background);color:var(--fg);
+    font:14px/1.6 "Segoe UI Variable","Segoe UI",system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+  .app{display:flex;min-height:100vh}
+
+  /* ---------- 侧边栏 ---------- */
+  aside{width:224px;flex:0 0 224px;background:var(--sidebar);border-right:1px solid var(--border);
+    padding:18px 12px;display:flex;flex-direction:column;gap:6px;position:sticky;top:0;height:100vh;overflow:auto}
+  .brand{display:flex;align-items:center;gap:10px;padding:6px 10px 18px}
+  .brand .mark{width:30px;height:30px;border-radius:9px;background:var(--primary);color:var(--primary-fg);
+    display:grid;place-items:center;font-weight:700;font-size:15px}
+  .brand b{font-size:15px;font-weight:600;letter-spacing:.01em}
+  nav{display:flex;flex-direction:column;gap:2px}
+  nav button{all:unset;display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:10px;
+    color:var(--sidebar-fg);font-size:13.5px;cursor:pointer;transition:background .15s,color .15s}
+  nav button:hover{background:oklch(90% .025 230 / .6)}
+  nav button.active{background:var(--primary);color:var(--primary-fg);font-weight:600}
+  nav button .ic{width:16px;text-align:center;opacity:.85}
+  .side-foot{margin-top:auto;padding:12px 10px;font-size:11.5px;color:var(--muted-fg);line-height:1.7}
+
+  /* ---------- 主区 ---------- */
+  main{flex:1;min-width:0;display:flex;flex-direction:column}
+  header{position:sticky;top:0;z-index:5;background:oklch(99% .004 240 / .85);backdrop-filter:blur(10px);
+    border-bottom:1px solid var(--border);padding:14px 26px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  header h1{font-size:16px;font-weight:600;margin:0}
   .spacer{flex:1}
-  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:7px;vertical-align:1px}
-  .dot.on{background:var(--ok);box-shadow:0 0 0 4px rgba(52,211,153,.14)}
-  .dot.off{background:var(--bad);box-shadow:0 0 0 4px rgba(248,113,113,.14)}
-  .chip{display:inline-flex;align-items:center;padding:5px 12px;border-radius:99px;font-size:12.5px;
-    border:1px solid var(--line);background:rgba(255,255,255,.02);color:var(--dim)}
-  main{max-width:1320px;margin:0 auto;padding:26px 28px 60px;display:grid;gap:18px;
-    grid-template-columns:repeat(auto-fit,minmax(400px,1fr))}
-  .card{background:linear-gradient(180deg,rgba(255,255,255,.026),rgba(255,255,255,.008));
-    border:1px solid var(--line);border-radius:var(--radius);padding:20px 22px;
-    box-shadow:0 18px 40px -28px rgba(0,0,0,.9)}
-  .card.wide{grid-column:1/-1}
-  .card h2{font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim2);
-    margin:0 0 18px;display:flex;align-items:center;gap:9px;font-weight:650}
-  .card h2::before{content:"";width:3px;height:13px;border-radius:2px;background:linear-gradient(180deg,var(--accent),var(--accent2))}
-  label{display:block;font-size:12.5px;color:var(--dim);margin:14px 0 6px}
-  input,textarea{width:100%;background:#0a0c11;border:1px solid var(--line2);color:var(--fg);
-    border-radius:9px;padding:9px 12px;font:inherit;transition:.15s}
-  input:focus,textarea:focus{outline:0;border-color:var(--accent);box-shadow:0 0 0 3px rgba(91,157,255,.15)}
-  button{background:linear-gradient(180deg,var(--accent),#3d7fe0);color:#05101f;border:0;border-radius:9px;
-    padding:10px 18px;font:inherit;font-weight:650;cursor:pointer;transition:.15s;
-    box-shadow:0 6px 18px -10px rgba(91,157,255,.9)}
-  button:hover{filter:brightness(1.08);transform:translateY(-1px)}
-  button.ghost{background:transparent;color:var(--dim);border:1px solid var(--line2);box-shadow:none;padding:8px 12px;font-weight:500}
-  button.ghost:hover{color:var(--fg);border-color:var(--accent);background:rgba(91,157,255,.07)}
+  .chip{display:inline-flex;align-items:center;gap:7px;padding:5px 12px;border-radius:9999px;
+    font-size:12.5px;background:var(--muted);color:var(--muted-fg);border:1px solid var(--border)}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--muted-fg)}
+  .dot.on{background:var(--ok)}.dot.off{background:var(--bad)}
+
+  .body{padding:22px 26px 60px;max-width:1080px;width:100%}
+  .page{display:none;flex-direction:column;gap:16px}
+  .page.active{display:flex}
+
+  .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:18px 20px}
+  .card h2{font-size:13px;font-weight:600;margin:0 0 4px;letter-spacing:.01em}
+  .card .sub{font-size:12.5px;color:var(--muted-fg);margin-bottom:14px}
+
+  label{display:block;font-size:12.5px;color:var(--muted-fg);margin:14px 0 6px;font-weight:500}
+  input,textarea,select{width:100%;background:var(--card);border:1px solid var(--border);color:var(--fg);
+    border-radius:10px;padding:9px 12px;font:inherit;transition:border-color .15s,box-shadow .15s}
+  input:focus,textarea:focus{outline:0;border-color:var(--ring);box-shadow:0 0 0 3px oklch(68.5% .155 230 / .18)}
+  button{background:var(--primary);color:var(--primary-fg);border:0;border-radius:10px;padding:9px 16px;
+    font:inherit;font-weight:600;cursor:pointer;transition:filter .15s}
+  button:hover{filter:brightness(1.06)}
+  button.ghost{background:var(--card);color:var(--fg);border:1px solid var(--border);font-weight:500}
+  button.ghost:hover{background:var(--accent);border-color:var(--accent);color:var(--accent-fg);filter:none}
+  button.sm{padding:6px 12px;font-size:12.5px}
   .row{display:flex;gap:9px;align-items:center}
   .row>*{flex:1}.row>button{flex:0 0 auto}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-  .switch{display:flex;align-items:center;justify-content:space-between;gap:12px;
-    padding:12px 14px;border:1px solid var(--line2);border-radius:10px;background:rgba(255,255,255,.014);margin-bottom:10px}
-  .switch .t{font-size:13.5px}
-  .switch .d{font-size:11.5px;color:var(--dim2);margin-top:2px}
-  .toggle{position:relative;width:44px;height:25px;flex:0 0 auto}
+
+  .switch{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:13px 15px;
+    border:1px solid var(--border);border-radius:10px;background:var(--card);margin-bottom:10px}
+  .switch .t{font-size:13.5px;font-weight:500}
+  .switch .d{font-size:12px;color:var(--muted-fg);margin-top:2px}
+  .toggle{position:relative;width:42px;height:24px;flex:0 0 auto}
   .toggle input{position:absolute;opacity:0;width:100%;height:100%;margin:0;cursor:pointer;z-index:2}
-  .toggle i{position:absolute;inset:0;border-radius:99px;background:#2a3040;transition:.2s}
-  .toggle i::after{content:"";position:absolute;top:3px;left:3px;width:19px;height:19px;border-radius:50%;
-    background:#8b93a7;transition:.2s}
-  .toggle input:checked+i{background:linear-gradient(135deg,var(--accent),var(--accent2))}
-  .toggle input:checked+i::after{transform:translateX(19px);background:#fff}
-  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:11px}
-  .stat{background:#0a0c11;border:1px solid var(--line);border-radius:11px;padding:13px 15px}
-  .stat .k{font-size:11px;color:var(--dim2)}
-  .stat .v{font-size:22px;font-weight:700;margin-top:5px;font-variant-numeric:tabular-nums}
-  .stat.hi .v{color:var(--accent)}.stat.ok .v{color:var(--ok)}.stat.wa .v{color:var(--warn)}
-  .feed{max-height:340px;overflow:auto;border:1px solid var(--line);border-radius:11px;background:#090b0f}
-  .feed .item{display:flex;gap:11px;align-items:center;padding:10px 14px;border-bottom:1px solid #12151c;font-size:13px}
-  .feed .item:last-child{border-bottom:0}
-  .feed .item:hover{background:rgba(91,157,255,.045)}
-  .tag{flex:0 0 auto;font-size:10.5px;padding:2px 7px;border-radius:5px;background:#1a1f2b;color:var(--dim)}
-  .tag.high{background:rgba(248,113,113,.16);color:#ff9d9d}
-  .tag.mid{background:rgba(251,191,36,.16);color:#ffd479}
-  .tag.low{background:rgba(91,157,255,.14);color:#9dc2ff}
-  .feed .who{color:var(--fg);font-weight:550;flex:0 0 auto;max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .feed .txt{color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
-  .feed .time{color:var(--dim2);font-size:11.5px;flex:0 0 auto;font-variant-numeric:tabular-nums}
-  .empty{color:var(--dim2);padding:22px;text-align:center;font-size:13px}
-  .hint{font-size:12px;color:var(--dim2);margin-top:10px;line-height:1.65}
-  .hint code{background:#0a0c11;border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:11.5px}
-  .toast{position:fixed;right:22px;bottom:22px;background:var(--card);border:1px solid var(--line2);
-    border-radius:11px;padding:12px 18px;opacity:0;transform:translateY(8px);transition:.22s;pointer-events:none;
-    box-shadow:0 20px 40px -18px rgba(0,0,0,.9)}
+  .toggle i{position:absolute;inset:0;border-radius:9999px;background:oklch(88% .01 240);transition:.2s}
+  .toggle i::after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;
+    background:#fff;box-shadow:0 1px 2px #0002;transition:.2s}
+  .toggle input:checked+i{background:var(--primary)}
+  .toggle input:checked+i::after{transform:translateX(18px)}
+
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:12px}
+  .stat{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px}
+  .stat .k{font-size:12px;color:var(--muted-fg)}
+  .stat .v{font-size:23px;font-weight:600;margin-top:4px;font-variant-numeric:tabular-nums}
+  .stat.ok .v{color:var(--ok)}.stat.wa .v{color:var(--warn)}.stat.hi .v{color:var(--primary)}
+
+  .list{border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;background:var(--card)}
+  .list .item{display:flex;gap:11px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--border);font-size:13px}
+  .list .item:last-child{border-bottom:0}
+  .list .item:hover{background:var(--muted)}
+  .tag{flex:0 0 auto;font-size:11px;padding:2px 8px;border-radius:9999px;background:var(--muted);color:var(--muted-fg);font-weight:500}
+  .tag.high{background:oklch(63.7% .237 25.331 / .12);color:var(--bad)}
+  .tag.mid{background:oklch(76.9% .188 70.08 / .16);color:oklch(55% .15 60)}
+  .tag.low{background:oklch(68.5% .155 230 / .12);color:oklch(50% .13 235)}
+  .tag.ok{background:oklch(69.6% .17 162.48 / .14);color:oklch(48% .13 165)}
+  .list .who{font-weight:500;flex:0 0 auto;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .list .txt{color:var(--muted-fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+  .list .time{color:var(--muted-fg);font-size:11.5px;flex:0 0 auto;font-variant-numeric:tabular-nums}
+  .empty{color:var(--muted-fg);padding:22px;text-align:center;font-size:13px}
+  .hint{font-size:12.5px;color:var(--muted-fg);margin-top:10px;line-height:1.7}
+  .hint code{background:var(--muted);border-radius:5px;padding:1px 6px;font-size:12px}
+  .toast{position:fixed;right:22px;bottom:22px;background:var(--card);border:1px solid var(--border);
+    border-radius:var(--radius);padding:12px 18px;opacity:0;transform:translateY(8px);transition:.22s;
+    pointer-events:none;box-shadow:0 10px 30px -12px #0003}
   .toast.show{opacity:1;transform:none}
-  ::-webkit-scrollbar{width:9px;height:9px}
-  ::-webkit-scrollbar-thumb{background:#242a38;border-radius:9px}
-  ::-webkit-scrollbar-thumb:hover{background:#31384a}
+  @media(max-width:760px){aside{width:64px;flex:0 0 64px}.brand b,nav button span,{display:none}.side-foot{display:none}}
 </style>
 </head>
 <body>
-<header>
-  <div class="logo">Q</div>
-  <h1>qqbridge</h1>
-  <span class="sub">QQ ↔ MCP 桥</span>
-  <div class="spacer"></div>
-  <span class="chip" id="c-ws"><i class="dot off"></i>连接中</span>
-  <span class="chip" id="c-sched"><i class="dot off"></i>巡检</span>
-  <span class="chip" id="c-self">账号 …</span>
-</header>
-
-<main>
-  <section class="card">
-    <h2>巡检与唤醒</h2>
-    <div class="switch">
-      <div><div class="t">启用自动巡检</div><div class="d">有消息才唤醒模型，空闲零消耗</div></div>
-      <label class="toggle"><input type="checkbox" id="enabled"><i></i></label>
+<div class="app">
+  <aside>
+    <div class="brand"><div class="mark">Q</div><b>qqbridge</b></div>
+    <nav id="nav">
+      <button data-page="overview" class="active"><i class="ic">◉</i><span>概览</span></button>
+      <button data-page="model"><i class="ic">◆</i><span>模型与人格</span></button>
+      <button data-page="watch"><i class="ic">◷</i><span>巡检与唤醒</span></button>
+      <button data-page="safety"><i class="ic">⬡</i><span>权限与安全</span></button>
+      <button data-page="agent"><i class="ic">⌘</i><span>内置 Agent</span></button>
+      <button data-page="logs"><i class="ic">≡</i><span>日志与审计</span></button>
+    </nav>
+    <div class="side-foot">
+      <div id="f-self">账号 —</div>
+      <div id="f-model">模型 —</div>
     </div>
-    <label>巡检间隔（秒）</label>
-    <div class="row">
-      <input type="number" id="interval" min="5" max="86400">
-      <button class="ghost" data-set="10">10 秒</button>
-      <button class="ghost" data-set="30">30 秒</button>
-      <button class="ghost" data-set="300">5 分</button>
+  </aside>
+
+  <main>
+    <header>
+      <h1 id="page-title">概览</h1>
+      <div class="spacer"></div>
+      <span class="chip" id="c-ws"><i class="dot off"></i>连接中</span>
+      <span class="chip" id="c-mode"><i class="dot off"></i>auto</span>
+      <span class="chip" id="c-auto">自动接话 —</span>
+    </header>
+
+    <div class="body">
+      <!-- 概览 -->
+      <section class="page active" id="page-overview">
+        <div class="stats" id="stats"></div>
+        <div class="card">
+          <h2>最近消息</h2><div class="sub">只显示监控范围内的群</div>
+          <div class="list" id="events"></div>
+        </div>
+      </section>
+
+      <!-- 模型与人格 -->
+      <section class="page" id="page-model">
+        <div class="card">
+          <h2>模型</h2><div class="sub">bot 自带凭据，独立于任何外部 Agent 宿主</div>
+          <div class="switch">
+            <div><div class="t">自动接话</div><div class="d">关掉后只提供 MCP 工具，不主动发言</div></div>
+            <label class="toggle"><input type="checkbox" id="auto_reply"><i></i></label>
+          </div>
+          <label>API Base</label><input id="api_base" placeholder="https://api.deepseek.com">
+          <label>API Key（留空表示不修改）</label><input id="api_key" type="password" placeholder="sk-...">
+          <div class="grid2">
+            <div><label>模型</label><input id="model" placeholder="deepseek-chat"></div>
+            <div><label>max_tokens</label><input type="number" id="max_tokens" min="64" max="8192"></div>
+          </div>
+          <div class="row" style="margin-top:16px">
+            <button id="save-llm">保存</button>
+            <span class="hint" id="llm-hint" style="margin:0"></span>
+          </div>
+        </div>
+        <div class="card">
+          <h2>人格 / System Prompt</h2>
+          <div class="sub">改完立刻生效，不用重启</div>
+          <textarea id="prompt" rows="16" style="font:12.5px/1.65 ui-monospace,Consolas,monospace"></textarea>
+          <div class="row" style="margin-top:12px">
+            <button id="save-prompt">保存人格</button>
+            <span class="hint" id="prompt-hint" style="margin:0"></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 巡检与唤醒 -->
+      <section class="page" id="page-watch">
+        <div class="card">
+          <h2>巡检节奏</h2><div class="sub">控制 bot 多久看一次消息</div>
+          <div class="switch">
+            <div><div class="t">启用巡检</div><div class="d">空闲时不产生任何模型调用</div></div>
+            <label class="toggle"><input type="checkbox" id="enabled"><i></i></label>
+          </div>
+          <label>巡检间隔（秒）</label>
+          <div class="row">
+            <input type="number" id="interval" min="5" max="86400">
+            <button class="ghost sm" data-set="10">10 秒</button>
+            <button class="ghost sm" data-set="30">30 秒</button>
+            <button class="ghost sm" data-set="300">5 分</button>
+          </div>
+          <div class="grid2">
+            <div><label>最小间隔（秒）</label><input type="number" id="min_gap" min="0"></div>
+            <div><label>每小时上限</label><input type="number" id="max_turns" min="1"></div>
+          </div>
+          <label>静默时段（留空不启用）</label>
+          <div class="row"><input type="time" id="q1"><input type="time" id="q2"></div>
+          <button id="save-sched" style="margin-top:16px">保存</button>
+        </div>
+        <div class="card">
+          <h2>运行模式</h2><div class="sub">群里发 /stop /start /auto 也能切（仅管理员）</div>
+          <div class="row">
+            <button class="ghost" data-mode="auto">auto 自动</button>
+            <button class="ghost" data-mode="manual">manual 手动</button>
+            <button class="ghost" data-mode="stopped">stopped 停止</button>
+          </div>
+          <div class="hint" id="mode-hint">—</div>
+        </div>
+        <div class="card">
+          <h2>监控范围与关键词</h2>
+          <label>只监控这些群（逗号分隔；留空=全部）</label><input id="watch" placeholder="1060667115">
+          <label>关键词（空格分隔，命中即优先处理）</label><textarea id="keywords" rows="3"></textarea>
+          <button id="save-watch" style="margin-top:16px">保存</button>
+          <div class="hint">范围外的群<b>只落库，不入队，不唤醒</b>。</div>
+        </div>
+      </section>
+
+      <!-- 权限与安全 -->
+      <section class="page" id="page-safety">
+        <div class="card">
+          <h2>操作权限</h2><div class="sub">写操作只认白名单里的 QQ 号</div>
+          <div class="switch">
+            <div><div class="t">允许发送</div><div class="d">发文本 / 图片 / 单聊</div></div>
+            <label class="toggle"><input type="checkbox" id="allow_send"><i></i></label>
+          </div>
+          <div class="switch">
+            <div><div class="t">允许群管理</div><div class="d">禁言 / 踢人 / 改名 / 名片 / 全员禁言 / 退群</div></div>
+            <label class="toggle"><input type="checkbox" id="allow_manage"><i></i></label>
+          </div>
+          <label>Owner 白名单</label><input id="owners" placeholder="98704929">
+          <button id="save-perm" style="margin-top:16px">保存</button>
+        </div>
+        <div class="card">
+          <h2>管理员</h2><div class="sub">可用 /stop /start /auto 与内置 Agent</div>
+          <label>ADMIN_IDS（.env 中配置）</label><input id="admins" disabled>
+          <div class="hint">白名单与管理员都写进 <code>.env</code>，重启后保持。</div>
+        </div>
+      </section>
+
+      <!-- 内置 Agent -->
+      <section class="page" id="page-agent">
+        <div class="card">
+          <h2>内置 Agent</h2>
+          <div class="sub">bot 自己能读写文件、执行命令，替代外部 Agent 宿主</div>
+          <div id="agent-stats" class="stats"></div>
+          <div class="hint">
+            <b>所有读取与写入都会记录</b>到 <code>data/agent.log</code>（JSONL）与审计表。<br>
+            路径越界直接拒绝；读 ≤256KB、写 ≤1MB、命令 ≤120 秒；危险命令黑名单拦截。
+          </div>
+        </div>
+        <div class="card">
+          <h2>文件读写 / 命令执行记录</h2>
+          <div class="list" id="agent-log"></div>
+        </div>
+      </section>
+
+      <!-- 日志与审计 -->
+      <section class="page" id="page-logs">
+        <div class="card">
+          <h2>审计记录</h2><div class="sub">谁发起、做什么、结果如何</div>
+          <div class="list" id="audit"></div>
+        </div>
+      </section>
     </div>
-    <div class="grid2">
-      <div><label>最小间隔（秒）</label><input type="number" id="min_gap" min="0"></div>
-      <div><label>每小时上限</label><input type="number" id="max_turns" min="1"></div>
-    </div>
-    <label>静默时段（留空不启用）</label>
-    <div class="row"><input type="time" id="q1"><input type="time" id="q2"></div>
-    <button id="save-sched" style="margin-top:16px;width:100%">保存</button>
-    <div class="hint">唤醒由 DSH 插件 <code>dsh-qqbridge-wake</code> 执行：每 N 秒轮询一次本服务，<b>没有消息就不产生任何模型调用</b>。</div>
-  </section>
-
-  <section class="card">
-    <h2>权限与安全</h2>
-    <div class="switch">
-      <div><div class="t">允许发送</div><div class="d">发文本 / 图片到群</div></div>
-      <label class="toggle"><input type="checkbox" id="allow_send"><i></i></label>
-    </div>
-    <div class="switch">
-      <div><div class="t">允许群管理</div><div class="d">禁言 / 踢人 / 改名 / 群名片 / 全员禁言 / 退群</div></div>
-      <label class="toggle"><input type="checkbox" id="allow_manage"><i></i></label>
-    </div>
-    <label>Owner 白名单（只有这些 QQ 能触发写操作）</label>
-    <input id="owners" placeholder="98704929">
-    <button id="save-perm" style="margin-top:16px;width:100%">保存</button>
-    <div class="hint">写操作必须由白名单账号发起并带幂等键，全部留痕在下方审计记录。</div>
-  </section>
-
-  <section class="card">
-    <h2>监控范围</h2>
-    <label>只监控这些群（逗号分隔；留空表示全部）</label>
-    <input id="watch" placeholder="1060667115">
-    <label>关键词触发（空格分隔，命中即唤醒）</label>
-    <textarea id="keywords" rows="4"></textarea>
-    <button id="save-watch" style="margin-top:16px;width:100%">保存</button>
-    <div class="hint">不在监控范围内的群<b>只落库，绝不唤醒模型</b>。</div>
-  </section>
-
-  <section class="card">
-    <h2>模型（bot 自带）</h2>
-    <div class="switch">
-      <div><div class="t">自动接话</div><div class="d">关掉后 bot 只提供 MCP 工具，不主动发言</div></div>
-      <label class="toggle"><input type="checkbox" id="auto_reply"><i></i></label>
-    </div>
-    <label>API Base</label>
-    <input id="api_base" placeholder="https://api.deepseek.com">
-    <label>API Key（留空表示不修改）</label>
-    <input id="api_key" type="password" placeholder="sk-...">
-    <div class="grid2">
-      <div><label>模型</label><input id="model" placeholder="deepseek-chat"></div>
-      <div><label>max_tokens</label><input type="number" id="max_tokens" min="64" max="8192"></div>
-    </div>
-    <button id="save-llm" style="margin-top:16px;width:100%">保存模型设置</button>
-    <div class="hint" id="llm-hint">—</div>
-  </section>
-
-  <section class="card wide">
-    <h2>人格 / System Prompt</h2>
-    <textarea id="prompt" rows="14" style="font:12.5px/1.6 ui-monospace,Consolas,monospace"></textarea>
-    <button id="save-prompt" style="margin-top:12px">保存人格</button>
-    <span class="hint" id="prompt-hint" style="margin-left:10px"></span>
-  </section>
-
-  <section class="card">
-    <h2>运行状态</h2>
-    <div class="stats" id="stats"></div>
-  </section>
-
-  <section class="card wide">
-    <h2>消息流</h2>
-    <div class="feed" id="events"></div>
-  </section>
-
-  <section class="card wide">
-    <h2>审计记录</h2>
-    <div class="feed" id="audit"></div>
-  </section>
-</main>
+  </main>
+</div>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -204,7 +283,6 @@ let TOKEN = new URLSearchParams(location.search).get("token") || localStorage.ge
 if (TOKEN) localStorage.setItem("qqbridge_token", TOKEN);
 const toast = (m) => { const t = $("toast"); t.textContent = m; t.classList.add("show");
   clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove("show"), 1900); };
-
 async function api(path, opts = {}) {
   const res = await fetch(path, { ...opts, headers: { "Content-Type": "application/json", "X-Bridge-Token": TOKEN, ...(opts.headers || {}) } });
   const text = await res.text();
@@ -213,51 +291,66 @@ async function api(path, opts = {}) {
   return data;
 }
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-const hhmm = (t) => new Date(t * 1000).toLocaleTimeString("zh-CN", { hour12: false });
-let lastAudit = 0;
+const hhmm = (t) => new Date((t || 0) * 1000).toLocaleTimeString("zh-CN", { hour12: false });
+const titles = { overview: "概览", model: "模型与人格", watch: "巡检与唤醒", safety: "权限与安全", agent: "内置 Agent", logs: "日志与审计" };
+
+$("nav").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-page]"); if (!b) return;
+  document.querySelectorAll("nav button").forEach((x) => x.classList.remove("active"));
+  b.classList.add("active");
+  document.querySelectorAll(".page").forEach((p) => p.classList.remove("active"));
+  $("page-" + b.dataset.page).classList.add("active");
+  $("page-title").textContent = titles[b.dataset.page] || b.dataset.page;
+});
+
+const save = async (fn, msg) => { try { await fn(); toast(msg); refresh(); } catch (e) { toast("失败：" + e.message); } };
 
 async function refresh() {
   try {
     const s = await api("/api/state");
-    const st = s.scheduler.settings;
+    const st = s.scheduler.settings, b = s.scheduler.bus, llm = s.llm || {}, ctl = s.control || {};
     const tag = document.activeElement?.tagName;
-    if (tag !== "INPUT" && tag !== "TEXTAREA") {
-      $("enabled").checked = !!st.enabled;
-      $("interval").value = st.interval_seconds;
-      $("min_gap").value = st.min_gap_seconds;
-      $("max_turns").value = st.max_turns_per_hour;
-      const q = (st.quiet_hours || [])[0] || ["", ""];
-      $("q1").value = q[0] || ""; $("q2").value = q[1] || "";
-      $("allow_send").checked = !!s.config.allow_send;
-      $("allow_manage").checked = !!s.config.allow_manage;
+    const editable = tag !== "INPUT" && tag !== "TEXTAREA";
+    if (editable) {
+      $("enabled").checked = !!st.enabled; $("interval").value = st.interval_seconds;
+      $("min_gap").value = st.min_gap_seconds; $("max_turns").value = st.max_turns_per_hour;
+      const q = (st.quiet_hours || [])[0] || ["", ""]; $("q1").value = q[0] || ""; $("q2").value = q[1] || "";
+      $("allow_send").checked = !!s.config.allow_send; $("allow_manage").checked = !!s.config.allow_manage;
       $("owners").value = (s.config.owners || []).join(",");
+      $("admins").value = (s.config.admins || []).join(",");
       $("watch").value = (s.config.watch_groups || []).join(",");
       $("keywords").value = (s.keywords || []).join(" ");
-    }
-    $("c-self").textContent = "账号 " + (s.bot.self_id || "?");
-    $("c-ws").innerHTML = '<i class="dot ' + (s.bot.ws_connected ? "on" : "off") + '"></i>' + (s.bot.ws_connected ? "QQ 已连接" : "QQ 断开");
-    $("c-sched").innerHTML = '<i class="dot ' + (st.enabled ? "on" : "off") + '"></i>' + (st.enabled ? "巡检 " + st.interval_seconds + "s" : "巡检关闭");
-
-    const llm = s.llm || {};
-    if (tag !== "INPUT" && tag !== "TEXTAREA") {
       $("auto_reply").checked = !!s.config.auto_reply;
-      $("api_base").value = llm.api_base || "";
-      $("model").value = llm.model || "";
+      $("api_base").value = llm.api_base || ""; $("model").value = llm.model || "";
       $("max_tokens").value = llm.max_tokens || 1024;
     }
-    $("llm-hint").textContent = llm.configured
-      ? ("已配置 · 调用 " + (llm.calls||0) + " 次 · 输入 " + (llm.prompt_tokens||0) + " / 输出 " + (llm.completion_tokens||0) + " tokens")
-      : "未配置：填好 API Base / Key / 模型后 bot 才能自己说话";
+    $("f-self").textContent = "账号 " + (s.bot.self_id || "?");
+    $("f-model").textContent = (llm.model || "未配置模型");
+    $("c-ws").innerHTML = '<i class="dot ' + (s.bot.ws_connected ? "on" : "off") + '"></i>' + (s.bot.ws_connected ? "QQ 已连接" : "QQ 断开");
+    const modeCls = ctl.mode === "auto" ? "on" : "off";
+    $("c-mode").innerHTML = '<i class="dot ' + modeCls + '"></i>' + esc(ctl.mode || "auto");
+    $("c-auto").textContent = s.config.auto_reply ? "自动接话 开" : "自动接话 关";
+    $("mode-hint").textContent = ctl.paused ? ("已暂停（由 " + (ctl.by || "?") + " 触发：" + (ctl.reason || "") + "）") : "运行中";
 
-    const b = s.scheduler.bus;
     $("stats").innerHTML = [
       ["队列总量", b.stored, ""], ["待处理 @我", b.pending_high, b.pending_high ? "hi" : ""],
       ["待处理 关键词", b.pending_mid, b.pending_mid ? "wa" : ""], ["待处理 闲聊", b.pending_low, ""],
-      ["巡检次数", s.scheduler.runs, ""],
-      ["距下次巡检", st.enabled ? (s.scheduler.seconds_until_next ?? "—") + "s" : "未启用", ""],
+      ["缓冲丢弃", b.dropped || 0, (b.dropped ? "wa" : "")],
+      ["消息计数", b.last_id || 0, ""],
       ["监控群", (s.config.watch_groups || []).length || "全部", ""],
-      ["静默中", s.scheduler.in_quiet_hours ? "是" : "否", s.scheduler.in_quiet_hours ? "wa" : "ok"]
+      ["模型调用", llm.calls || 0, ""]
     ].map(([k, v, c]) => '<div class="stat ' + c + '"><div class="k">' + k + '</div><div class="v">' + esc(v) + '</div></div>').join("");
+
+    $("llm-hint").textContent = llm.configured
+      ? ("已配置 · 调用 " + (llm.calls || 0) + " 次 · 输入 " + (llm.prompt_tokens || 0) + " / 输出 " + (llm.completion_tokens || 0))
+      : "未配置：填好三项 bot 才能说话";
+
+    const a = s.agent_loop || {};
+    $("agent-stats").innerHTML = [
+      ["任务次数", a.runs || 0, ""], ["工具调用", a.tool_calls || 0, ""],
+      ["步数", a.steps || 0, ""], ["错误", a.errors || 0, (a.errors ? "wa" : "ok")],
+      ["单次上限", a.max_steps || 6, ""], ["根目录", (a.root || "").split("\\").pop() || "—", ""]
+    ].map(([k, v, c]) => '<div class="stat ' + c + '"><div class="k">' + k + '</div><div class="v" style="font-size:' + (k === "根目录" ? "14px" : "23px") + '">' + esc(v) + '</div></div>').join("");
 
     const ev = await api("/api/events?limit=40");
     const items = (ev.events || []).slice().reverse();
@@ -268,59 +361,55 @@ async function refresh() {
       '<span class="txt">' + esc(e.text) + '</span><span class="time">群' + esc(e.group_id) + '</span></div>').join("")
       : '<div class="empty">暂无消息</div>';
 
+    const al = await api("/api/agent_log?limit=30").catch(() => ({ lines: [] }));
+    $("agent-log").innerHTML = (al.lines || []).length ? al.lines.slice().reverse().map((line) => {
+      let r; try { r = JSON.parse(line); } catch { r = { action: "?", target: line.slice(0, 60), state: "" }; }
+      const cls = r.state === "SUCCEEDED" ? "ok" : r.state === "DENIED" ? "high" : "mid";
+      return '<div class="item"><span class="tag ' + cls + '">' + esc(r.action) + '</span>' +
+        '<span class="time">' + esc(r.at || "") + '</span>' +
+        '<span class="txt">' + esc(String(r.target || "").split("\\").pop() || r.target) + ' ' + esc(JSON.stringify(r.detail || {})) + '</span>' +
+        '<span class="tag">' + esc(r.state) + '</span></div>';
+    }).join("") : '<div class="empty">还没有记录</div>';
+
     const au = await api("/api/audit?limit=40");
-    const sig = (au.records || []).length ? au.records[0].id : 0;
-    if (sig !== lastAudit) {
-      lastAudit = sig;
-      $("audit").innerHTML = (au.records || []).length ? au.records.map((r) =>
-        '<div class="item"><span class="tag ' + (r.state === "SUCCEEDED" ? "mid" : "high") + '">' + esc(r.state) + '</span>' +
-        '<span class="time">' + hhmm(r.at) + '</span><span class="who">' + esc(r.actor) + '</span>' +
-        '<span class="txt">' + esc(r.action) + ' → ' + esc(r.target) + '</span></div>').join("")
-        : '<div class="empty">暂无记录</div>';
-    }
+    $("audit").innerHTML = (au.records || []).length ? au.records.map((r) =>
+      '<div class="item"><span class="tag ' + (r.state === "SUCCEEDED" ? "ok" : "high") + '">' + esc(r.state) + '</span>' +
+      '<span class="time">' + hhmm(r.at) + '</span><span class="who">' + esc(r.actor) + '</span>' +
+      '<span class="txt">' + esc(r.action) + ' → ' + esc(r.target) + '</span></div>').join("")
+      : '<div class="empty">暂无记录</div>';
   } catch (e) {
-    $("stats").innerHTML = '<div class="stat"><div class="k">读取失败</div><div class="v" style="font-size:13px">' + esc(e.message) + '</div></div>';
+    toast("读取失败：" + e.message);
   }
 }
 
-const save = async (fn, msg) => { try { await fn(); toast(msg); refresh(); } catch (e) { toast("失败：" + e.message); } };
-
 $("save-sched").onclick = () => save(() => api("/api/scheduler", { method: "POST", body: JSON.stringify({
-  enabled: $("enabled").checked, interval_seconds: +$("interval").value,
-  min_gap_seconds: +$("min_gap").value, max_turns_per_hour: +$("max_turns").value,
+  enabled: $("enabled").checked, interval_seconds: +$("interval").value, min_gap_seconds: +$("min_gap").value,
+  max_turns_per_hour: +$("max_turns").value,
   quiet_hours: ($("q1").value && $("q2").value) ? [[$("q1").value, $("q2").value]] : [] }) }), "巡检设置已保存");
-
 $("save-perm").onclick = () => save(() => api("/api/permissions", { method: "POST", body: JSON.stringify({
   allow_send: $("allow_send").checked, allow_manage: $("allow_manage").checked,
-  owners: $("owners").value.split(/[,，\s]+/).filter(Boolean) }) }), "安全设置已保存");
-
+  owners: $("owners").value.split(/[,，\s]+/).filter(Boolean) }) }), "权限已保存");
 $("save-watch").onclick = () => save(async () => {
   await api("/api/watch", { method: "POST", body: JSON.stringify({ watch_groups: $("watch").value.split(/[,，\s]+/).filter(Boolean) }) });
   await api("/api/keywords", { method: "POST", body: JSON.stringify({ keywords: $("keywords").value.split(/[\s,，]+/).filter(Boolean) }) });
 }, "监控范围已保存");
-
 $("save-llm").onclick = () => save(() => api("/api/llm", { method: "POST", body: JSON.stringify({
-  api_base: $("api_base").value.trim(),
-  api_key: $("api_key").value.trim(),
-  model: $("model").value.trim(),
-  max_tokens: +$("max_tokens").value,
-  auto_reply: $("auto_reply").checked }) }), "模型设置已保存");
-
+  api_base: $("api_base").value.trim(), api_key: $("api_key").value.trim(), model: $("model").value.trim(),
+  max_tokens: +$("max_tokens").value, auto_reply: $("auto_reply").checked }) }), "模型设置已保存");
 $("save-prompt").onclick = () => save(() => api("/api/prompt", { method: "POST", body: JSON.stringify({
   prompt: $("prompt").value }) }), "人格已保存");
+document.querySelectorAll("[data-set]").forEach((x) => x.onclick = () => { $("interval").value = x.dataset.set; });
+document.querySelectorAll("[data-mode]").forEach((x) => x.onclick = () => save(() =>
+  api("/api/control", { method: "POST", body: JSON.stringify({ mode: x.dataset.mode }) }), "模式已切换为 " + x.dataset.mode));
 
-document.querySelectorAll("[data-set]").forEach((b) => b.onclick = () => { $("interval").value = b.dataset.set; });
-if (!TOKEN) { const v = prompt("请输入访问令牌（.env 的 MCP_TOKEN）"); if (v) { TOKEN = v.trim(); localStorage.setItem("qqbridge_token", TOKEN); } }
 async function loadPrompt() {
-  try {
-    const r = await api("/api/prompt");
+  try { const r = await api("/api/prompt");
     $("prompt").value = r.prompt || "";
-    $("prompt-hint").textContent = (r.chars || 0) + " 字符 · " + (r.file || "");
-  } catch (e) { $("prompt-hint").textContent = "读取失败：" + e.message; }
+    $("prompt-hint").textContent = (r.chars || 0) + " 字符";
+  } catch (e) { $("prompt-hint").textContent = "读取失败"; }
 }
-if (TOKEN) loadPrompt();
-refresh();
-setInterval(refresh, 4000);
+if (!TOKEN) { const v = prompt("请输入访问令牌（.env 的 MCP_TOKEN）"); if (v) { TOKEN = v.trim(); localStorage.setItem("qqbridge_token", TOKEN); } }
+loadPrompt(); refresh(); setInterval(refresh, 4000);
 </script>
 </body>
 </html>
