@@ -42,6 +42,7 @@ class AgentLoop:
 
         trace: list[dict] = []
         self.runs += 1
+        fail_seen: dict = {}       # 同一个调用反复失败就别再耗步数了
         for step in range(1, self.max_steps + 1):
             self.steps += 1
             out = await self.llm.chat(messages, tools=self.tools.schemas())
@@ -72,6 +73,9 @@ class AgentLoop:
                     ok = False
                     self.errors += 1
                 self.tool_calls += 1
+                if not ok:
+                    fp = name + ":" + json.dumps(args, sort_keys=True, ensure_ascii=False)
+                    fail_seen[fp] = fail_seen.get(fp, 0) + 1
                 trace.append({"step": step, "kind": "tool", "name": name,
                               "args": {k: str(v)[:80] for k, v in (args or {}).items()},
                               "ok": ok})
@@ -80,9 +84,35 @@ class AgentLoop:
                 messages.append({"role": "tool", "tool_call_id": call.get("id") or name,
                                  "content": json.dumps(result, ensure_ascii=False)[:20000]})
 
-        # 步数用尽
-        self._audit("agent_run", {"steps": self.max_steps, "reason": "max_steps"}, "TRUNCATED")
-        return {"text": "（步骤用尽，未得到最终答复）", "steps": self.max_steps, "tool_calls": trace}
+            # 同一个调用带着同样的参数连续失败 3 次 = 死循环。
+            # 之前就是这样：命令被黑名单误杀，模型换个写法接着试，把 30 步全烧光。
+            if fail_seen and max(fail_seen.values()) >= 3:
+                worst = max(fail_seen, key=lambda k: fail_seen[k]).split(":")[0]
+                text = await self._wrap_up(
+                    messages, f"工具 {worst} 用同样的参数连续失败了 3 次，判定卡住")
+                self._audit("agent_run", {"steps": step, "reason": "repeat_failure",
+                                          "tool": worst, "text": text[:200]}, "STOPPED")
+                return {"text": text or "这条我卡住了，换个说法我再试。",
+                        "steps": step, "tool_calls": trace}
+
+        # 步数用尽：不要往群里丢「（步骤用尽，未得到最终答复）」这种废话，
+        # 再问一次模型要一句人话（不带工具），至少告诉用户卡在哪。
+        text = await self._wrap_up(messages, f"已经用完 {self.max_steps} 步工具调用")
+        self._audit("agent_run", {"steps": self.max_steps, "reason": "max_steps",
+                                  "text": text[:200]}, "TRUNCATED")
+        return {"text": text or "这轮没干完，工具调用次数到上限了，换个说法我再试。",
+                "steps": self.max_steps, "tool_calls": trace}
+
+    async def _wrap_up(self, messages: list[dict], why: str) -> str:
+        """收尾提问：不带工具再问一次，要一句能直接发进群的人话。"""
+        try:
+            out = await self.llm.chat(messages + [{"role": "user", "content":
+                f"【系统】{why}，不要再调用任何工具。"
+                "直接给用户一句人话：你已经知道什么、卡在哪里、需要他做什么，60 字以内。"}])
+            return (out.get("text") or "").strip()
+        except Exception as exc:
+            log.warning("agent 收尾提问失败：%s", exc)
+            return ""
 
     def _audit(self, action: str, detail: dict, state: str):
         if self.store is None:

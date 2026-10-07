@@ -223,7 +223,7 @@ SYSTEM_PROMPT_FILE=data/system_prompt.md # 人格文件，改完热加载
 ```dotenv
 AGENT_ENABLED=true      # 关掉则只有聊天，没有文件 / 命令能力
 AGENT_ROOT=             # 操作根目录，越界一律拒绝；留空 = 仓库根目录
-AGENT_MAX_STEPS=30      # 单次任务最多几步
+AGENT_MAX_STEPS=60      # 单次任务最多几步（真正兜底的是 90 秒超时和死循环检测）
 ```
 
 可用工具：`list_dir` `read_file` `write_file` `search_files` `run_command` `fetch_url`
@@ -249,7 +249,8 @@ AGENT_MAX_STEPS=30      # 单次任务最多几步
 | 命令输出 | ≤ 64 KB |
 | 命令超时 | 默认 15 秒，硬上限 60 秒 |
 | 抓网页 | ≤ 512 KB，只允许 http/https |
-| 危险命令 | 黑名单拦截（format / mkfs / shutdown / rm -rf 等），记 `DENIED` |
+| 危险命令 | 黑名单拦截（格式化 / mkfs / 关机重启 / diskpart / rm -rf 等），记 `DENIED` |
+| 死循环 | 同一个工具调用用同样参数连续失败 3 次就停手，改问模型要一句人话 |
 | 调用方 | MCP 侧 `agent_run` 仅限 `ADMIN_IDS` |
 
 > 命令走 `asyncio.to_thread`，不会阻塞事件循环 —— 实测执行期间心跳最大间隔 0.111 秒。
@@ -373,6 +374,7 @@ qqbridge/
 python tests/test_auth_qzone.py    # 门禁 / 协议 / 自动说说 / 图片代理白名单
 python tests/test_console.py       # 控制台每个开关是不是「真的生效」
 python tests/test_autoreply.py     # 被 @ 必回、闲聊该不该接
+python tests/test_agenttools.py    # 命令黑名单别误杀、卡住时别发废话
 node   tests/ui_console.mjs        # 控制台前端脚本（假 DOM 里跑 ui.html）
 python tests/test_readme.py        # 这份 README 有没有跟代码对不上
 ```

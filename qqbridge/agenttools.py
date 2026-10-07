@@ -30,11 +30,33 @@ DEFAULT_CMD_TIMEOUT = 15          # 秒；超时就掐，别拖住整轮
 
 ALLOWED_SCHEMES = ("http", "https")
 
+# 危险命令黑名单。
+#
+# 血的教训：第一条原来写的是 r"\bformat\b"，本意是挡「格式化磁盘」，
+# 但 PowerShell 的 Format-List / Format-Table / Format-Wide 全都会命中 ——
+# 于是「systeminfo | ... | Format-List」这种纯读命令被拒，
+# 模型反复重试直到步数耗尽，最后往群里发了一句「步骤用尽」。
+# 现在只匹配真正会毁数据的写法，宁可写长一点。
 BANNED = [
-    r"\bformat\b", r"\bmkfs\b", r"\bshutdown\b", r"\breboot\b",
-    r"rm\s+-rf\s+/", r"del\s+/[sq]\s+[a-z]:\\?\s*$",
-    r"Remove-Item.*-Recurse.*[A-Z]:\\?\s*$", r"\bdiskpart\b",
-    r"reg\s+delete\s+HKLM", r"\btaskkill\b.*/f.*/im\s+winlogon",
+    # 格式化：必须带盘符或 /q /s /f 参数。Format-Volume 是另一个 cmdlet，单列
+    r"(?<![\w.-])format(?:\.com)?\s+[a-z]:",
+    r"(?<![\w.-])format(?:\.com)?\s+/[qsf]",
+    r"\bFormat-Volume\b",
+    r"\bmkfs(?:\.\w+)?\b",
+    # 关机 / 重启
+    r"(?<![\w.-])shutdown(?:\.exe)?\s+/[a-z]",
+    r"\bStop-Computer\b", r"\bRestart-Computer\b",
+    r"(?<![\w.-])reboot(?:\.exe)?\b",
+    # 磁盘与分区
+    r"\bdiskpart\b", r"\bClear-Disk\b", r"\bInitialize-Disk\b",
+    r"\bRemove-Partition\b",
+    # 删根目录
+    r"rm\s+-rf\s+/",
+    r"del\s+/[sq]\s+[a-z]:\\?\s*$",
+    r"Remove-Item.*-Recurse.*[A-Z]:\\?\s*$",
+    # 注册表与关键进程
+    r"reg\s+delete\s+HKLM",
+    r"\btaskkill\b.*/f.*/im\s+winlogon",
 ]
 
 

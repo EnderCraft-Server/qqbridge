@@ -205,8 +205,10 @@ class EventBus:
         """推进游标。只进不退；跳过尚未处理的事件会在日志里留警告。"""
         through_id = int(through_id)
         with self._lock:
+            # 严格小于 through_id 才算「被跳过」——through_id 正是这条刚处理完的事件，
+            # 用 <= 会把它自己也列进去，日志里就成了「跳过了 1 条：[它自己]」的假警报
             skipped = [i for i in (self._pending_high + self._pending_mid + self._pending_low)
-                       if self._processed < i <= through_id]
+                       if self._processed < i < through_id]
             if skipped:
                 log.warning("mark_processed(%d) 跳过了 %d 条未处理事件：%s",
                             through_id, len(skipped), skipped[:10])
