@@ -116,8 +116,8 @@ class QqAgent:
         out = await self.llm.chat(messages)
         raw = out["text"] or ""
         reply, how = clean_reply(raw)
-        if len(reply) > 500:
-            reply = reply[:500]
+        if len(reply) > 800:
+            reply = reply[:800]
         if how == "failed":
             log.warning("decide: 输出解析失败，改判沉默。原文前 200 字：%s", raw[:200])
             if self.store:
@@ -192,7 +192,23 @@ def parse_decision(raw: str) -> tuple[dict, str]:
     looks_like_json = stripped[:1] in ("{", "[") or '"reply"' in stripped
     if looks_like_json:
         return {"reply": "", "reason": "JSON 解析失败"}, "failed"
-    return {"reply": stripped.splitlines()[0][:200], "reason": "纯文本回复"}, "plain"
+    return {"reply": tidy_plain(stripped), "reason": "纯文本回复"}, "plain"
+
+
+def tidy_plain(text: str) -> str:
+    """整理纯文本回复：**保留换行**，只清行尾空白、把连续空行压成一个，最后卡长度。
+
+    以前这里写的是 stripped.splitlines()[0][:200] —— 只取第一行。
+    于是模型写好的多行回答被砍成开头那一句，群里只剩一个「？」或者「宿主机状态：」，
+    看着像机器人在敷衍。QQ 消息本来就能换行，没必要砍。
+    """
+    lines = [ln.rstrip() for ln in (text or "").strip().splitlines()]
+    out: list[str] = []
+    for ln in lines:
+        if not ln and (not out or not out[-1]):
+            continue
+        out.append(ln)
+    return "\n".join(out).strip()[:800]
 
 
 def clean_reply(raw: str) -> tuple[str, str]:
