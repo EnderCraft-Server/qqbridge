@@ -446,10 +446,23 @@ const gate = $("gate");
 const showView = (id) => { document.querySelectorAll(".gate .view").forEach((v) => v.classList.toggle("on", v.id === id)); };
 let AGREEMENTS = null;
 
+// ?session=<token> 直接进（脚本/书签用）：必须在首次请求前种下 cookie，
+// 否则 /api/auth/state 拿不到登录态。
+const URL_SESSION = new URLSearchParams(location.search).get("session");
+if (URL_SESSION) {
+  document.cookie = "qqbridge_session=" + encodeURIComponent(URL_SESSION) + "; path=/; max-age=604800";
+  localStorage.setItem("qqbridge_token", URL_SESSION);
+}
+
 async function boot() {
   let st;
   try { st = await api("/api/auth/state"); } catch { st = { agreed: false, logged_in: false }; }
-  if (st.logged_in) { gate.classList.remove("show"); refresh(); setInterval(refresh, 4000); return; }
+  if (st.logged_in) {
+    // #页面名 让刷新后停在同一页
+    gate.classList.remove("show");
+    go(location.hash.slice(1) || "overview");
+    loadPrompt(); refresh(); setInterval(refresh, 4000); return;
+  }
   gate.classList.add("show");
   if (!st.agreed) {
     try { AGREEMENTS = await api("/api/auth/agreements"); } catch { AGREEMENTS = { terms: "加载失败", eula: "" }; }
@@ -495,13 +508,18 @@ $("logout").onclick = async () => { try { await api("/api/auth/logout", { method
 
 $("nav").addEventListener("click", (e) => {
   const b = e.target.closest("button[data-page]"); if (!b) return;
-  document.querySelectorAll("nav button").forEach((x) => x.classList.remove("active"));
-  b.classList.add("active");
-  document.querySelectorAll(".page").forEach((p) => p.classList.remove("active"));
-  $("page-" + b.dataset.page).classList.add("active");
-  $("page-title").textContent = titles[b.dataset.page] || b.dataset.page;
-  if (b.dataset.page === "qzone") loadQzone();
+    go(b.dataset.page);
 });
+
+function go(name) {
+  if (!$("page-" + name)) name = "overview";
+  document.querySelectorAll("nav button").forEach((x) => x.classList.toggle("active", x.dataset.page === name));
+  document.querySelectorAll(".page").forEach((p) => p.classList.remove("active"));
+  $("page-" + name).classList.add("active");
+  $("page-title").textContent = titles[name] || name;
+  if (location.hash.slice(1) !== name) history.replaceState(null, "", "#" + name);
+  if (name === "qzone") loadQzone();
+}
 
 /* ---------------- 说说详情 ---------------- */
 async function loadQzone() {
@@ -517,7 +535,7 @@ async function loadQzone() {
       '<span class="who">' + esc(t.name) + '</span>' +
       '<span class="txt">' + esc(t.hint || "") + (win ? ' <b>［仅 ' + esc(win) + '］</b>' : "") + '</span>' +
       '<span class="time">' + esc(t.id) + '</span>' +
-      '<button class="ghost sm" data-qz-del="' + esc(t.id) + '" style="all:unset;cursor:pointer;color:var(--bad);font-size:12px">删除</button></div>';
+      '<button data-qz-del="' + esc(t.id) + '" style="all:unset;cursor:pointer;color:var(--bad);font-size:12px;padding:3px 8px;border-radius:6px;flex:0 0 auto">删除</button></div>';
   }).join("") || '<div class="empty">还没有主题</div>';
   $("qz-active-hint").textContent = active.length
     ? ("当前只用：" + active.join(" / ") + "；留空表示全部主题都用。")
@@ -697,8 +715,7 @@ async function loadPrompt() {
     $("prompt-hint").textContent = (r.chars || 0) + " 字符";
   } catch (e) { $("prompt-hint").textContent = "读取失败"; }
 }
-loadPrompt();
-boot();
+boot();          // 未登录时不预读任何业务数据，避免 401 噪音
 </script>
 </body>
 </html>
