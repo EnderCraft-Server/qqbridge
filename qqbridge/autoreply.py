@@ -18,10 +18,11 @@ log = logging.getLogger("qqbridge.autoreply")
 
 class AutoReply:
     def __init__(self, bus, store, agent, bot, control, *, enabled: bool = True,
-                 idle_seconds: float = 1.5, max_per_minute: int = 8):
+                 idle_seconds: float = 1.5, max_per_minute: int = 8, agent_loop=None):
         self.bus = bus
         self.store = store
         self.agent = agent
+        self.agent_loop = agent_loop
         self.bot = bot
         self.control = control
         self.enabled = enabled
@@ -58,6 +59,7 @@ class AutoReply:
     def status(self) -> dict:
         return {
             "enabled": self.enabled,
+            "agent_mode": self.control.agent_mode if self.control else "chat",
             "running": bool(self._task and not self._task.done()),
             "sent_last_minute": len([t for t in self._sent if time.time() - t < 60]),
             "last_action": self.last_action,
@@ -89,6 +91,34 @@ class AutoReply:
         except Exception:
             return True
 
+    async def _run_agent(self, ev: dict) -> dict:
+        """agent 模式：把消息交给内置 Agent（带文件/命令工具）。"""
+        key = ev.get("group_id") or ev.get("user_id") or "?"
+        who = ev.get("sender") or ev.get("user_id")
+        task = (
+            f"来自 QQ 群 {ev.get('group_id') or '私聊'} 的消息，发送者 {who}（uid {ev.get('user_id')}）：\n"
+            f"{ev.get('text') or ''}\n\n"
+            "判断：如果这是在派活，就用工具办好并简短汇报；如果只是闲聊，就正常回一句。\n"
+            "直接给出要发到群里的那句话（可以引用做事的结果），不要输出过程、不要客套。"
+        )
+        system = (self.agent.system_prompt or "") + (
+            "\n\n你可以调用工具读写文件、执行命令。不知道就先看一眼再动手。"
+            "做完只回一句人话，别写报告。"
+        )
+        try:
+            out = await self.agent_loop.run(system, task)
+            reply = (out.get("text") or "").strip()
+        except Exception as exc:
+            self.errors += 1
+            log.warning("agent mode failed: %s", exc)
+            reply = ""
+        self.agent.decisions += 1
+        if reply:
+            self.agent.replies += 1
+        else:
+            self.agent.silences += 1
+        return {"reply": reply[:800], "reason": "agent 模式", "key": key}
+
     async def _tick(self):
         if not self.agent or not self.agent.llm.configured:
             return
@@ -102,7 +132,21 @@ class AutoReply:
         # 一次处理一条，避免刷屏
         ev = pending[0]
         self.agent.observe(ev)
-        decided = await self.agent.decide(ev)
+
+        in_agent_mode = bool(self.control) and self.control.is_agent()
+        is_admin = str(ev.get("user_id") or "") in config.admins
+
+        if in_agent_mode:
+            # agent 模式：只认管理员，走工具循环
+            if not is_admin:
+                self.bus.mark_processed(ev["id"])
+                self.last_action = "agent 模式忽略非管理员消息"
+                self.last_at = time.time()
+                return
+            decided = await self._run_agent(ev)
+        else:
+            decided = await self.agent.decide(ev)
+
         key = decided["key"]
         reply = decided["reply"]
 

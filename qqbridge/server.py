@@ -45,7 +45,8 @@ INSTRUCTIONS = """QQ 桥。所有工具都是非阻塞的：poll_events 立刻�
 写操作只接受白名单内的 owner 发起，并且需要 idempotency_key。"""
 
 
-def build_tools(box: Toolbox, rules: Rules, sched: Scheduler):
+def build_tools(box: Toolbox, rules: Rules, sched: Scheduler, control: Control,
+                llm: LLM, agent: QqAgent, agent_loop: AgentLoop, local_tools: LocalTools):
     tools = []
 
     def tool(name: str, description: str, schema: dict):
@@ -179,16 +180,21 @@ def build_tools(box: Toolbox, rules: Rules, sched: Scheduler):
     async def _ctl_get(**kw):
         return control.status()
 
-    @tool("set_control", "切换运行模式：auto 自动唤醒 / stopped 强制静默 / manual 手动。仅管理员。",
+    @tool("set_control", "切换运行模式。mode: auto/stopped/manual；agent_mode: chat/agent。仅管理员。",
           {"type": "object", "properties": {
               "actor": {"type": "string"},
               "mode": {"type": "string", "enum": ["auto", "stopped", "manual"]},
+              "agent_mode": {"type": "string", "enum": ["chat", "agent"]},
               "reason": {"type": "string", "default": ""}},
-           "required": ["actor", "mode"], "additionalProperties": False})
-    async def _ctl_set(actor: str, mode: str, reason: str = "", **kw):
+           "required": ["actor"], "additionalProperties": False})
+    async def _ctl_set(actor: str, mode: str = "", agent_mode: str = "", reason: str = "", **kw):
         if str(actor) not in config.admins:
             raise Denied(f"{actor} 不是管理员，不能切换运行模式。")
-        return control.set(mode, actor=actor, reason=reason)
+        if agent_mode:
+            control.set_agent_mode(agent_mode, actor=actor, reason=reason)
+        if mode:
+            control.set(mode, actor=actor, reason=reason)
+        return control.status()
 
     @tool("send_private", "单聊发文本。需 ALLOW_SEND 且 actor 在 OWNER_IDS。",
           {"type": "object", "properties": {
@@ -310,9 +316,10 @@ def create_app() -> FastAPI:
     local_tools = LocalTools(Path(config.agent_root) if config.agent_root else config.ROOT, store)
     agent_loop = AgentLoop(llm, local_tools, max_steps=config.agent_max_steps, store=store)
     bot = OneBot(config.http, config.ws, config.token, config.ws_token)
-    autoreply = AutoReply(bus, store, agent, bot, control, enabled=config.auto_reply)
+    autoreply = AutoReply(bus, store, agent, bot, control, enabled=config.auto_reply,
+                          agent_loop=agent_loop)
     box = Toolbox(bot, bus, store)
-    specs = build_tools(box, rules, sched)
+    specs = build_tools(box, rules, sched, control, llm, agent, agent_loop, local_tools)
     by_name = {s["name"]: s for s in specs}
 
     protocol = Server("qqbridge", version="0.1.0", instructions=INSTRUCTIONS)
@@ -359,6 +366,9 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def _startup():
+        global _MAIN_LOOP, _BOT
+        _MAIN_LOOP = asyncio.get_running_loop()
+        _BOT = bot
         await bot.start(on_event=lambda ev: _ingest(ev, bus, store, control))
         await sched.start()
         await autoreply.start()
@@ -523,8 +533,14 @@ def create_app() -> FastAPI:
     async def api_control(request: Request):
         _ui_auth(request)
         body = await request.json()
+        reason = str(body.get("reason") or "")
+        am = str(body.get("agent_mode") or "")
+        if am:
+            control.set_agent_mode(am, actor="gui", reason=reason)
         mode = str(body.get("mode") or "")
-        return control.set(mode, actor="gui", reason=str(body.get("reason") or ""))
+        if mode:
+            control.set(mode, actor="gui", reason=reason)
+        return control.status()
 
     @app.post("/api/scheduler")
     async def api_scheduler(request: Request):
@@ -587,14 +603,60 @@ def create_app() -> FastAPI:
     return app
 
 
+# 控制类回执需要从 WS 线程发消息：这里保存主循环与 bot 引用。
+_MAIN_LOOP = None
+_BOT = None
+
+
+def _reply(control, conversation: str, text: str):
+    """控制类回执：直接发出去，不进队列、不触发模型。"""
+    try:
+        conv = str(conversation or "")
+        if not conv.isdigit():
+            log.info("control reply (bad target): %s", text)
+            return
+        is_group = int(conv) > 1000000000      # QQ 群号量级
+        if _BOT is None or _MAIN_LOOP is None:
+            log.info("control reply (bot not ready): %s", text)
+            return
+        fut = asyncio.run_coroutine_threadsafe(
+            _BOT.call("send_group_msg" if is_group else "send_private_msg",
+                      **({"group_id": int(conv)} if is_group else {"user_id": int(conv)}),
+                      message=text),
+            _MAIN_LOOP)
+        fut.result(timeout=10)
+    except Exception:
+        log.exception("control reply failed")
+
+
 def _ingest(event: dict, bus: EventBus, store: Store, control: "Control" = None):
     """Callback from the WebSocket thread: store + queue. Never touches the model."""
     # 管理员命令在入队前拦下
     if control is not None and event.get("post_type") == "message":
         raw = event.get("raw_message") or ""
+        sender = str(event.get("user_id") or "")
+
+        # /switch agent | /switch chat
+        sw = commands.parse_switch(raw)
+        if sw:
+            gid = event.get("group_id") or event.get("user_id")
+            if sender not in config.admins:
+                _reply(control, gid, "只有管理员能切换模式。")
+                return
+            if sw == "?":
+                _reply(control, gid, "用法：/switch agent 只听管理员并允许调工具；/switch chat 恢复群友闲聊")
+                return
+            try:
+                control.set_agent_mode(sw, actor=sender, reason=raw.strip()[:80])
+                _reply(control, gid, "已切到 " + sw + " 模式"
+                       + ("（只响应管理员，可调用文件/命令工具）" if sw == "agent" else "（群友闲聊）"))
+                log.info("switch: %s -> %s by %s", raw.strip()[:30], sw, sender)
+            except Exception as exc:
+                _reply(control, gid, "切换失败：" + str(exc)[:120])
+            return
+
         target = commands.parse(raw)
         if target:
-            sender = str(event.get("user_id") or "")
             if sender in config.admins:
                 control.set(target, actor=sender, reason=raw.strip()[:80])
                 log.info("control: %s -> %s by %s", raw.strip()[:20], target, sender)

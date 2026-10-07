@@ -14,6 +14,8 @@ import time
 from pathlib import Path
 
 MODES = ("auto", "stopped", "manual")
+# 行为模式：chat = 群友闲聊（所有人都能聊）；agent = 只认管理员，可调工具干活
+AGENT_MODES = ("chat", "agent")
 
 
 class Control:
@@ -23,6 +25,7 @@ class Control:
         self.store = store
         self._lock = threading.RLock()
         self.mode = "auto"
+        self.agent_mode = "chat"
         self.by = ""
         self.at = 0.0
         self.reason = ""
@@ -34,6 +37,8 @@ class Control:
                 d = json.loads(self.path.read_text(encoding="utf-8"))
                 if d.get("mode") in MODES:
                     self.mode = d["mode"]
+                if d.get("agent_mode") in AGENT_MODES:
+                    self.agent_mode = d["agent_mode"]
                     self.by = d.get("by", "")
                     self.at = d.get("at", 0.0)
                     self.reason = d.get("reason", "")
@@ -45,7 +50,7 @@ class Control:
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps({
-            "mode": self.mode, "by": self.by, "at": self.at, "reason": self.reason
+            "mode": self.mode, "agent_mode": self.agent_mode, "by": self.by, "at": self.at, "reason": self.reason
         }, ensure_ascii=False, indent=1), encoding="utf-8")
 
     def _apply(self):
@@ -73,6 +78,23 @@ class Control:
                              {"reason": self.reason}, "SUCCEEDED", f"mode={mode}")
             return self.status()
 
+    def set_agent_mode(self, agent_mode: str, actor: str = "", reason: str = ""):
+        """切换 chat / agent 行为模式。"""
+        if agent_mode not in AGENT_MODES:
+            raise ValueError("模式必须是 chat 或 agent。")
+        with self._lock:
+            self.agent_mode = agent_mode
+            self.by = str(actor)
+            self.at = time.time()
+            self.reason = (reason or "")[:200]
+            self.save()
+            self.store.audit(str(actor), "switch:" + agent_mode, "runtime",
+                             {"reason": self.reason}, "SUCCEEDED", f"agent_mode={agent_mode}")
+            return self.status()
+
+    def is_agent(self) -> bool:
+        return self.agent_mode == "agent"
+
     def status(self) -> dict:
-        return {"mode": self.mode, "by": self.by, "at": self.at,
+        return {"mode": self.mode, "agent_mode": self.agent_mode, "by": self.by, "at": self.at,
                 "reason": self.reason, "paused": self.paused()}

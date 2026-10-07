@@ -13,9 +13,26 @@ ALIASES = {
 
 
 def parse(text: str) -> str | None:
-    """返回目标模式；不是控制命令则返回 None。"""
+    """返回目标运行模式（auto/stopped/manual）；不是控制命令则返回 None。"""
     raw = (text or "").strip()
     if not raw:
         return None
     head = raw.split()[0].lower()
     return COMMANDS.get(head) or ALIASES.get(head)
+
+
+SWITCHES = {"agent": "agent", "chat": "chat", "chatbot": "chat", "聊天": "chat", "干活": "agent"}
+
+
+def parse_switch(text: str) -> str | None:
+    """解析 /switch agent | /switch chat。返回目标行为模式，或 None。
+
+    只认 /switch 开头；缺参数时返回特殊值 "?"，便于回一句用法。
+    """
+    raw = (text or "").strip()
+    if not raw.startswith("/switch"):
+        return None
+    parts = raw.split()
+    if len(parts) < 2:
+        return "?"
+    return SWITCHES.get(parts[1].lower().strip())
