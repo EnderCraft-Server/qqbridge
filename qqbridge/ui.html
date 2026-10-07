@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>qqbridge</title>
+<style>
+  :root{
+    --bg:#0b0d12; --card:#151922; --line:#232837; --line2:#2d3345;
+    --fg:#e8ecf4; --dim:#7f8899; --dim2:#5b6478;
+    --ok:#34d399; --warn:#fbbf24; --bad:#f87171; --accent:#5b9dff; --accent2:#a78bfa;
+    --radius:14px;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;min-height:100vh;
+    background:
+      radial-gradient(1100px 600px at 15% -10%, #1b2540 0%, transparent 60%),
+      radial-gradient(900px 500px at 110% 10%, #241a3a 0%, transparent 55%),
+      var(--bg);
+    color:var(--fg);font:14px/1.6 "Segoe UI Variable","Segoe UI",system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  header{position:sticky;top:0;z-index:10;backdrop-filter:blur(14px);
+    background:rgba(11,13,18,.78);border-bottom:1px solid var(--line);
+    padding:14px 28px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .logo{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;
+    background:linear-gradient(135deg,var(--accent),var(--accent2));font-weight:800;color:#08101f;font-size:15px}
+  header h1{font-size:16px;margin:0;font-weight:650}
+  header .sub{color:var(--dim2);font-size:12px;margin-left:-8px}
+  .spacer{flex:1}
+  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:7px;vertical-align:1px}
+  .dot.on{background:var(--ok);box-shadow:0 0 0 4px rgba(52,211,153,.14)}
+  .dot.off{background:var(--bad);box-shadow:0 0 0 4px rgba(248,113,113,.14)}
+  .chip{display:inline-flex;align-items:center;padding:5px 12px;border-radius:99px;font-size:12.5px;
+    border:1px solid var(--line);background:rgba(255,255,255,.02);color:var(--dim)}
+  main{max-width:1320px;margin:0 auto;padding:26px 28px 60px;display:grid;gap:18px;
+    grid-template-columns:repeat(auto-fit,minmax(400px,1fr))}
+  .card{background:linear-gradient(180deg,rgba(255,255,255,.026),rgba(255,255,255,.008));
+    border:1px solid var(--line);border-radius:var(--radius);padding:20px 22px;
+    box-shadow:0 18px 40px -28px rgba(0,0,0,.9)}
+  .card.wide{grid-column:1/-1}
+  .card h2{font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim2);
+    margin:0 0 18px;display:flex;align-items:center;gap:9px;font-weight:650}
+  .card h2::before{content:"";width:3px;height:13px;border-radius:2px;background:linear-gradient(180deg,var(--accent),var(--accent2))}
+  label{display:block;font-size:12.5px;color:var(--dim);margin:14px 0 6px}
+  input,textarea{width:100%;background:#0a0c11;border:1px solid var(--line2);color:var(--fg);
+    border-radius:9px;padding:9px 12px;font:inherit;transition:.15s}
+  input:focus,textarea:focus{outline:0;border-color:var(--accent);box-shadow:0 0 0 3px rgba(91,157,255,.15)}
+  button{background:linear-gradient(180deg,var(--accent),#3d7fe0);color:#05101f;border:0;border-radius:9px;
+    padding:10px 18px;font:inherit;font-weight:650;cursor:pointer;transition:.15s;
+    box-shadow:0 6px 18px -10px rgba(91,157,255,.9)}
+  button:hover{filter:brightness(1.08);transform:translateY(-1px)}
+  button.ghost{background:transparent;color:var(--dim);border:1px solid var(--line2);box-shadow:none;padding:8px 12px;font-weight:500}
+  button.ghost:hover{color:var(--fg);border-color:var(--accent);background:rgba(91,157,255,.07)}
+  .row{display:flex;gap:9px;align-items:center}
+  .row>*{flex:1}.row>button{flex:0 0 auto}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .switch{display:flex;align-items:center;justify-content:space-between;gap:12px;
+    padding:12px 14px;border:1px solid var(--line2);border-radius:10px;background:rgba(255,255,255,.014);margin-bottom:10px}
+  .switch .t{font-size:13.5px}
+  .switch .d{font-size:11.5px;color:var(--dim2);margin-top:2px}
+  .toggle{position:relative;width:44px;height:25px;flex:0 0 auto}
+  .toggle input{position:absolute;opacity:0;width:100%;height:100%;margin:0;cursor:pointer;z-index:2}
+  .toggle i{position:absolute;inset:0;border-radius:99px;background:#2a3040;transition:.2s}
+  .toggle i::after{content:"";position:absolute;top:3px;left:3px;width:19px;height:19px;border-radius:50%;
+    background:#8b93a7;transition:.2s}
+  .toggle input:checked+i{background:linear-gradient(135deg,var(--accent),var(--accent2))}
+  .toggle input:checked+i::after{transform:translateX(19px);background:#fff}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:11px}
+  .stat{background:#0a0c11;border:1px solid var(--line);border-radius:11px;padding:13px 15px}
+  .stat .k{font-size:11px;color:var(--dim2)}
+  .stat .v{font-size:22px;font-weight:700;margin-top:5px;font-variant-numeric:tabular-nums}
+  .stat.hi .v{color:var(--accent)}.stat.ok .v{color:var(--ok)}.stat.wa .v{color:var(--warn)}
+  .feed{max-height:340px;overflow:auto;border:1px solid var(--line);border-radius:11px;background:#090b0f}
+  .feed .item{display:flex;gap:11px;align-items:center;padding:10px 14px;border-bottom:1px solid #12151c;font-size:13px}
+  .feed .item:last-child{border-bottom:0}
+  .feed .item:hover{background:rgba(91,157,255,.045)}
+  .tag{flex:0 0 auto;font-size:10.5px;padding:2px 7px;border-radius:5px;background:#1a1f2b;color:var(--dim)}
+  .tag.high{background:rgba(248,113,113,.16);color:#ff9d9d}
+  .tag.mid{background:rgba(251,191,36,.16);color:#ffd479}
+  .tag.low{background:rgba(91,157,255,.14);color:#9dc2ff}
+  .feed .who{color:var(--fg);font-weight:550;flex:0 0 auto;max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .feed .txt{color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+  .feed .time{color:var(--dim2);font-size:11.5px;flex:0 0 auto;font-variant-numeric:tabular-nums}
+  .empty{color:var(--dim2);padding:22px;text-align:center;font-size:13px}
+  .hint{font-size:12px;color:var(--dim2);margin-top:10px;line-height:1.65}
+  .hint code{background:#0a0c11;border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:11.5px}
+  .toast{position:fixed;right:22px;bottom:22px;background:var(--card);border:1px solid var(--line2);
+    border-radius:11px;padding:12px 18px;opacity:0;transform:translateY(8px);transition:.22s;pointer-events:none;
+    box-shadow:0 20px 40px -18px rgba(0,0,0,.9)}
+  .toast.show{opacity:1;transform:none}
+  ::-webkit-scrollbar{width:9px;height:9px}
+  ::-webkit-scrollbar-thumb{background:#242a38;border-radius:9px}
+  ::-webkit-scrollbar-thumb:hover{background:#31384a}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">Q</div>
+  <h1>qqbridge</h1>
+  <span class="sub">QQ ↔ MCP 桥</span>
+  <div class="spacer"></div>
+  <span class="chip" id="c-ws"><i class="dot off"></i>连接中</span>
+  <span class="chip" id="c-sched"><i class="dot off"></i>巡检</span>
+  <span class="chip" id="c-self">账号 …</span>
+</header>
+
+<main>
+  <section class="card">
+    <h2>巡检与唤醒</h2>
+    <div class="switch">
+      <div><div class="t">启用自动巡检</div><div class="d">有消息才唤醒模型，空闲零消耗</div></div>
+      <label class="toggle"><input type="checkbox" id="enabled"><i></i></label>
+    </div>
+    <label>巡检间隔（秒）</label>
+    <div class="row">
+      <input type="number" id="interval" min="5" max="86400">
+      <button class="ghost" data-set="10">10 秒</button>
+      <button class="ghost" data-set="30">30 秒</button>
+      <button class="ghost" data-set="300">5 分</button>
+    </div>
+    <div class="grid2">
+      <div><label>最小间隔（秒）</label><input type="number" id="min_gap" min="0"></div>
+      <div><label>每小时上限</label><input type="number" id="max_turns" min="1"></div>
+    </div>
+    <label>静默时段（留空不启用）</label>
+    <div class="row"><input type="time" id="q1"><input type="time" id="q2"></div>
+    <button id="save-sched" style="margin-top:16px;width:100%">保存</button>
+    <div class="hint">唤醒由 DSH 插件 <code>dsh-qqbridge-wake</code> 执行：每 N 秒轮询一次本服务，<b>没有消息就不产生任何模型调用</b>。</div>
+  </section>
+
+  <section class="card">
+    <h2>权限与安全</h2>
+    <div class="switch">
+      <div><div class="t">允许发送</div><div class="d">发文本 / 图片到群</div></div>
+      <label class="toggle"><input type="checkbox" id="allow_send"><i></i></label>
+    </div>
+    <div class="switch">
+      <div><div class="t">允许群管理</div><div class="d">禁言 / 踢人 / 改名 / 群名片 / 全员禁言 / 退群</div></div>
+      <label class="toggle"><input type="checkbox" id="allow_manage"><i></i></label>
+    </div>
+    <label>Owner 白名单（只有这些 QQ 能触发写操作）</label>
+    <input id="owners" placeholder="98704929">
+    <button id="save-perm" style="margin-top:16px;width:100%">保存</button>
+    <div class="hint">写操作必须由白名单账号发起并带幂等键，全部留痕在下方审计记录。</div>
+  </section>
+
+  <section class="card">
+    <h2>监控范围</h2>
+    <label>只监控这些群（逗号分隔；留空表示全部）</label>
+    <input id="watch" placeholder="1060667115">
+    <label>关键词触发（空格分隔，命中即唤醒）</label>
+    <textarea id="keywords" rows="4"></textarea>
+    <button id="save-watch" style="margin-top:16px;width:100%">保存</button>
+    <div class="hint">不在监控范围内的群<b>只落库，绝不唤醒模型</b>。</div>
+  </section>
+
+  <section class="card">
+    <h2>运行状态</h2>
+    <div class="stats" id="stats"></div>
+  </section>
+
+  <section class="card wide">
+    <h2>消息流</h2>
+    <div class="feed" id="events"></div>
+  </section>
+
+  <section class="card wide">
+    <h2>审计记录</h2>
+    <div class="feed" id="audit"></div>
+  </section>
+</main>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let TOKEN = new URLSearchParams(location.search).get("token") || localStorage.getItem("qqbridge_token") || "";
+if (TOKEN) localStorage.setItem("qqbridge_token", TOKEN);
+const toast = (m) => { const t = $("toast"); t.textContent = m; t.classList.add("show");
+  clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove("show"), 1900); };
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, { ...opts, headers: { "Content-Type": "application/json", "X-Bridge-Token": TOKEN, ...(opts.headers || {}) } });
+  const text = await res.text();
+  let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  if (!res.ok) throw new Error(data.detail || data.error || res.status);
+  return data;
+}
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const hhmm = (t) => new Date(t * 1000).toLocaleTimeString("zh-CN", { hour12: false });
+let lastAudit = 0;
+
+async function refresh() {
+  try {
+    const s = await api("/api/state");
+    const st = s.scheduler.settings;
+    const tag = document.activeElement?.tagName;
+    if (tag !== "INPUT" && tag !== "TEXTAREA") {
+      $("enabled").checked = !!st.enabled;
+      $("interval").value = st.interval_seconds;
+      $("min_gap").value = st.min_gap_seconds;
+      $("max_turns").value = st.max_turns_per_hour;
+      const q = (st.quiet_hours || [])[0] || ["", ""];
+      $("q1").value = q[0] || ""; $("q2").value = q[1] || "";
+      $("allow_send").checked = !!s.config.allow_send;
+      $("allow_manage").checked = !!s.config.allow_manage;
+      $("owners").value = (s.config.owners || []).join(",");
+      $("watch").value = (s.config.watch_groups || []).join(",");
+      $("keywords").value = (s.keywords || []).join(" ");
+    }
+    $("c-self").textContent = "账号 " + (s.bot.self_id || "?");
+    $("c-ws").innerHTML = '<i class="dot ' + (s.bot.ws_connected ? "on" : "off") + '"></i>' + (s.bot.ws_connected ? "QQ 已连接" : "QQ 断开");
+    $("c-sched").innerHTML = '<i class="dot ' + (st.enabled ? "on" : "off") + '"></i>' + (st.enabled ? "巡检 " + st.interval_seconds + "s" : "巡检关闭");
+
+    const b = s.scheduler.bus;
+    $("stats").innerHTML = [
+      ["队列总量", b.stored, ""], ["待处理 @我", b.pending_high, b.pending_high ? "hi" : ""],
+      ["待处理 关键词", b.pending_mid, b.pending_mid ? "wa" : ""], ["待处理 闲聊", b.pending_low, ""],
+      ["巡检次数", s.scheduler.runs, ""],
+      ["距下次巡检", st.enabled ? (s.scheduler.seconds_until_next ?? "—") + "s" : "未启用", ""],
+      ["监控群", (s.config.watch_groups || []).length || "全部", ""],
+      ["静默中", s.scheduler.in_quiet_hours ? "是" : "否", s.scheduler.in_quiet_hours ? "wa" : "ok"]
+    ].map(([k, v, c]) => '<div class="stat ' + c + '"><div class="k">' + k + '</div><div class="v">' + esc(v) + '</div></div>').join("");
+
+    const ev = await api("/api/events?limit=40");
+    const items = (ev.events || []).slice().reverse();
+    $("events").innerHTML = items.length ? items.map((e) =>
+      '<div class="item"><span class="tag ' + (e.priority === "high" ? "high" : e.priority === "mid" ? "mid" : "low") + '">' +
+      (e.priority === "high" ? "@我" : e.priority === "mid" ? "关键词" : e.priority === "low" ? "闲聊" : "存档") + '</span>' +
+      '<span class="time">' + hhmm(e.at) + '</span><span class="who">' + esc(e.sender) + '</span>' +
+      '<span class="txt">' + esc(e.text) + '</span><span class="time">群' + esc(e.group_id) + '</span></div>').join("")
+      : '<div class="empty">暂无消息</div>';
+
+    const au = await api("/api/audit?limit=40");
+    const sig = (au.records || []).length ? au.records[0].id : 0;
+    if (sig !== lastAudit) {
+      lastAudit = sig;
+      $("audit").innerHTML = (au.records || []).length ? au.records.map((r) =>
+        '<div class="item"><span class="tag ' + (r.state === "SUCCEEDED" ? "mid" : "high") + '">' + esc(r.state) + '</span>' +
+        '<span class="time">' + hhmm(r.at) + '</span><span class="who">' + esc(r.actor) + '</span>' +
+        '<span class="txt">' + esc(r.action) + ' → ' + esc(r.target) + '</span></div>').join("")
+        : '<div class="empty">暂无记录</div>';
+    }
+  } catch (e) {
+    $("stats").innerHTML = '<div class="stat"><div class="k">读取失败</div><div class="v" style="font-size:13px">' + esc(e.message) + '</div></div>';
+  }
+}
+
+const save = async (fn, msg) => { try { await fn(); toast(msg); refresh(); } catch (e) { toast("失败：" + e.message); } };
+
+$("save-sched").onclick = () => save(() => api("/api/scheduler", { method: "POST", body: JSON.stringify({
+  enabled: $("enabled").checked, interval_seconds: +$("interval").value,
+  min_gap_seconds: +$("min_gap").value, max_turns_per_hour: +$("max_turns").value,
+  quiet_hours: ($("q1").value && $("q2").value) ? [[$("q1").value, $("q2").value]] : [] }) }), "巡检设置已保存");
+
+$("save-perm").onclick = () => save(() => api("/api/permissions", { method: "POST", body: JSON.stringify({
+  allow_send: $("allow_send").checked, allow_manage: $("allow_manage").checked,
+  owners: $("owners").value.split(/[,，\s]+/).filter(Boolean) }) }), "安全设置已保存");
+
+$("save-watch").onclick = () => save(async () => {
+  await api("/api/watch", { method: "POST", body: JSON.stringify({ watch_groups: $("watch").value.split(/[,，\s]+/).filter(Boolean) }) });
+  await api("/api/keywords", { method: "POST", body: JSON.stringify({ keywords: $("keywords").value.split(/[\s,，]+/).filter(Boolean) }) });
+}, "监控范围已保存");
+
+document.querySelectorAll("[data-set]").forEach((b) => b.onclick = () => { $("interval").value = b.dataset.set; });
+if (!TOKEN) { const v = prompt("请输入访问令牌（.env 的 MCP_TOKEN）"); if (v) { TOKEN = v.trim(); localStorage.setItem("qqbridge_token", TOKEN); } }
+refresh();
+setInterval(refresh, 4000);
+</script>
+</body>
+</html>

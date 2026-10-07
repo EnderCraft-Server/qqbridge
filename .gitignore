@@ -1,0 +1,16 @@
+# 凭据与本地状态 —— 绝不提交
+.env
+data/
+*.log
+*.log.err
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.tmp/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
