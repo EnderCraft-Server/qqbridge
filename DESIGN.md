@@ -1,4 +1,4 @@
-# QQ 桥 (qqbridge) — 自研 OneBot + MCP
+﻿# QQ 桥 (qqbridge) — 自研 OneBot + MCP
 
 替代 Tulpa 的最小可用实现：直接吃 SnowLuma 的 OneBot v11 接口，
 把 QQ 常用能力包成 MCP 工具，**并且不用 wait 阻塞循环**。
@@ -24,7 +24,7 @@ OneBot WS 事件 ──► 本地事件总线（常驻，零模型成本）
                         └─► 按规则触发：@我 / 关键词 / 冷却时间到
                                   │
                                   ▼
-                          MCP resource 推送（DSH 侧订阅）
+                          MCP 工具轮询（外部 Agent 或自带循环）
                           或 Agent 用 tools/list_pending 主动拉
 ```
 
@@ -97,4 +97,4 @@ qqbridge/
   - `cooldown`：距上次发言 > N 秒且有新消息 → 低优先级入队
   - `silent`：都不满足 → 只记录，不唤醒模型
 - Agent 侧建议节奏：醒一次 → `list_pending` → 处理 → `send_message` → 再次挂起
-  由 DSH 的 schedule/goal 机制定期唤醒，而不是死循环 wait
+  由进程内的 autoreply 循环驱动（见 autoreply.py），不依赖任何外部 Agent 宿主

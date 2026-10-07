@@ -81,19 +81,33 @@ class Toolbox(QzoneMixin):
         return self.store.search(query, group_id, limit)
 
     def poll_events(self, cursor: int = 0, include_low: bool = True, limit: int = 50) -> dict:
-        """Non-blocking. Never sleeps; returns whatever is queued right now."""
-        if cursor:
-            self.bus.mark_processed(cursor)
-        items = self.bus.pending(include_low=include_low, limit=limit)
+        """**纯读**：返回 id > cursor 的事件，不改变任何状态。
+
+        历史教训：早期版本在这里先调 mark_processed(cursor) 再取队列，而 mark_processed
+        只进不退 —— 于是传一个较大的 cursor 会**静默清空整个待处理队列**。
+        现在游标只由 mark_processed 显式推进，读操作永远无副作用。
+        """
+        items = self.bus.since(cursor, limit, include_low=include_low)
         return {
             "events": items,
             "count": len(items),
-            "cursor": items[-1]["id"] if items else self.bus.status()["cursor"],
+            "cursor": cursor,
+            "next_cursor": items[-1]["id"] if items else cursor,
+            "head": self.bus.status()["last_id"],
+            "pending": self.bus.status()["pending_total"],
             "status": self.bus.status(),
         }
 
     def list_pending(self, include_low: bool = True) -> dict:
-        return self.poll_events(0, include_low)
+        """只返回尚未处理的队列（按优先级），同样不改变状态。"""
+        items = self.bus.pending(include_low=include_low, limit=50)
+        st = self.bus.status()
+        return {
+            "events": items,
+            "count": len(items),
+            "cursor": st["cursor"],
+            "status": st,
+        }
 
     # ---------- write ----------
     async def send_message(self, actor: str, group_id: str, text: str,

@@ -1,4 +1,4 @@
-"""In-memory event bus with a ring buffer and trigger rules.
+﻿"""In-memory event bus with a ring buffer and trigger rules.
 
 The whole point: the model never waits. Events accumulate here (cheap, no model
 cost) and the agent pulls whatever is pending whenever it happens to run.
@@ -6,9 +6,12 @@ cost) and the agent pulls whatever is pending whenever it happens to run.
 from __future__ import annotations
 
 import itertools
+import logging
 import threading
 import time
 from collections import deque
+
+log = logging.getLogger("qqbridge.bus")
 
 
 class EventBus:
@@ -18,9 +21,10 @@ class EventBus:
                  rules=None, watch_groups=None, control=None, store=None):
         self._lock = threading.RLock()
         self._events = deque(maxlen=size)
+        self._dropped = 0            # 被环形缓冲挤掉的条数（可观测）
         # Durable id sequence + cursor. Both live in the store when one is supplied, so a
         # restart resumes where it left off instead of rewinding to 1. Without this, an
-        # external poller (e.g. dsh-qqbridge-wake) keeps its own monotonic cursor, sees every
+        # An external poller keeps its own monotonic cursor and sees every
         # new id as "already processed", and silently stops waking anyone until it is restarted.
         self._store = store
         # Seed from persisted state; on the first run after an upgrade, fall back to the highest
@@ -121,6 +125,11 @@ class EventBus:
             record["keyword_hit"] = hit
             if self.watch_groups and record["group_id"] not in self.watch_groups and record["message_type"] == "group":
                 return record          # 落库但绝不入队，完全不唤醒
+            if len(self._events) == self._events.maxlen:
+                self._dropped += 1
+                if self._dropped == 1 or self._dropped % 100 == 0:
+                    log.warning("环形缓冲已满（%d），累计挤掉 %d 条；完整历史在 SQLite 里",
+                                self._events.maxlen, self._dropped)
             self._events.append(record)
             paused = bool(self.control) and self.control.paused()
             if not record["is_self"] and not paused:
@@ -153,6 +162,8 @@ class EventBus:
             "stored": len(events),
             "last_id": events[-1]["id"] if events else 0,
             "cursor": self._processed,
+            "pending_total": len(high) + len(mid) + len(low),
+            "dropped": self._dropped,
             "pending_high": len(high),
             "pending_mid": len(mid),
             "pending_low": len(low),
@@ -177,14 +188,29 @@ class EventBus:
                 out.append(rec)
         return out
 
-    def since(self, cursor: int = 0, limit: int = 100) -> list:
+    def since(self, cursor: int = 0, limit: int = 100, include_low: bool = True) -> list:
+        """**纯读**：返回 id > cursor 的事件。include_low=False 时只给"值得处理"的。
+
+        这里永不修改状态 —— 游标的推进只发生在 mark_processed。
+        """
         with self._lock:
-            events = list(self._events)
-        return [e for e in events if e["id"] > cursor][:limit]
+            events = [e for e in self._events if e["id"] > cursor]
+        if not include_low:
+            with self._lock:
+                worth = set(self._pending_high) | set(self._pending_mid)
+            events = [e for e in events if e["id"] in worth or e["is_self"]]
+        return events[:limit]
 
     def mark_processed(self, through_id: int) -> int:
+        """推进游标。只进不退；跳过尚未处理的事件会在日志里留警告。"""
+        through_id = int(through_id)
         with self._lock:
-            self._processed = max(self._processed, int(through_id))
+            skipped = [i for i in (self._pending_high + self._pending_mid + self._pending_low)
+                       if self._processed < i <= through_id]
+            if skipped:
+                log.warning("mark_processed(%d) 跳过了 %d 条未处理事件：%s",
+                            through_id, len(skipped), skipped[:10])
+            self._processed = max(self._processed, through_id)
             self._pending_high = [i for i in self._pending_high if i > through_id]
             self._pending_mid = [i for i in self._pending_mid if i > through_id]
             self._pending_low = [i for i in self._pending_low if i > through_id]

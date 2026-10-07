@@ -1,4 +1,4 @@
-# qqbridge
+﻿# qqbridge
 
 QQ ↔ MCP 桥：把 QQ 群聊接进 Agent，**没有消息时不产生任何模型调用**。
 
@@ -37,7 +37,7 @@ QQ 客户端
    └─ OneBot v11（SnowLuma / NapCat / Lagrange）   HTTP :3000   WS :3001
           └─ qqbridge                               MCP :18900   控制台 :18900
                  ├─ 自带模型：直接调 OpenAI 兼容 API，自己接话
-                 └─ MCP 工具：外部 Agent（DSH / Codex / Claude Code）仍可接入
+                 └─ MCP 工具：外部 Agent（Codex / Claude Code / 任意 MCP 客户端）可接入
 ```
 
 两条路并存、共用同一个事件队列：

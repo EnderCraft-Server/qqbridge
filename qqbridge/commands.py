@@ -6,7 +6,10 @@ COMMANDS = {
     "/start": "manual",
     "/auto": "auto",
 }
-ALIASES = {"/pause": "stopped", "/resume": "manual", "/继续": "manual", "/停止": "stopped"}
+ALIASES = {
+    "/pause": "stopped", "/off": "stopped", "/停止": "stopped", "/关闭": "stopped",
+    "/resume": "manual", "/on": "auto", "/继续": "manual", "/开启": "auto",
+}
 
 
 def parse(text: str) -> str | None:
