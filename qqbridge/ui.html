@@ -109,6 +109,19 @@
   .list .txt{color:var(--muted-fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
   .list .time{color:var(--muted-fg);font-size:11.5px;flex:0 0 auto;font-variant-numeric:tabular-nums}
   .empty{color:var(--muted-fg);padding:22px;text-align:center;font-size:13px}
+  /* 图片消息 */
+  .list .item.media{flex-wrap:wrap;align-items:flex-start}
+  .thumbs{flex:1 0 100%;display:flex;flex-wrap:wrap;gap:8px;margin-top:9px}
+  .thumbs img{max-height:120px;max-width:190px;border-radius:8px;border:1px solid var(--border);
+    cursor:zoom-in;background:var(--muted);object-fit:cover;transition:transform .12s}
+  .thumbs img:hover{transform:scale(1.02)}
+  .thumbs img.broken{border-style:dashed;opacity:.5;cursor:default}
+  .lightbox{position:fixed;inset:0;z-index:60;background:oklch(20% .03 250 / .82);display:none;
+    place-items:center;padding:32px;cursor:zoom-out;backdrop-filter:blur(3px)}
+  .lightbox.show{display:grid}
+  .lightbox img{max-width:min(92vw,1400px);max-height:88vh;border-radius:var(--radius);
+    box-shadow:0 30px 80px -20px #0008;background:var(--card)}
+  .lightbox .cap{position:absolute;bottom:26px;color:oklch(95% .01 240);font-size:12.5px;opacity:.85}
   .hint{font-size:12.5px;color:var(--muted-fg);margin-top:10px;line-height:1.7}
   .hint code{background:var(--muted);border-radius:5px;padding:1px 6px;font-size:12px}
   .toast{position:fixed;right:22px;bottom:22px;background:var(--card);border:1px solid var(--border);
@@ -416,6 +429,7 @@
     </div>
   </main>
 </div>
+<div class="lightbox" id="lightbox"><img id="lightbox-img" alt=""><div class="cap" id="lightbox-cap"></div></div>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -432,6 +446,20 @@ async function api(path, opts = {}) {
   return data;
 }
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+// 图片走本机代理：QQ 图床是带 rkey 的临时链，直连可能被 Referer 挡掉
+const imgSrc = (url) => "/api/image?u=" + encodeURIComponent(url || "");
+// raw_message 里的 CQ 码对人不友好，显示前换成中文标记
+const cqLabel = (t) => String(t ?? "")
+  .replace(/\[CQ:image,[^\]]*\]/g, "[图片]")
+  .replace(/\[CQ:face,[^\]]*\]/g, "[表情]")
+  .replace(/\[CQ:record,[^\]]*\]/g, "[语音]")
+  .replace(/\[CQ:video,[^\]]*\]/g, "[视频]")
+  .replace(/\[CQ:at,qq=(\d+)\]/g, "@$1")
+  .replace(/\[CQ:reply,[^\]]*\]/g, "")
+  .replace(/\[CQ:[^\]]*\]/g, "")
+  .trim();
+const evImages = (e) => ((e && e.segments) || []).filter((s) => s.type === "image" && s.url).map((s) => s.url);
+const evText = (e) => cqLabel(e.text) || (evImages(e).length ? "" : "（无内容）");
 const hhmm = (t) => new Date((t || 0) * 1000).toLocaleTimeString("zh-CN", { hour12: false });
 const titles = { overview: "概览", model: "模型与人格", watch: "巡检与唤醒", qzone: "自动说说", safety: "权限与安全", agent: "内置 Agent", logs: "日志与审计" };
 
@@ -506,6 +534,28 @@ $("lg-pass").onkeydown = (e) => { if (e.key === "Enter") doLogin(); };
 
 $("logout").onclick = async () => { try { await api("/api/auth/logout", { method: "POST" }); } catch {} location.reload(); };
 
+/* ---------------- 图片查看 ---------------- */
+$("events").addEventListener("click", (e) => {
+  const img = e.target.closest("img[data-full]");
+  if (!img) return;
+  $("lightbox-img").src = img.dataset.full;
+  $("lightbox-cap").textContent = img.dataset.cap || "";
+  $("lightbox").classList.add("show");
+});
+$("lightbox").onclick = () => {
+  $("lightbox").classList.remove("show");
+  $("lightbox-img").src = "";
+};
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("lightbox").onclick(); });
+// 图床链接是会过期的，取不到就标出来，别让它一直转
+window.addEventListener("error", (e) => {
+  if (e.target && e.target.tagName === "IMG" && e.target.closest(".thumbs")) {
+    e.target.classList.add("broken");
+    e.target.alt = "图片已过期或取不到";
+    e.target.removeAttribute("src");
+  }
+}, true);
+
 $("nav").addEventListener("click", (e) => {
   const b = e.target.closest("button[data-page]"); if (!b) return;
     go(b.dataset.page);
@@ -557,6 +607,8 @@ async function loadQzone() {
 }
 
 const save = async (fn, msg) => { try { await fn(); toast(msg); refresh(); } catch (e) { toast("失败：" + e.message); } };
+
+let lastEventsHtml = "";
 
 async function refresh() {
   try {
@@ -625,12 +677,23 @@ async function refresh() {
 
     const ev = await api("/api/events?limit=40");
     const items = (ev.events || []).slice().reverse();
-    $("events").innerHTML = items.length ? items.map((e) =>
-      '<div class="item"><span class="tag ' + (e.priority === "high" ? "high" : e.priority === "mid" ? "mid" : "low") + '">' +
-      (e.priority === "high" ? "@我" : e.priority === "mid" ? "关键词" : e.priority === "low" ? "闲聊" : "存档") + '</span>' +
-      '<span class="time">' + hhmm(e.at) + '</span><span class="who">' + esc(e.sender) + '</span>' +
-      '<span class="txt">' + esc(e.text) + '</span><span class="time">群' + esc(e.group_id) + '</span></div>').join("")
+    const eventsHtml = items.length ? items.map((e) => {
+      const imgs = evImages(e);
+      const thumbs = imgs.length
+        ? '<div class="thumbs">' + imgs.map((u) =>
+            '<img src="' + esc(imgSrc(u)) + '" loading="lazy" alt="图片消息" ' +
+            'data-full="' + esc(imgSrc(u)) + '" data-cap="' + esc(e.sender + " · 群" + e.group_id) + '">').join("") + '</div>'
+        : "";
+      return '<div class="item' + (imgs.length ? " media" : "") + '"><span class="tag ' +
+        (e.priority === "high" ? "high" : e.priority === "mid" ? "mid" : "low") + '">' +
+        (e.priority === "high" ? "@我" : e.priority === "mid" ? "关键词" : e.priority === "low" ? "闲聊" : "存档") + '</span>' +
+        '<span class="time">' + hhmm(e.at) + '</span><span class="who">' + esc(e.sender) + '</span>' +
+        '<span class="txt">' + esc(evText(e)) + '</span><span class="time">群' + esc(e.group_id) + '</span>' +
+        thumbs + '</div>';
+    }).join("")
       : '<div class="empty">暂无消息</div>';
+    // 4 秒一次的轮询不该把已经显示出来的图重新加载一遍（会闪），内容没变就不动 DOM
+    if (eventsHtml !== lastEventsHtml) { $("events").innerHTML = eventsHtml; lastEventsHtml = eventsHtml; }
 
     const al = await api("/api/agent_log?limit=30").catch(() => ({ lines: [] }));
     $("agent-log").innerHTML = (al.lines || []).length ? al.lines.slice().reverse().map((line) => {

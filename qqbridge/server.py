@@ -11,6 +11,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -486,6 +487,51 @@ def create_app() -> FastAPI:
             raise HTTPException(400, str(exc))
         store.audit("gui", "auth_password", auth.data.get("username", ""), {}, "SUCCEEDED")
         return {"ok": True}
+
+    # ---------- 图片代理 ----------
+    # QQ 图床的 rkey 是签名过的临时链接。让浏览器直连有两个风险：
+    # Referer 被挡、以及以后换域名。统一走后端取，顺便做主机白名单防 SSRF。
+    IMAGE_HOST_OK = ("multimedia.nt.qq.com.cn", "multimedia.qpic.cn", "gchat.qpic.cn")
+    IMAGE_SUFFIX_OK = (".qpic.cn", ".qq.com")
+    IMAGE_MAX_BYTES = 12 * 1024 * 1024
+    _img_cache: dict[str, tuple[bytes, str]] = {}
+
+    @app.get("/api/image")
+    async def api_image(request: Request, u: str = ""):
+        _ui_auth(request)
+        parsed = urlparse(u or "")
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme != "https" or not host:
+            raise HTTPException(400, "只允许 https 图片地址")
+        if not (host in IMAGE_HOST_OK or host.endswith(IMAGE_SUFFIX_OK)):
+            raise HTTPException(400, f"不允许从这个主机取图：{host}")
+        if host.replace(".", "").isdigit():
+            raise HTTPException(400, "不接受 IP 形式的图片地址")
+
+        hit = _img_cache.get(u)
+        if hit is None:
+            import httpx
+            try:
+                async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                    resp = await client.get(u, headers={"User-Agent": "qqbridge-console/1.0"})
+                resp.raise_for_status()
+            except Exception as exc:
+                log.warning("图片代理失败 %s: %s", host, exc)
+                raise HTTPException(502, f"取图失败：{type(exc).__name__}")
+            body = resp.content
+            if len(body) > IMAGE_MAX_BYTES:
+                raise HTTPException(413, "图片太大")
+            ctype = (resp.headers.get("content-type") or "image/jpeg").split(";")[0].strip()
+            if not ctype.startswith("image/"):
+                raise HTTPException(415, f"返回的不是图片：{ctype}")
+            if len(_img_cache) > 60:
+                _img_cache.clear()
+            _img_cache[u] = (body, ctype)
+            hit = _img_cache[u]
+            store.audit("gui", "proxy_image", host, {"bytes": len(body)}, "SUCCEEDED")
+        body, ctype = hit
+        return Response(content=body, media_type=ctype,
+                        headers={"Cache-Control": "private, max-age=600"})
 
     @app.get("/api/qzone")
     async def api_qzone(request: Request):

@@ -119,9 +119,18 @@ r = c.post("/api/qzone", json={"themes": r.json()["themes"] + [{"id": "x1", "nam
 assert len(r.json()["themes"]) == n + 1
 r = c.post("/api/auth/accept", json={"username": "other", "password": "pw12345678", "agreed": True})
 assert r.status_code == 400, "重复初始化应当被拒绝"
+# 图片代理的主机白名单：不能变成任意 URL 的 SSRF 跳板
+for bad in ["https://evil.example.com/a.png", "http://multimedia.nt.qq.com.cn/a.png",
+            "https://127.0.0.1/a.png", "https://169.254.169.254/latest/meta-data/",
+            "file:///C:/Windows/win.ini", ""]:
+    rr = c.get("/api/image", params={"u": bad})
+    assert rr.status_code in (400, 422), f"该拦下的图片地址没拦住：{bad!r} -> {rr.status_code}"
+rr = c.get("/api/image", params={"u": "https://multimedia.nt.qq.com.cn/a.png"})
+assert rr.status_code not in (400, 401, 415), f"QQ 图床应当放行（这里只验白名单，不真联网）：{rr.status_code}"
+ok.append("路由: 门禁/协议/登录/说说读写/图片代理白名单 全部符合预期")
+
 r = c.post("/api/auth/logout"); assert r.status_code == 200
 r = c.get("/api/state"); assert r.status_code == 401, "登出后应当被拦"
-ok.append("路由: 门禁/协议/登录/说说读写 全部符合预期")
 
 print("\n".join("PASS  " + x for x in ok))
 print("ALL PASS")
