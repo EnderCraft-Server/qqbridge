@@ -142,5 +142,36 @@ sent = [m for m in bot.msgs if m["action"] == "send_group_msg"]
 assert len(sent) == 1 and sent[0]["message"] == "确实不错", bot.msgs
 ok.append("普通闲聊 -> 模型想接就正常接")
 
+# ---------- 6. 纯文本回复不能被砍成第一行 ----------
+# 真实翻车：模型查完宿主机写了 6 行状态，群里只收到「宿主机状态：」这一行。
+from qqbridge.agent import parse_decision, tidy_plain, clean_reply
+
+STATUS = (
+    "宿主机状态：\n"
+    "CPU：AMD R7 9800X3D 8核16线程，负载23%~29%\n"
+    "内存：31.2GB 总，可用10.6GB\n"
+    "显卡：RTX 3080 + 核显\n"
+    "磁盘：C 275G/516G 可用，D 562G/930G\n"
+    "系统：Win11 专业版 26200，已开机14小时"
+)
+reply, how = clean_reply(STATUS)
+assert how == "plain", how
+assert reply == STATUS, "多行纯文本被砍了：\n" + repr(reply)
+assert "CPU" in reply and "内存" in reply and "磁盘" in reply
+
+# 多行 JSON 里的 reply 也要完整保留
+import json as _json
+multi = _json.dumps({"reply": "第一行\n第二行\n第三行", "reason": "多行"}, ensure_ascii=False)
+r2, how2 = clean_reply(multi)
+assert how2 == "ok" and r2 == "第一行\n第二行\n第三行", (how2, repr(r2))
+
+# 空行压缩、行尾空白清理，但不吃掉换行
+assert tidy_plain("a  \n\n\n\nb\n") == "a\n\nb", repr(tidy_plain("a  \n\n\n\nb\n"))
+# 超长才截断，且给足 800 字
+assert len(tidy_plain("x" * 2000)) == 800
+# 坏 JSON 仍然沉默，绝不把 JSON 发出去
+assert clean_reply('{"reply": "hi", ') == ("", "failed")
+ok.append("纯文本多行回复完整保留（不再只发第一行），坏 JSON 依旧沉默")
+
 print("\n".join("PASS  " + x for x in ok))
 print("ALL PASS")
