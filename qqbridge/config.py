@@ -48,6 +48,21 @@ class Config:
         self.owners = owners()
         self.admins = admins() or self.owners
         self.mcp_token = (os.environ.get("MCP_TOKEN") or "").strip() or "change-me"
+        # 自带模型
+        self.llm_api_base = (os.environ.get("LLM_API_BASE") or "https://api.deepseek.com").rstrip("/")
+        self.llm_api_key = (os.environ.get("LLM_API_KEY") or os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+        self.llm_model = (os.environ.get("LLM_MODEL") or "deepseek-chat").strip()
+        self.llm_max_tokens = _int("LLM_MAX_TOKENS", 1024)
+        self.llm_temperature_raw = (os.environ.get("LLM_TEMPERATURE") or "1.0").strip()
+        try:
+            self.llm_temperature = float(self.llm_temperature_raw)
+        except ValueError:
+            self.llm_temperature = 1.0
+        # system prompt：文件优先，便于热改
+        self.system_prompt_file = (os.environ.get("SYSTEM_PROMPT_FILE") or "data/system_prompt.md").strip()
+        # 是否让 bot 自己决定接话（关掉则只做 MCP 工具，不主动发言）
+        self.auto_reply = _bool("AUTO_REPLY", True)
+
         raw_watch = (os.environ.get("WATCH_GROUPS") or "").strip()
         self.watch_groups = {x.strip() for x in raw_watch.replace("，", ",").split(",") if x.strip()}
         self.data_dir = ROOT / "data"
@@ -64,6 +79,9 @@ class Config:
             "ALLOW_MANAGE": "true" if self.allow_manage else "false",
             "OWNER_IDS": ",".join(sorted(self.owners)),
             "WATCH_GROUPS": ",".join(sorted(self.watch_groups)),
+            "LLM_API_BASE": self.llm_api_base,
+            "LLM_MODEL": self.llm_model,
+            "AUTO_REPLY": "true" if self.auto_reply else "false",
         }
         seen = set()
         out = []
@@ -93,6 +111,15 @@ class Config:
             "allow_manage": self.allow_manage,
             "cooldown_seconds": self.cooldown,
             "watch_groups": sorted(self.watch_groups),
+            "llm": {
+                "api_base": self.llm_api_base,
+                "model": self.llm_model,
+                "has_key": bool(self.llm_api_key),
+                "max_tokens": self.llm_max_tokens,
+                "temperature": self.llm_temperature,
+            },
+            "system_prompt_file": self.system_prompt_file,
+            "auto_reply": self.auto_reply,
         }
 
 

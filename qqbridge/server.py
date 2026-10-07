@@ -21,7 +21,10 @@ from mcp.server.transport_security import TransportSecuritySettings
 from .bus import EventBus
 from .config import config
 from .onebot import OneBot
+from .agent import QqAgent, load_system_prompt, DEFAULT_SYSTEM
+from .autoreply import AutoReply
 from .control import Control
+from .llm import LLM
 from .rules import Rules
 from . import commands
 from .scheduler import Scheduler
@@ -184,6 +187,74 @@ def build_tools(box: Toolbox, rules: Rules, sched: Scheduler):
             raise Denied(f"{actor} 不是管理员，不能切换运行模式。")
         return control.set(mode, actor=actor, reason=reason)
 
+    @tool("send_private", "单聊发文本。需 ALLOW_SEND 且 actor 在 OWNER_IDS。",
+          {"type": "object", "properties": {
+              "actor": {"type": "string"}, "user_id": {"type": "string"},
+              "text": {"type": "string"}, "idempotency_key": {"type": "string"}},
+           "required": ["actor", "user_id", "text", "idempotency_key"], "additionalProperties": False})
+    async def _priv(actor: str, user_id: str, text: str, idempotency_key: str, **kw):
+        return await box.send_private(actor, user_id, text, idempotency_key)
+
+    @tool("set_profile", "修改机器人自己的 QQ 昵称。仅管理员。",
+          {"type": "object", "properties": {
+              "actor": {"type": "string"}, "nickname": {"type": "string"},
+              "idempotency_key": {"type": "string"}},
+           "required": ["actor", "nickname", "idempotency_key"], "additionalProperties": False})
+    async def _profile(actor: str, nickname: str, idempotency_key: str, **kw):
+        return await box.set_profile(actor, nickname, idempotency_key)
+
+    @tool("qzone_list", "读取说说列表（默认机器人自己的空间）。",
+          {"type": "object", "properties": {
+              "target_uin": {"type": "string", "default": ""},
+              "pos": {"type": "integer", "default": 0},
+              "num": {"type": "integer", "default": 20}}, "additionalProperties": False})
+    async def _qzlist(target_uin: str = "", pos: int = 0, num: int = 20, **kw):
+        return await box.qzone_list(target_uin, pos, num)
+
+    @tool("qzone_feeds", "读取好友动态。", {"type": "object", "properties": {
+              "page": {"type": "integer", "default": 1},
+              "count": {"type": "integer", "default": 10}}, "additionalProperties": False})
+    async def _qzfeeds(page: int = 1, count: int = 10, **kw):
+        return await box.qzone_feeds(page, count)
+
+    @tool("qzone_publish", "发表纯文本说说（发到机器人自己的空间）。仅管理员。",
+          {"type": "object", "properties": {
+              "actor": {"type": "string"}, "content": {"type": "string"},
+              "idempotency_key": {"type": "string"}},
+           "required": ["actor", "content", "idempotency_key"], "additionalProperties": False})
+    async def _qzpub(actor: str, content: str, idempotency_key: str, **kw):
+        return await box.qzone_publish(actor, content, idempotency_key)
+
+    @tool("qzone_delete", "删除机器人自己空间的一条说说（按 tid）。仅管理员。",
+          {"type": "object", "properties": {
+              "actor": {"type": "string"}, "tid": {"type": "string"},
+              "idempotency_key": {"type": "string"}},
+           "required": ["actor", "tid", "idempotency_key"], "additionalProperties": False})
+    async def _qzdel(actor: str, tid: str, idempotency_key: str, **kw):
+        return await box.qzone_delete(actor, tid, idempotency_key)
+
+    @tool("qzone_like", "给一条说说点赞/取消赞（点赞好友的需传 target_uin）。仅管理员。",
+          {"type": "object", "properties": {
+              "actor": {"type": "string"}, "tid": {"type": "string"},
+              "target_uin": {"type": "string", "default": ""},
+              "like": {"type": "boolean", "default": True},
+              "abstime": {"type": "integer", "default": 0},
+              "idempotency_key": {"type": "string"}},
+           "required": ["actor", "tid", "idempotency_key"], "additionalProperties": False})
+    async def _qzlike(actor: str, tid: str, idempotency_key: str, target_uin: str = "",
+                      like: bool = True, abstime: int = 0, **kw):
+        return await box.qzone_like(actor, tid, idempotency_key, target_uin, like, abstime)
+
+    @tool("qzone_comment", "评论一条说说（好友的需传 target_uin）。仅管理员。",
+          {"type": "object", "properties": {
+              "actor": {"type": "string"}, "tid": {"type": "string"},
+              "content": {"type": "string"}, "target_uin": {"type": "string", "default": ""},
+              "idempotency_key": {"type": "string"}},
+           "required": ["actor", "tid", "content", "idempotency_key"], "additionalProperties": False})
+    async def _qzcmt(actor: str, tid: str, content: str, idempotency_key: str,
+                     target_uin: str = "", **kw):
+        return await box.qzone_comment(actor, tid, content, idempotency_key, target_uin)
+
     @tool("audit_tail", "查看最近的操作审计记录。", {"type": "object",
           "properties": {"limit": {"type": "integer", "default": 30}}, "additionalProperties": False})
     async def _audit(limit: int = 30, **kw):
@@ -200,7 +271,16 @@ def create_app() -> FastAPI:
     control = Control(config.data_dir / "control.json", bus, store)
     bus.control = control
     sched = Scheduler(config.data_dir / "scheduler.json", bus, store)
+    llm = LLM(config.llm_api_base, config.llm_api_key, config.llm_model,
+              max_tokens=config.llm_max_tokens, temperature=config.llm_temperature)
+    prompt_path = (config.data_dir.parent / config.system_prompt_file
+                   if not config.system_prompt_file.startswith("/")
+                   else __import__("pathlib").Path(config.system_prompt_file))
+    if not prompt_path.is_absolute():
+        prompt_path = config.data_dir.parent / config.system_prompt_file
+    agent = QqAgent(llm, load_system_prompt(prompt_path, DEFAULT_SYSTEM))
     bot = OneBot(config.http, config.ws, config.token, config.ws_token)
+    autoreply = AutoReply(bus, store, agent, bot, control, enabled=config.auto_reply)
     box = Toolbox(bot, bus, store)
     specs = build_tools(box, rules, sched)
     by_name = {s["name"]: s for s in specs}
@@ -241,15 +321,20 @@ def create_app() -> FastAPI:
     app.state.box = box
     app.state.bot = bot
     app.state.rules = rules
+    app.state.llm = llm
+    app.state.agent = agent
+    app.state.autoreply = autoreply
 
     @app.on_event("startup")
     async def _startup():
         await bot.start(on_event=lambda ev: _ingest(ev, bus, store, control))
         await sched.start()
+        await autoreply.start()
         app.state.session_task = asyncio.create_task(_run_manager())
 
     @app.on_event("shutdown")
     async def _shutdown():
+        await autoreply.stop()
         await sched.stop()
         await bot.stop()
 
@@ -282,6 +367,9 @@ def create_app() -> FastAPI:
             "scheduler": sched.status(),
             "control": control.status(),
             "keywords": rules.keywords,
+            "llm": llm.describe(),
+            "agent": agent.status(),
+            "autoreply": autoreply.status(),
         }
 
     @app.get("/api/events")
@@ -330,6 +418,64 @@ def create_app() -> FastAPI:
     async def api_audit(request: Request, limit: int = 20):
         _ui_auth(request)
         return {"records": store.audit_tail(limit)}
+
+    @app.get("/api/prompt")
+    async def api_prompt_get(request: Request):
+        _ui_auth(request)
+        return {"prompt": agent.system_prompt, "file": str(prompt_path), "chars": len(agent.system_prompt)}
+
+    @app.post("/api/prompt")
+    async def api_prompt_set(request: Request):
+        _ui_auth(request)
+        body = await request.json()
+        text = str(body.get("prompt") or "")
+        if not text.strip():
+            raise __import__("fastapi").HTTPException(400, "system prompt 不能为空")
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        prompt_path.write_text(text, encoding="utf-8")
+        agent.reconfigure(text)
+        store.audit("gui", "set_prompt", str(prompt_path), {"chars": len(text)}, "SUCCEEDED")
+        return {"prompt": agent.system_prompt, "chars": len(agent.system_prompt)}
+
+    @app.post("/api/llm")
+    async def api_llm(request: Request):
+        _ui_auth(request)
+        body = await request.json()
+        llm.reconfigure(
+            api_base=body.get("api_base"),
+            api_key=body.get("api_key") or None,
+            model=body.get("model"),
+            max_tokens=body.get("max_tokens"),
+            temperature=body.get("temperature"),
+        )
+        config.llm_api_base = llm.api_base
+        config.llm_model = llm.model
+        if body.get("api_key"):
+            _persist_key(str(body["api_key"]))
+        if "auto_reply" in body:
+            config.auto_reply = bool(body["auto_reply"])
+            autoreply.enabled = config.auto_reply
+        config.persist_permissions()
+        store.audit("gui", "set_llm", llm.model,
+                    {"api_base": llm.api_base, "auto_reply": config.auto_reply}, "SUCCEEDED")
+        return {"llm": llm.describe(), "auto_reply": config.auto_reply}
+
+    def _persist_key(key: str):
+        env = config.ROOT / ".env"
+        try:
+            lines = env.read_text(encoding="utf-8").splitlines() if env.is_file() else []
+        except OSError:
+            return
+        out, seen = [], False
+        for line in lines:
+            if line.split("=", 1)[0].strip() == "LLM_API_KEY":
+                out.append("LLM_API_KEY=" + key)
+                seen = True
+            else:
+                out.append(line)
+        if not seen:
+            out.append("LLM_API_KEY=" + key)
+        env.write_text("\n".join(out) + "\n", encoding="utf-8")
 
     @app.post("/api/control")
     async def api_control(request: Request):

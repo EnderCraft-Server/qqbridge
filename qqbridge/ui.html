@@ -157,6 +157,31 @@
   </section>
 
   <section class="card">
+    <h2>模型（bot 自带）</h2>
+    <div class="switch">
+      <div><div class="t">自动接话</div><div class="d">关掉后 bot 只提供 MCP 工具，不主动发言</div></div>
+      <label class="toggle"><input type="checkbox" id="auto_reply"><i></i></label>
+    </div>
+    <label>API Base</label>
+    <input id="api_base" placeholder="https://api.deepseek.com">
+    <label>API Key（留空表示不修改）</label>
+    <input id="api_key" type="password" placeholder="sk-...">
+    <div class="grid2">
+      <div><label>模型</label><input id="model" placeholder="deepseek-chat"></div>
+      <div><label>max_tokens</label><input type="number" id="max_tokens" min="64" max="8192"></div>
+    </div>
+    <button id="save-llm" style="margin-top:16px;width:100%">保存模型设置</button>
+    <div class="hint" id="llm-hint">—</div>
+  </section>
+
+  <section class="card wide">
+    <h2>人格 / System Prompt</h2>
+    <textarea id="prompt" rows="14" style="font:12.5px/1.6 ui-monospace,Consolas,monospace"></textarea>
+    <button id="save-prompt" style="margin-top:12px">保存人格</button>
+    <span class="hint" id="prompt-hint" style="margin-left:10px"></span>
+  </section>
+
+  <section class="card">
     <h2>运行状态</h2>
     <div class="stats" id="stats"></div>
   </section>
@@ -213,6 +238,17 @@ async function refresh() {
     $("c-ws").innerHTML = '<i class="dot ' + (s.bot.ws_connected ? "on" : "off") + '"></i>' + (s.bot.ws_connected ? "QQ 已连接" : "QQ 断开");
     $("c-sched").innerHTML = '<i class="dot ' + (st.enabled ? "on" : "off") + '"></i>' + (st.enabled ? "巡检 " + st.interval_seconds + "s" : "巡检关闭");
 
+    const llm = s.llm || {};
+    if (tag !== "INPUT" && tag !== "TEXTAREA") {
+      $("auto_reply").checked = !!s.config.auto_reply;
+      $("api_base").value = llm.api_base || "";
+      $("model").value = llm.model || "";
+      $("max_tokens").value = llm.max_tokens || 1024;
+    }
+    $("llm-hint").textContent = llm.configured
+      ? ("已配置 · 调用 " + (llm.calls||0) + " 次 · 输入 " + (llm.prompt_tokens||0) + " / 输出 " + (llm.completion_tokens||0) + " tokens")
+      : "未配置：填好 API Base / Key / 模型后 bot 才能自己说话";
+
     const b = s.scheduler.bus;
     $("stats").innerHTML = [
       ["队列总量", b.stored, ""], ["待处理 @我", b.pending_high, b.pending_high ? "hi" : ""],
@@ -263,8 +299,26 @@ $("save-watch").onclick = () => save(async () => {
   await api("/api/keywords", { method: "POST", body: JSON.stringify({ keywords: $("keywords").value.split(/[\s,，]+/).filter(Boolean) }) });
 }, "监控范围已保存");
 
+$("save-llm").onclick = () => save(() => api("/api/llm", { method: "POST", body: JSON.stringify({
+  api_base: $("api_base").value.trim(),
+  api_key: $("api_key").value.trim(),
+  model: $("model").value.trim(),
+  max_tokens: +$("max_tokens").value,
+  auto_reply: $("auto_reply").checked }) }), "模型设置已保存");
+
+$("save-prompt").onclick = () => save(() => api("/api/prompt", { method: "POST", body: JSON.stringify({
+  prompt: $("prompt").value }) }), "人格已保存");
+
 document.querySelectorAll("[data-set]").forEach((b) => b.onclick = () => { $("interval").value = b.dataset.set; });
 if (!TOKEN) { const v = prompt("请输入访问令牌（.env 的 MCP_TOKEN）"); if (v) { TOKEN = v.trim(); localStorage.setItem("qqbridge_token", TOKEN); } }
+async function loadPrompt() {
+  try {
+    const r = await api("/api/prompt");
+    $("prompt").value = r.prompt || "";
+    $("prompt-hint").textContent = (r.chars || 0) + " 字符 · " + (r.file || "");
+  } catch (e) { $("prompt-hint").textContent = "读取失败：" + e.message; }
+}
+if (TOKEN) loadPrompt();
 refresh();
 setInterval(refresh, 4000);
 </script>

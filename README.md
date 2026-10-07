@@ -30,12 +30,28 @@ OneBot WebSocket（常驻，断线自动重连）
 
 ## 架构
 
+**bot 自带模型，独立于任何 Agent 宿主。**
+
 ```
 QQ 客户端
-   └─ OneBot v11（如 SnowLuma）      HTTP :3000   WS :3001
-          └─ qqbridge                MCP :18900   控制台 :18900
-                 └─ 任意 MCP 客户端（DeepSeek Harness 等）
+   └─ OneBot v11（SnowLuma / NapCat / Lagrange）   HTTP :3000   WS :3001
+          └─ qqbridge                               MCP :18900   控制台 :18900
+                 ├─ 自带模型：直接调 OpenAI 兼容 API，自己接话
+                 └─ MCP 工具：外部 Agent（DSH / Codex / Claude Code）仍可接入
 ```
+
+两条路并存、共用同一个事件队列：
+
+| | 谁驱动 | 需要外部 Agent |
+|---|---|---|
+| **自动接话** | qqbridge 进程内循环调自己的模型 | 否 |
+| **MCP 工具** | 外部 Agent 主动调用 | 是 |
+
+### 为什么不用「让模型等待」
+
+常见实现是让 Agent `wait(timeout=180)` 阻塞着等消息 —— 空转也烧 token，
+Agent 一停链路就断。qqbridge 把等待下沉到服务层：事件在本地排队（零模型成本），
+只在真有消息时才醒来处理。
 
 ## 快速开始
 
@@ -47,12 +63,34 @@ python run.py
 
 控制台：<http://127.0.0.1:18900/?token=你的MCP_TOKEN>
 
+## 让 bot 自己说话（自带模型）
+
+`.env` 里配三项即可，**不依赖任何外部 Agent**：
+
+```dotenv
+LLM_API_BASE=https://api.deepseek.com    # 任何 OpenAI 兼容端点
+LLM_API_KEY=sk-...
+LLM_MODEL=deepseek-chat
+AUTO_REPLY=true                          # false = 只做工具，不主动发言
+SYSTEM_PROMPT_FILE=data/system_prompt.md # 人格文件，改完热加载
+```
+
+**人格**：直接编辑 `data/system_prompt.md`（或控制台里的「人格 / System Prompt」文本框）。
+文件内容是完整的 system prompt，可以随便写人设。程序会要求模型以 JSON 回
+`{"reply": "...", "reason": "..."}`，`reply` 为空即沉默 —— 所以**沉默是模型可以主动选的**，
+不是异常。
+
+调用统计（次数 / tokens）在控制台的「模型」卡片里实时显示。
+
 ## 配置
 
 见 `.env.example`。关键项：
 
 | 变量 | 说明 |
 |---|---|
+| `LLM_API_BASE` / `LLM_API_KEY` / `LLM_MODEL` | bot 自己的模型凭据 |
+| `AUTO_REPLY` | 是否让 bot 主动接话 |
+| `SYSTEM_PROMPT_FILE` | 人格文件路径 |
 | `ONEBOT_HTTP` / `ONEBOT_WS` | OneBot 的 HTTP 与 WebSocket 地址 |
 | `ONEBOT_TOKEN` / `ONEBOT_WS_TOKEN` | 两者常常**不是同一个** token |
 | `MCP_TOKEN` | 本服务的访问令牌（MCP 与控制台共用） |
@@ -67,7 +105,14 @@ python run.py
 `list_keywords` `get_scheduler`
 
 **写操作**：`send_message` `send_image` `manage_group`（禁言/解禁/踢人/改名/名片/全员禁言/退群）
-`set_keywords` `set_scheduler`
+`set_keywords` `set_scheduler` `set_control` `set_profile`
+
+**单聊与 QQ 空间**（SnowLuma 扩展接口，非 OneBot 标准）：
+`send_private` `set_profile`（改昵称）`qzone_list` `qzone_feeds` `qzone_publish`（发说说）
+`qzone_delete` `qzone_like` `qzone_comment`
+
+> ⚠️ 这些扩展接口是 SnowLuma 独有的，换 OneBot 实现时须重新核对，
+> 代码里只做了「缺参数回显」式的只读探测确认。
 
 写操作要求 `actor` 在 `OWNER_IDS` 内，并携带唯一 `idempotency_key`，全部记入审计表。
 
@@ -86,8 +131,11 @@ python run.py
 
 ## 控制台
 
-单页 Web 界面，可配置巡检间隔、权限开关、Owner 白名单、监控群、关键词表，
-并实时查看消息流与审计记录。设置落盘到 `.env` 与 `data/`。
+`http://127.0.0.1:18900/?token=<MCP_TOKEN>`
+
+可配置：模型（API Base / Key / 模型名 / 自动接话开关）、**人格 system prompt**、
+巡检间隔、权限开关、Owner 白名单、监控群、关键词表、运行模式（auto / stopped / manual）。
+实时显示消息流、审计记录、token 用量。设置落盘到 `.env`、`data/`。
 
 ## 安全约定
 

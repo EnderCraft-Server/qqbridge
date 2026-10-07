@@ -7,6 +7,7 @@ from typing import Any
 from .bus import EventBus
 from .config import config
 from .onebot import OneBot, OneBotError
+from .qzone import QzoneMixin
 from .store import Store
 
 
@@ -14,7 +15,7 @@ class Denied(RuntimeError):
     pass
 
 
-class Toolbox:
+class Toolbox(QzoneMixin):
     def __init__(self, bot: OneBot, bus: EventBus, store: Store):
         self.bot = bot
         self.bus = bus
@@ -27,6 +28,10 @@ class Toolbox:
             raise Denied("未配置 OWNER_IDS，写操作全部拒绝。")
         if str(actor) not in config.owners:
             raise Denied(f"{actor} 不在 OWNER_IDS 白名单，拒绝执行 {action}。")
+
+    @staticmethod
+    def _deny(message: str) -> "Denied":
+        return Denied(message)
 
     @staticmethod
     def _once(key: str, store: Store):
