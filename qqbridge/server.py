@@ -727,6 +727,35 @@ def create_app() -> FastAPI:
                      "owners": sorted(config.owners)}, "SUCCEEDED")
         return config.describe()
 
+    @app.get("/api/groups")
+    async def api_groups(request: Request, refresh: int = 0):
+        """机器人实际加入的群，供控制台用勾选框选监控范围。
+        以前这里是让用户手打群号，打错、或者被 4 秒一次的刷新冲掉，就变成「改了没用」。"""
+        _ui_auth(request)
+        try:
+            rows = await box.list_groups(refresh=bool(refresh))
+        except Exception as exc:
+            log.warning("get_group_list 失败，退回本地缓存：%s", exc)
+            rows = store.groups()
+        watched = {str(g) for g in config.watch_groups}
+        seen = set()
+        out = []
+        for r in rows:
+            gid = str(r.get("group_id") or "")
+            if not gid or gid in seen:
+                continue
+            seen.add(gid)
+            out.append({"group_id": gid, "name": r.get("name") or "",
+                        "member_count": r.get("member_count") or 0,
+                        "watched": gid in watched})
+        # 配置里有、但机器人已不在（或接口没返回）的群，也要显示出来，免得看起来像被吞了
+        for gid in sorted(watched - seen):
+            out.append({"group_id": gid, "name": "（不在机器人的群列表里）",
+                        "member_count": 0, "watched": True})
+        out.sort(key=lambda x: (not x["watched"], x["group_id"]))
+        return {"groups": out, "watched": sorted(watched),
+                "watch_all": not watched, "total": len(out)}
+
     @app.post("/api/watch")
     async def api_watch(request: Request):
         _ui_auth(request)

@@ -109,6 +109,18 @@
   .list .txt{color:var(--muted-fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
   .list .time{color:var(--muted-fg);font-size:11.5px;flex:0 0 auto;font-variant-numeric:tabular-nums}
   .empty{color:var(--muted-fg);padding:22px;text-align:center;font-size:13px}
+  /* 监控群勾选框 */
+  .grouplist{max-height:300px;overflow:auto;border:1px solid var(--border);border-radius:var(--radius);background:var(--background)}
+  .grouplist .g{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--border);
+    font-size:13px;cursor:pointer;margin:0}
+  .grouplist .g:last-child{border-bottom:0}
+  .grouplist .g:hover{background:var(--muted)}
+  .grouplist .g input{width:15px;height:15px;accent-color:var(--primary);flex:0 0 auto;margin:0}
+  .grouplist .g .gname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .grouplist .g .gid{color:var(--muted-fg);font-size:11.5px;flex:0 0 auto;font-variant-numeric:tabular-nums}
+  .grouplist .g.on{background:oklch(68.5% .155 230 / .08)}
+  .grouplist .g.on .gname{font-weight:600}
+
   /* 图片消息 */
   .list .item.media{flex-wrap:wrap;align-items:flex-start}
   .thumbs{flex:1 0 100%;display:flex;flex-wrap:wrap;gap:8px;margin-top:9px}
@@ -317,11 +329,23 @@
           <div class="hint" id="mode-hint">—</div>
         </div>
         <div class="card">
-          <h2>监控范围与关键词</h2>
-          <label>只监控这些群（逗号分隔；留空=全部）</label><input id="watch" placeholder="1060667115">
-          <label>关键词（空格分隔，命中即优先处理）</label><textarea id="keywords" rows="3"></textarea>
-          <button id="save-watch" style="margin-top:16px">保存</button>
-          <div class="hint">范围外的群<b>只落库，不入队，不唤醒</b>。</div>
+          <h2>监控范围</h2>
+          <div class="sub">勾选的群才会入队、才会唤醒模型；没勾的群<b>只落库，完全不唤醒</b>。
+            <b>一个都不勾 = 不设限制（所有群都监控）</b>。</div>
+          <div class="row" style="margin-bottom:10px">
+            <button class="ghost sm" id="watch-reload">刷新群列表</button>
+            <button class="ghost sm" id="watch-all">全选</button>
+            <button class="ghost sm" id="watch-none">全不选</button>
+            <span class="hint" id="watch-hint" style="margin:0">—</span>
+          </div>
+          <div class="grouplist" id="watch-list"><div class="empty">加载中…</div></div>
+          <button id="save-watch" style="margin-top:14px">保存监控范围</button>
+        </div>
+        <div class="card">
+          <h2>关键词</h2>
+          <div class="sub">命中的消息进中优先级队列</div>
+          <label>关键词（空格或逗号分隔）</label><textarea id="keywords" rows="3"></textarea>
+          <button id="save-keywords" style="margin-top:14px">保存关键词</button>
         </div>
       </section>
 
@@ -569,6 +593,7 @@ function go(name) {
   $("page-title").textContent = titles[name] || name;
   if (location.hash.slice(1) !== name) history.replaceState(null, "", "#" + name);
   if (name === "qzone") loadQzone();
+  if (name === "watch") loadGroups();
 }
 
 /* ---------------- 说说详情 ---------------- */
@@ -606,7 +631,26 @@ async function loadQzone() {
   });
 }
 
-const save = async (fn, msg) => { try { await fn(); toast(msg); refresh(); } catch (e) { toast("失败：" + e.message); } };
+/* 表单防覆盖。
+   refresh() 每 4 秒拉一次 /api/state，原来只判断 activeElement 是不是输入框——
+   用户点一下别处、切个标签页、或者刷新正好落在鼠标按下和抬起之间，
+   正在编辑的内容就被服务端值冲掉，接着点「保存」保存的还是旧值。
+   这就是「改了监控群没用」的根因。现在：碰过的字段打脏标记，保存成功前一律不回填。 */
+let dirtySet = new WeakSet();
+document.addEventListener("input", (e) => { if (e.target && e.target.id) dirtySet.add(e.target); }, true);
+document.addEventListener("change", (e) => { if (e.target && e.target.id) dirtySet.add(e.target); }, true);
+
+function fill(el, value) {
+  if (!el || document.activeElement === el || dirtySet.has(el)) return;
+  if (el.type === "checkbox") el.checked = !!value;
+  else el.value = value;
+}
+function clearDirty() { dirtySet = new WeakSet(); }
+
+const save = async (fn, msg) => {
+  try { await fn(); clearDirty(); if (msg) toast(msg); refresh(); }
+  catch (e) { toast("失败：" + e.message); }
+};
 
 let lastEventsHtml = "";
 
@@ -614,34 +658,31 @@ async function refresh() {
   try {
     const s = await api("/api/state");
     const st = s.scheduler.settings, b = s.scheduler.bus, llm = s.llm || {}, ctl = s.control || {};
-    const tag = document.activeElement?.tagName;
-    const editable = tag !== "INPUT" && tag !== "TEXTAREA";
-    if (editable) {
-      $("enabled").checked = !!st.enabled; $("interval").value = st.interval_seconds;
-      $("min_gap").value = st.min_gap_seconds; $("max_turns").value = st.max_turns_per_hour;
-      const q = (st.quiet_hours || [])[0] || ["", ""]; $("q1").value = q[0] || ""; $("q2").value = q[1] || "";
-      $("allow_send").checked = !!s.config.allow_send; $("allow_manage").checked = !!s.config.allow_manage;
-      $("owners").value = (s.config.owners || []).join(",");
-      $("admins").value = (s.config.admins || []).join(",");
-      $("acct-user").value = (s.auth || {}).username || "";
-      $("watch").value = (s.config.watch_groups || []).join(",");
-      $("keywords").value = (s.keywords || []).join(" ");
-      $("auto_reply").checked = !!s.config.auto_reply;
-      $("api_base").value = llm.api_base || ""; $("model").value = llm.model || "";
-      $("max_tokens").value = llm.max_tokens || 1024;
-    }
+    fill($("enabled"), !!st.enabled); fill($("interval"), st.interval_seconds);
+    fill($("min_gap"), st.min_gap_seconds); fill($("max_turns"), st.max_turns_per_hour);
+    const q = (st.quiet_hours || [])[0] || ["", ""]; fill($("q1"), q[0] || ""); fill($("q2"), q[1] || "");
+    fill($("allow_send"), !!s.config.allow_send); fill($("allow_manage"), !!s.config.allow_manage);
+    fill($("owners"), (s.config.owners || []).join(","));
+    fill($("admins"), (s.config.admins || []).join(","));
+    fill($("acct-user"), (s.auth || {}).username || "");
+    fill($("keywords"), (s.keywords || []).join(" "));
+    fill($("auto_reply"), !!s.config.auto_reply);
+    fill($("api_base"), llm.api_base || ""); fill($("model"), llm.model || "");
+    fill($("max_tokens"), llm.max_tokens || 1024);
+
     const qz = s.qzone || {};
-    if (editable) {
-      $("qz_enabled").checked = !!qz.enabled;
-      $("qz_mode").value = qz.mode || "interval";
-      $("qz_interval").value = qz.interval_hours ?? 12;
-      $("qz_times").value = (qz.daily_times || []).join(",");
-      $("qz_mingap").value = qz.min_gap_hours ?? 4;
-      $("qz_order").value = qz.order || "random";
-      const qq = (qz.quiet_hours || [])[0] || ["", ""];
-      $("qz_q1").value = qq[0] || ""; $("qz_q2").value = qq[1] || "";
-      $("qz-active").value = (qz.active_themes || []).join(",");
-    }
+    fill($("qz_enabled"), !!qz.enabled);
+    fill($("qz_mode"), qz.mode || "interval");
+    fill($("qz_interval"), qz.interval_hours ?? 12);
+    fill($("qz_times"), (qz.daily_times || []).join(","));
+    fill($("qz_mingap"), qz.min_gap_hours ?? 4);
+    fill($("qz_order"), qz.order || "random");
+    const qq = (qz.quiet_hours || [])[0] || ["", ""];
+    fill($("qz_q1"), qq[0] || ""); fill($("qz_q2"), qq[1] || "");
+    fill($("qz-active"), (qz.active_themes || []).join(","));
+    $("watch-hint").textContent = (s.config.watch_groups || []).length
+      ? ("正在监控 " + s.config.watch_groups.length + " 个群")
+      : "没有限制（所有群都监控）";
     $("qz-hint").textContent = qz.last_post_at
       ? ("上次发布 " + hhmm(qz.last_post_at) + " · 累计 " + (qz.posted || 0) + " 条 · " +
          (qz.next_in_seconds != null ? ("约 " + Math.round(qz.next_in_seconds / 60) + " 分钟后到点") : "未排期"))
@@ -730,10 +771,55 @@ $("acct-save").onclick = async () => {
 $("save-perm").onclick = () => save(() => api("/api/permissions", { method: "POST", body: JSON.stringify({
   allow_send: $("allow_send").checked, allow_manage: $("allow_manage").checked,
   owners: $("owners").value.split(/[,，\s]+/).filter(Boolean) }) }), "权限已保存");
+/* ---------------- 监控范围 ---------------- */
+let groupCache = [];
+
+function renderGroups() {
+  const box = $("watch-list");
+  if (!groupCache.length) { box.innerHTML = '<div class="empty">拿不到群列表，点「刷新群列表」重试</div>'; return; }
+  box.innerHTML = groupCache.map((g) => {
+    const on = !!g.sel;
+    return '<label class="g' + (on ? " on" : "") + '">' +
+      '<input type="checkbox" data-gid="' + esc(g.group_id) + '"' + (on ? " checked" : "") + '>' +
+      '<span class="gname">' + esc(g.name || "（没有群名）") + '</span>' +
+      (g.member_count ? '<span class="gid">' + esc(g.member_count) + ' 人</span>' : '') +
+      '<span class="gid">' + esc(g.group_id) + '</span></label>';
+  }).join("");
+}
+
+async function loadGroups(refresh = 0) {
+  try {
+    const r = await api("/api/groups" + (refresh ? "?refresh=1" : ""));
+    // 默认选中：明确勾过的，或者当前根本没设限（watch_all）
+    groupCache = (r.groups || []).map((g) => ({ ...g, sel: r.watch_all ? true : !!g.watched }));
+    renderGroups();
+  } catch (e) {
+    $("watch-list").innerHTML = '<div class="empty">读取群列表失败：' + esc(e.message) + '</div>';
+  }
+}
+
+$("watch-list").addEventListener("change", (e) => {
+  const cb = e.target.closest("input[data-gid]");
+  if (!cb) return;
+  const g = groupCache.find((x) => x.group_id === cb.dataset.gid);
+  if (g) g.sel = cb.checked;
+  cb.closest(".g").classList.toggle("on", cb.checked);
+});
+$("watch-all").onclick = () => { groupCache.forEach((g) => { g.sel = true; }); renderGroups(); };
+$("watch-none").onclick = () => { groupCache.forEach((g) => { g.sel = false; }); renderGroups(); };
+$("watch-reload").onclick = () => { toast("正在向 OneBot 拉群列表…"); loadGroups(1); };
+
 $("save-watch").onclick = () => save(async () => {
-  await api("/api/watch", { method: "POST", body: JSON.stringify({ watch_groups: $("watch").value.split(/[,，\s]+/).filter(Boolean) }) });
-  await api("/api/keywords", { method: "POST", body: JSON.stringify({ keywords: $("keywords").value.split(/[\s,，]+/).filter(Boolean) }) });
-}, "监控范围已保存");
+  const picked = groupCache.filter((g) => g.sel).map((g) => g.group_id);
+  const r = await api("/api/watch", { method: "POST", body: JSON.stringify({ watch_groups: picked }) });
+  // 用服务端回执核对，别只信本地状态
+  const got = (r.watch_groups || []).length;
+  await loadGroups();
+  toast(got ? ("已保存，正在监控 " + got + " 个群") : "已保存，现在所有群都监控");
+}, "");          // 具体条数由处理器自己 toast，避免被通用提示盖掉
+
+$("save-keywords").onclick = () => save(() => api("/api/keywords", { method: "POST", body: JSON.stringify({
+  keywords: $("keywords").value.split(/[\s,，]+/).filter(Boolean) }) }), "关键词已保存");
 $("save-llm").onclick = () => save(() => api("/api/llm", { method: "POST", body: JSON.stringify({
   api_base: $("api_base").value.trim(), api_key: $("api_key").value.trim(), model: $("model").value.trim(),
   max_tokens: +$("max_tokens").value, auto_reply: $("auto_reply").checked }) }), "模型设置已保存");
