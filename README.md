@@ -1,92 +1,145 @@
 # qqbridge
 
-QQ ↔ MCP 桥：把 QQ 群聊接进 Agent，**没有消息时不产生任何模型调用**。
+> 把 QQ 群聊接进 AI 的本地桥。**没有消息的时候，一次模型调用都不会发生。**
 
-## 为什么做这个
+![license](https://img.shields.io/badge/license-MIT-blue.svg)
+![python](https://img.shields.io/badge/python-3.10%2B-3776AB.svg)
+![mcp](https://img.shields.io/badge/MCP-compatible-6E56CF.svg)
+![onebot](https://img.shields.io/badge/OneBot-v11-12B7F5.svg)
 
-常见的群聊机器人实现用「让模型等待」的方式驱动：
+跑在你自己电脑上的 QQ ↔ AI 桥，同时干两件事：
 
+| 能力 | 是什么 | 需要外挂 Agent 吗 |
+|---|---|---|
+| **自动接话** | 进程内自带模型凭据，自己判断该不该说话、说什么 | 不需要 |
+| **MCP 服务** | 一套工具，给 Codex / Claude Code / 任意 MCP 客户端用 | 需要 |
+
+两条路共用同一个事件队列。空闲时消息只在本地排队，**零 token 消耗**。
+
+---
+
+## 目录
+
+- [它解决什么问题](#它解决什么问题)
+- [架构](#架构)
+- [30 秒跑起来](#30-秒跑起来)
+- [消息是怎么被处理的](#消息是怎么被处理的)
+- [自带模型与人格](#自带模型与人格)
+- [自动发说说](#自动发说说)
+- [控制台](#控制台)
+- [内置 Agent](#内置-agent)
+- [MCP 工具](#mcp-工具)
+- [配置速查](#配置速查)
+- [目录结构](#目录结构)
+- [安全约定](#安全约定)
+- [测试](#测试)
+- [常见问题](#常见问题)
+- [License](#license)
+
+---
+
+## 它解决什么问题
+
+大多数群聊机器人的驱动方式是这样的：
+
+```text
+Agent → wait(timeout=180)   # 阻塞着等，没消息也干等，照样烧 token
+     → 有消息 → 回复 → 再 wait → ……
 ```
-Agent → wait(timeout=180)   # 阻塞，没消息也干等，照样烧 token
-     → 有消息 → 回复 → 再 wait → …
-```
 
-外部 Agent 一停整条链路就断，空闲时也在消耗上下文。
+三个毛病：空闲时白烧 token；Agent 进程一停整条链路就断；等待期间还会一直占着上下文。
 
-qqbridge 把**等待下沉到服务层**：事件在本地排队（零模型成本），
-只在真的有事时才唤醒模型。
+qqbridge 把**等待下沉到服务层**：
 
-```
+```text
 OneBot WebSocket（常驻，断线自动重连）
-   └─► 事件总线（环形缓冲 + 自增 id）
-          ├─ pending_high  @我
-          ├─ pending_mid   命中关键词
-          └─ pending_low   冷却期内的闲聊
+   └─► 事件总线（环形缓冲 + 持久化自增 id）
+          ├─ pending_high   @我
+          ├─ pending_mid    命中关键词
+          └─ pending_low    冷却期内的闲聊
                  │
                  ▼
-        MCP 工具全部「立刻返回」
-        poll_events / list_pending / mark_processed
+        进程内接话循环（每 1.5 秒看一眼，有货才调模型）
+                 │
+                 ▼
+        直连 OpenAI 兼容 API，自己把话发回群里
 ```
+
+MCP 工具全部「立刻返回」——`poll_events` 没消息就返回空，永远不会让调用方卡住等。
 
 ## 架构
 
-**bot 自带模型，独立于任何 Agent 宿主。**
-
-```
+```text
 QQ 客户端
-   └─ OneBot v11（SnowLuma / NapCat / Lagrange）   HTTP :3000   WS :3001
-          └─ qqbridge                               MCP :18900   控制台 :18900
-                 ├─ 自带模型：直接调 OpenAI 兼容 API，自己接话
-                 └─ MCP 工具：外部 Agent（Codex / Claude Code / 任意 MCP 客户端）可接入
+  └─ OneBot v11 实现（SnowLuma / NapCat / Lagrange）    HTTP :3000   WS :3001
+       └─ qqbridge                                      MCP :18900   控制台 :18900
+            ├─ 自带模型：直接调 OpenAI 兼容 API，自己接话
+            ├─ 内置 Agent：自己能读写文件、跑命令（有边界，全程留痕）
+            └─ MCP 工具：外部 Agent 可接入，共用同一个事件队列
 ```
 
-两条路并存、共用同一个事件队列：
+内置 Agent 让它**不需要在电脑上再常开一个 Agent 宿主**；MCP 工具则是给已经有的宿主留的口子。
 
-| | 谁驱动 | 需要外部 Agent |
-|---|---|---|
-| **自动接话** | qqbridge 进程内循环调自己的模型 | 否 |
-| **MCP 工具** | 外部 Agent 主动调用 | 是 |
-
-### 为什么不用「让模型等待」
-
-常见实现是让 Agent `wait(timeout=180)` 阻塞着等消息 —— 空转也烧 token，
-Agent 一停链路就断。qqbridge 把等待下沉到服务层：事件在本地排队（零模型成本），
-只在真有消息时才醒来处理。
-
-## 快速开始
+## 30 秒跑起来
 
 ```powershell
 pip install -r requirements.txt
-copy .env.example .env      # 填写 OneBot 地址与 Token
+copy .env.example .env          # Linux/macOS 用 cp
+# 编辑 .env：填 OneBot 地址与 Token、模型的 API Key、OWNER_IDS
 python run.py
 ```
 
-控制台：<http://127.0.0.1:18900/?token=你的MCP_TOKEN>
+然后浏览器打开 <http://127.0.0.1:18900/>：
 
-## 两种行为模式
+1. 第一次进会弹《使用须知》和《最终用户许可协议》，勾同意
+2. 设置后台账号密码（PBKDF2-SHA256 加盐存储，不存明文）
+3. 以后每次都登录进后台
 
-群里发命令切换（仅管理员）：
+> Windows 上可以直接双击 `start.bat`（里面写死了打包运行时的路径，按自己的 Python 改一下）。
 
-| 命令 | 模式 | 行为 |
+## 消息是怎么被处理的
+
+**全自动分流，不需要手动切模式。** 按发送者身份自动选路：
+
+| 谁发的 | 走哪条路 | 能做什么 |
 |---|---|---|
-| `/switch chat` | **chat**（默认） | 群友闲聊：**所有人都能聊**，模型只说话、不碰文件 |
-| `/switch agent` | **agent** | 只响应管理员；消息交给内置 Agent，**可以读写文件、执行命令** |
-| `/switch` | — | 回一句用法 |
+| 管理员（`ADMIN_IDS`） | **agent 路径** | 聊天 + 读写文件 + 执行命令。有没有活干由模型自己判断 |
+| 其他人 | **chat 路径** | 只聊天。碰不到文件系统，也没有任何工具 |
 
-跟运行开关是两回事：
+消息进哪个队列，决定它多快被看到：
 
-| | 命令 | 作用 |
+| 队列 | 什么消息进 | 说明 |
 |---|---|---|
-| 运行开关 | `/auto` `/manual` `/stop`（`/on` `/off`） | 开 / 半开 / 全停 |
-| 行为模式 | `/switch agent` `/switch chat` | 谁能触发、能不能用工具 |
+| `pending_high` | @ 了机器人 | **不受每分钟上限限制**，优先处理 |
+| `pending_mid` | 命中关键词表 | 关键词在控制台里配 |
+| `pending_low` | 冷却期内的普通闲聊 | 距上次发言超过 `COOLDOWN_SECONDS` 才进 |
 
-控制台的「巡检与唤醒」页也能点按钮切换，效果等同。
+接话循环每 1.5 秒扫一次未处理事件，一次只处理一条（避免刷屏），每分钟最多发 8 条。
 
-> agent 模式下的每一步工具调用都会写进 `data/agent.log` 与审计表。
+### 群里的控制命令
 
-## 让 bot 自己说话（自带模型）
+只有管理员能用，命令本身不入队、不触发模型，执行完直接回执：
 
-`.env` 里配三项即可，**不依赖任何外部 Agent**：
+| 命令 | 模式 | 群里收到的回执 |
+|---|---|---|
+| `/auto` | `auto`（默认） | 已开启对话自动接话功能，并接受所有agent请求 |
+| `/start` | `manual` | 已切换为手动模式：只保留工具，不自动接话 |
+| `/stop` | `stopped` | 已停止当前会话的自动接话功能，并已停止所有agent请求 |
+
+非管理员发这些命令，只会收到一句「只有管理员能切换运行状态」。
+
+### 沉默是允许的，但被 @ 不行
+
+模型可以不接话（返回空的 `reply`），这是正常行为，不是故障。但**被 @ 时必须回一句**：
+
+- 模型沉默 / 输出解析失败 / 超时 / agent 链路报错 —— 都会带着「必须说一句」再问一次
+- 再问还问不出话，就发固定短句「在，你说。」
+
+被点名还一声不吭，用户只会以为机器人死了。
+
+## 自带模型与人格
+
+`.env` 里配三项就能说话，**不依赖任何外部 Agent**：
 
 ```dotenv
 LLM_API_BASE=https://api.deepseek.com    # 任何 OpenAI 兼容端点
@@ -96,164 +149,288 @@ AUTO_REPLY=true                          # false = 只做工具，不主动发�
 SYSTEM_PROMPT_FILE=data/system_prompt.md # 人格文件，改完热加载
 ```
 
-**人格**：直接编辑 `data/system_prompt.md`（或控制台里的「人格 / System Prompt」文本框）。
-文件内容是完整的 system prompt，可以随便写人设。程序会要求模型以 JSON 回
-`{"reply": "...", "reason": "..."}`，`reply` 为空即沉默 —— 所以**沉默是模型可以主动选的**，
-不是异常。
+**人格**直接编辑 `data/system_prompt.md`（或控制台「模型与人格」页的文本框）。
+文件内容就是完整的 system prompt，人设随便写。
 
-调用统计（次数 / tokens）在控制台的「模型」卡片里实时显示。
+> `SYSTEM_PROMPT_FILE` 的回退链：配置的文件 → `prompts/default_persona.md` → 代码内置默认。
+> 所以自己改了人格，升级仓库时不会被覆盖。
 
-### 输出解析与安全兜底
+### 输出解析：五档兜底，绝不把 JSON 发进群
 
-模型被要求以 JSON 回复。解析按五档处理，**任何一档都不会把原始 JSON 发进群**：
+模型被要求以 JSON 回复。解析分五档，**任何一档都不会把原始 JSON 发到群里**：
 
 | how | 场景 | 行为 |
 |---|---|---|
-| `ok` | 直接是合法 JSON | 正常取 reply |
-| `fenced` | 被 ```json 包裹 | 剥壳后取 reply |
+| `ok` | 直接是合法 JSON | 正常取 `reply` |
+| `fenced` | 被 markdown 代码块包着 | 剥壳后取 `reply` |
 | `embedded` | JSON 前后夹了别的话 | 抠出第一个 `{...}` 块 |
 | `plain` | 本来就是一句人话 | 当纯文本发 |
-| `failed` | **看着像 JSON 但坏了（截断/畸形）** | **改判沉默**，并写审计 `decide_parse_failed` |
+| `failed` | **看着像 JSON 但坏了（截断 / 畸形）** | **改判沉默**，并写审计 `decide_parse_failed` |
 
-> 这条兜底是踩过坑加的：带 reasoning 的模型会把推理 token 也算进 `max_tokens`，
-> JSON 被截断时，早期版本会把整段 `{"reply": ...}` 原样发到群里。
-> 现在遇到 `failed` 一律闭嘴。用 reasoning 模型时建议 `LLM_MAX_TOKENS>=2048`。
+> 这条兜底是踩坑加的：带思考链的模型会把推理 token 也算进 `max_tokens`，
+> JSON 被截断时早期版本会把整段 `{"reply": ...}` 原样发到群里。
+> 用 reasoning 模型时建议 `LLM_MAX_TOKENS>=2048`。
 
-## 配置
+调用统计（次数 / 输入输出 token）在控制台实时显示。
 
-见 `.env.example`。关键项：
+## 自动发说说
 
-| 变量 | 说明 |
+按节奏用模型现写内容，发到机器人自己的 QQ 空间。配置在 `data/qzone.json`，控制台可视化编辑。
+
+| 项目 | 说明 |
 |---|---|
-| `LLM_API_BASE` / `LLM_API_KEY` / `LLM_MODEL` | bot 自己的模型凭据 |
-| `AUTO_REPLY` | 是否让 bot 主动接话 |
-| `SYSTEM_PROMPT_FILE` | 人格文件路径 |
-| `ONEBOT_HTTP` / `ONEBOT_WS` | OneBot 的 HTTP 与 WebSocket 地址 |
-| `ONEBOT_TOKEN` / `ONEBOT_WS_TOKEN` | 两者常常**不是同一个** token |
-| `MCP_TOKEN` | 本服务的访问令牌（MCP 与控制台共用） |
-| `OWNER_IDS` | 只有这些 QQ 能触发写操作；留空则全部拒绝 |
-| `ALLOW_SEND` / `ALLOW_MANAGE` | 发送 / 群管理总开关，默认关 |
-| `WATCH_GROUPS` | 只监控这些群；留空=全部。范围外的群只落库不唤醒 |
+| **频率** | 按间隔（每 N 小时）或按时刻（每天 `12:30` / `21:00` 这类） |
+| **兜底** | 最短间隔 + 静默时段（例如 23:30–08:00 不发） |
+| **主题** | 预设 8 个，可增删改、可只启用其中几个、可随机或轮转 |
+| **时间窗** | 主题可带 `hours`：「深夜」只在 22:30–05:30 被选中，下午不会写出「凌晨了还醒着」 |
+| **试口吻** | 控制台有「立刻发一条」，不影响排期 |
 
-## MCP 工具
+预设主题：日常随想 / 写代码 / Minecraft 服务器 / 深夜 / 玩梗吐槽 / 天气季节 / 游戏 / AI 自省。
 
-**只读**：`get_status` `list_groups` `list_members` `get_history` `local_history`
-`search_messages` `poll_events` `list_pending` `mark_processed` `audit_tail`
-`list_keywords` `get_scheduler`
-
-**写操作**：`send_message` `send_image` `manage_group`（禁言/解禁/踢人/改名/名片/全员禁言/退群）
-`set_keywords` `set_scheduler` `set_control` `set_profile`
-
-**单聊与 QQ 空间**（SnowLuma 扩展接口，非 OneBot 标准）：
-`send_private` `set_profile`（改昵称）`qzone_list` `qzone_feeds` `qzone_publish`（发说说）
-`qzone_delete` `qzone_like` `qzone_comment`
-
-> ⚠️ 这些扩展接口是 SnowLuma 独有的，换 OneBot 实现时须重新核对，
-> 代码里只做了「缺参数回显」式的只读探测确认。
-
-写操作要求 `actor` 在 `OWNER_IDS` 内，并携带唯一 `idempotency_key`，全部记入审计表。
-
-## ⚠️ 游标陷阱（已知问题，使用前必读）
-
-`poll_events(cursor)` 会**先推进游标再取消息**，而 `mark_processed` **只进不退**：
-
-| 缺陷 | 后果 |
-|---|---|
-| 传较大的 cursor 即清空队列 | 静默丢弃中间所有消息 |
-| `/api/pending` 的 cursor 取所有事件最大 id（含自己的消息） | 自己发一条就会跳过别人插在中间的消息 |
-| 环形缓冲 `maxlen=500` 满即丢弃 | 最旧事件永久消失，无告警 |
-
-**安全用法**：只用服务器返回的 cursor；判断"有没有新消息"用 `list_pending` 或
-`/api/events`，不要只看 `poll_events` 的空返回；发现游标跳跃立刻停止。
-
-## 内置 Agent（替代外部宿主）
-
-bot 自己能读写文件、执行命令 —— 不需要在电脑上另外常开一个 Agent 宿主。
-
-```dotenv
-AGENT_ENABLED=true      # 关掉则只有聊天，没有文件/命令能力
-AGENT_ROOT=             # 操作根目录，越界一律拒绝；留空=仓库根目录
-AGENT_MAX_STEPS=6       # 单次任务最多几步工具调用
-```
-
-可用工具：`list_dir` `read_file` `write_file` `search_files` `run_command`
-
-### 每一次读写都留痕
-
-**所有读取与写入逐行记录到 `data/agent.log`**（JSON Lines），同时写入 SQLite 审计表：
-
-```json
-{"at":"2026-10-07 17:52:07","action":"write_file","target":"...\\data\\x.txt","detail":{"bytes":12},"state":"SUCCEEDED"}
-{"at":"2026-10-07 17:52:08","action":"run_command","target":"format C: /y","detail":{},"state":"DENIED","result":"命中危险命令黑名单"}
-```
-
-外部 MCP 客户端也能调用它：`agent_run(task=\"...\")` 派活、`agent_log(limit=40)` 看读写记录。
-
-### 安全边界
-
-| 约束 | 行为 |
-|---|---|
-| 路径越界 | 直接拒绝（`只允许操作 <AGENT_ROOT> 之内的路径`） |
-| 单次读 | ≤ 256 KB |
-| 单次写 | ≤ 1 MB |
-| 命令超时 | ≤ 120 秒 |
-| 危险命令 | 黑名单拦截（format / mkfs / shutdown / rm -rf / 等），记 `DENIED` |
-| 调用方 | `agent_run` 仅限 `ADMIN_IDS` |
+> 走的是 SnowLuma 的扩展接口 `send_qzone_msg`，**不是** OneBot v11 标准接口。
 
 ## 控制台
 
-`http://127.0.0.1:18900/`
+<http://127.0.0.1:18900/> —— 需要账号密码登录。
 
-**首次进入**会先弹出《使用须知》与《最终用户许可协议》，必须勾选同意，然后设置后台账号密码。
-之后每次进入都要用账号密码登录；登录态放在 HttpOnly Cookie，有效期 7 天，
-进程重启即失效（会话只存在内存里）。
+| 页面 | 能干什么 |
+|---|---|
+| 概览 | 队列水位、消息流、待处理数量、缓冲丢弃计数 |
+| 模型与人格 | API Base / Key / 模型名 / 自动接话开关、system prompt |
+| 巡检与唤醒 | 巡检间隔、运行开关、**监控范围**、关键词表 |
+| 自动说说 | 发帖频率、主题管理、发送记录 |
+| 权限与安全 | 允许发送 / 群管理、Owner 白名单、改后台密码 |
+| 内置 Agent | 文件读写与命令执行记录 |
+| 日志与审计 | 谁发起、做什么、结果如何 |
 
-密码用 PBKDF2-SHA256（20 万次迭代 + 随机盐）保存，落盘文件是 `data/auth.json`，不含明文。
-账号管理页可以改密码，改完强制重新登录。
+几个值得单独说的设计：
 
-协议要点（全文在 `qqbridge/auth.py`）：
+**监控范围是勾选框，不是让人手打群号。** 列表直接来自 OneBot 的 `get_group_list`，
+显示群名、人数、群号；一个都不勾 = 不设限制，所有群都监控（范围外的群只落库，完全不唤醒）。
+
+**表单不会被轮询冲掉。** 状态每 4 秒刷一次，但只回填「你没碰过」的字段，
+碰过的字段会一直保留到你保存成功为止。
+
+**群里的图片直接渲染成缩略图**（点开是大图灯箱），不再是一串 `[CQ:image,file=...]`。
+图片经后端 `/api/image` 代理：只放行 QQ 图床（`*.qpic.cn` / `*.qq.com`）的 https 地址，
+挡掉 IP 字面量与其它主机，避免这个接口变成任意 URL 的跳板。
+图床链接带签名会过期，取不到时显示「图片已过期或取不到」而不是一直转圈。
+
+## 内置 Agent
+
+机器人自己能读写文件、执行命令，替代外部 Agent 宿主。
+
+```dotenv
+AGENT_ENABLED=true      # 关掉则只有聊天，没有文件 / 命令能力
+AGENT_ROOT=             # 操作根目录，越界一律拒绝；留空 = 仓库根目录
+AGENT_MAX_STEPS=30      # 单次任务最多几步
+```
+
+可用工具：`list_dir` `read_file` `write_file` `search_files` `run_command` `fetch_url`
+
+> `fetch_url` 是专门加的：让模型查网页时不用拼 curl。实测同一个查询从 15+ 步降到 2 步、6 秒。
+
+### 每一次读写都留痕
+
+所有读取与写入逐行写进 `data/agent.log`（JSON Lines），同时进 SQLite 审计表：
+
+```json
+{"at":"2026-10-07 17:52:07","action":"write_file","target":".../data/x.txt","detail":{"bytes":12},"state":"SUCCEEDED"}
+{"at":"2026-10-07 17:52:08","action":"run_command","target":"format C: /y","detail":{},"state":"DENIED","result":"命中危险命令黑名单"}
+```
+
+### 边界
+
+| 约束 | 行为 |
+|---|---|
+| 路径越界 | 直接拒绝，只允许 `AGENT_ROOT` 之内 |
+| 单次读 | ≤ 256 KB |
+| 单次写 | ≤ 1 MB |
+| 命令输出 | ≤ 64 KB |
+| 命令超时 | 默认 15 秒，硬上限 60 秒 |
+| 抓网页 | ≤ 512 KB，只允许 http/https |
+| 危险命令 | 黑名单拦截（format / mkfs / shutdown / rm -rf 等），记 `DENIED` |
+| 调用方 | MCP 侧 `agent_run` 仅限 `ADMIN_IDS` |
+
+> 命令走 `asyncio.to_thread`，不会阻塞事件循环 —— 实测执行期间心跳最大间隔 0.111 秒。
+
+## MCP 工具
+
+端点：`http://127.0.0.1:18900/mcp/`（注意结尾斜杠），鉴权头 `Authorization: Bearer <MCP_TOKEN>`。
+
+**读取与队列（13 个）**
+
+| 工具 | 用途 |
+|---|---|
+| `get_status` | 连接状态、队列水位、配置概览 |
+| `list_groups` / `list_members` | 群列表 / 群成员（含 role） |
+| `get_history` / `local_history` | 从 OneBot 拉历史 / 读本地缓存 |
+| `search_messages` | 本地消息全文检索 |
+| `poll_events` / `list_pending` | 取事件（都立刻返回，永不阻塞） |
+| `mark_processed` | 推进已处理游标 |
+| `list_keywords` / `get_scheduler` / `get_control` | 读当前设置 |
+| `audit_tail` | 最近的操作审计 |
+
+**写操作（8 个）** —— 要求 `actor` 在 `OWNER_IDS` 内，且带唯一 `idempotency_key`
+
+| 工具 | 用途 |
+|---|---|
+| `send_message` / `send_image` / `send_private` | 发文本 / 发图 / 单聊 |
+| `manage_group` | `mute` `unmute` `kick` `rename` `card` `whole_ban` `leave` |
+| `set_keywords` / `set_scheduler` / `set_control` / `set_profile` | 改配置 / 改昵称 |
+
+**QQ 空间与 Agent（8 个）** —— 前 6 个是 SnowLuma 扩展接口，**非 OneBot 标准**
+
+| 工具 | 用途 |
+|---|---|
+| `qzone_list` / `qzone_feeds` | 自己的说说 / 好友动态 |
+| `qzone_publish` / `qzone_delete` | 发 / 删说说 |
+| `qzone_like` / `qzone_comment` | 点赞 / 评论（好友的需带 `target_uin`） |
+| `agent_run` / `agent_log` | 给内置 Agent 派活 / 查它的读写记录 |
+
+> 这些扩展接口是 SnowLuma 独有的。换 OneBot 实现时必须重新核对，
+> 代码里只做过「缺参数回显」式的只读探测确认。
+
+## 配置速查
+
+完整项见 [`.env.example`](.env.example)。最常改的几个：
+
+| 变量 | 说明 |
+|---|---|
+| `LLM_API_BASE` / `LLM_API_KEY` / `LLM_MODEL` | 机器人自己的模型凭据 |
+| `AUTO_REPLY` | 是否主动接话 |
+| `SYSTEM_PROMPT_FILE` | 人格文件路径 |
+| `ONEBOT_HTTP` / `ONEBOT_WS` | OneBot 的 HTTP 与 WebSocket 地址 |
+| `ONEBOT_TOKEN` / `ONEBOT_WS_TOKEN` | 两者常常**不是同一个** token |
+| `MCP_TOKEN` | MCP 与控制台共用的访问令牌 |
+| `OWNER_IDS` | 只有这些 QQ 能触发写操作；留空则全部拒绝 |
+| `ADMIN_IDS` | 能发 `/stop` `/start` `/auto`、能走 agent 路径；留空退回 `OWNER_IDS` |
+| `ALLOW_SEND` / `ALLOW_MANAGE` | 发送 / 群管理总开关，默认关 |
+| `WATCH_GROUPS` | 只监控这些群；留空 = 全部 |
+| `COOLDOWN_SECONDS` | 自动触发接话的冷却秒数（0 = 不自动触发） |
+| `RING_SIZE` | 环形缓冲大小（默认 500），满了会丢最旧的并计数 |
+
+## 目录结构
+
+```text
+qqbridge/
+├─ run.py                   入口（把仓库目录塞进 sys.path，不用装包）
+├─ start.bat                Windows 一键启动
+├─ .env.example             配置模板
+├─ README.md                这份说明
+├─ DESIGN.md                更细的设计笔记
+├─ prompts/
+│   └─ default_persona.md   自带人格（用户没配人格文件时的回退）
+├─ tests/                   自包含测试脚本，见下方「测试」
+├─ qqbridge/                包本体
+│   ├─ server.py            FastAPI：MCP 端点 + 控制台 REST + 图片代理
+│   ├─ ui.html              控制台单页（无构建步骤）
+│   ├─ bus.py               事件总线：环形缓冲 + 持久化自增 id + 三级队列
+│   ├─ autoreply.py         接话循环：全自动分流、限流、@ 兜底
+│   ├─ agent.py             人格、历史、决策与输出解析兜底
+│   ├─ agentloop.py         内置 Agent 的多步循环
+│   ├─ agenttools.py        文件 / 命令 / 抓网页工具（带边界与留痕）
+│   ├─ llm.py               OpenAI 兼容客户端（含 DeepSeek thinking 开关）
+│   ├─ onebot.py            OneBot HTTP + 常驻 WebSocket（指数退避重连）
+│   ├─ qzone.py             QQ 空间扩展接口
+│   ├─ qzone_auto.py        自动发说说的调度与生成
+│   ├─ auth.py              控制台鉴权 + 两份协议全文
+│   ├─ scheduler.py         巡检节拍
+│   ├─ control.py           auto / manual / stopped
+│   ├─ commands.py          群内命令与回执文案
+│   ├─ rules.py             关键词分级
+│   ├─ store.py             SQLite 持久化
+│   └─ config.py            .env 读取与回写
+└─ data/                    运行时数据（已 gitignore）
+    ├─ qqbridge.sqlite3     消息 / 成员 / 群 / 审计 / 幂等键
+    ├─ system_prompt.md     人格（可改，热加载）
+    ├─ qzone.json           自动说说配置与历史
+    ├─ auth.json            后台账号（PBKDF2 加盐，无明文）
+    ├─ agent.log            内置 Agent 的读写记录（JSONL）
+    └─ scheduler.json       巡检设置
+```
+
+## 安全约定
+
+- **写操作只认 `OWNER_IDS`**，昵称与自称不算数
+- **幂等键防重放**；审计表记录「谁发起、做什么、结果如何」
+- **控制台要登录**，会话只存在内存里，重启即失效；密码 PBKDF2-SHA256 加盐
+- **群管理前核对目标 role**，群主不可被禁言；失败如实上报，绝不谎报成功
+- **内置 Agent 的所有读写都在 `AGENT_ROOT` 内**，越界直接拒绝，且逐条留痕
+- **提示词注入不生效**：要求以开发者身份下令、索要凭据、顶号之类的请求一律拒绝并留审计
+
+控制台首访必须同意两份协议，要点：
 
 1. **不保证没有 BUG**，因 BUG 造成的损失作者不赔
 2. **若有人拿它做违法的事，开发者概不负责**，责任由使用者独立承担
 3. 机器人及其相关创作的**所有权归属 EnderCraft**
 
-**监控范围是勾选框**，不是让人手打群号：列表直接来自 OneBot 的 `get_group_list`，
-显示群名、人数、群号，勾上保存即生效（`GET /api/groups`）。
-一个都不勾 = 不设限制，所有群都监控。
+## 测试
 
-表单不会被 4 秒一次的轮询冲掉：`refresh()` 只回填「用户没碰过」的字段，
-碰过的字段一直保留到保存成功为止 —— 以前在这里丢过改动，表现就是「改了监控群没用」。
+全部是自包含脚本：不联网、不碰仓库里的真实配置（临时目录里跑）。
 
-群里的图片会**直接渲染成缩略图**（点开看大图），不再是一串 `[CQ:image,file=...]`。
-图片经后端 `/api/image` 代理：只放行 QQ 图床（`*.qpic.cn` / `*.qq.com`）的 https 地址，
-挡掉 IP 字面量与其它主机，避免这个接口变成任意 URL 的跳板。图床链接带签名会过期，
-取不到时显示「图片已过期或取不到」而不是一直转圈。
+```powershell
+python tests/test_auth_qzone.py    # 门禁 / 协议 / 自动说说 / 图片代理白名单
+python tests/test_console.py       # 控制台每个开关是不是「真的生效」
+python tests/test_autoreply.py     # 被 @ 必回、闲聊该不该接
+node   tests/ui_console.mjs        # 控制台前端脚本（假 DOM 里跑 ui.html）
+python tests/test_readme.py        # 这份 README 有没有跟代码对不上
+```
 
-可配置：模型（API Base / Key / 模型名 / 自动接话开关）、**人格 system prompt**、
-巡检间隔、权限开关、Owner 白名单、监控群、关键词表、运行模式（auto / stopped / manual）、
-**自动说说**。实时显示消息流、审计记录、token 用量、Agent 的文件读写记录。
-设置落盘到 `.env`、`data/`。
+两个值得一提的守卫：
 
-## 自动发说说
+- `test_console.py` 会在开头给仓库真实的 `.env` 逐字节拍快照，结尾断言一个字节都没变 ——
+  因为控制台接口会把设置写回 `.env`，测试一旦认错目录就会把线上配置冲掉
+- `test_readme.py` 检查这份 README：提到的命令、环境变量、MCP 工具、目录结构、
+  测试脚本是不是都真实存在，工具数量对不对得上。文档一漂就报错
 
-bot 可以按节奏自己发 QQ 空间说说，内容由模型按主题现写，发到 bot 自己的空间。
+## 常见问题
 
-- 配置在 `data/qzone.json`，控制台「自动说说」页可视化编辑
-- 频率：按间隔（每 N 小时）或按时刻（每天 12:30 / 21:00 这类），另有最短间隔与静默时段兜底
-- 主题预设 8 个（日常随想 / 写代码 / Minecraft 服务器 / 深夜 / 玩梗吐槽 / 天气季节 / 游戏 / AI 自省），
-  可增删改，可只启用其中几个，可随机或轮转
-- 主题可带 `hours` 时间窗：例如「深夜」只在北京时间 22:30–05:30 被选中，
-  下午不会写出「凌晨了还醒着」这种跟时间对不上的内容
-- 控制台有「立刻发一条」按钮，用来试口吻，不影响排期
+<details>
+<summary><b>机器人一直不吭声，审计里全是 <code>auto_silent</code></b></summary>
 
-这条链路走的是 SnowLuma 的扩展接口 `send_qzone_msg`，**不是** OneBot v11 标准接口。
+先看控制台「模型与人格」页：`last_error` 是不是有值。
+最常见的两个原因：`LLM_API_BASE` / `LLM_MODEL` 被改成了不可用的值（例如测试值）；
+或者 API Key 余额不足。改回来立刻生效，不用重启。
 
-## 安全约定
+如果 `last_error` 是空的，那就是模型真的选择了沉默 —— 看审计里的 `reason`，
+它会写清楚为什么（例如「没人点名，也没有能自然接上的话题」）。
+</details>
 
-- 写操作只认 `OWNER_IDS`，昵称与自称不算数
-- 幂等键防重放；审计表记录「谁发起、做什么、结果」
-- 群管理前核对目标 role（owner 不可禁言），失败如实上报，不谎报成功
-- 不读取宿主机任何密钥或凭据
+<details>
+<summary><b>@ 了机器人还是不回</b></summary>
+
+正常情况下不可能：被 @ 时如果模型不给话，会再问一次，还不行就发「在，你说。」。
+如果仍然完全没反应，检查三件事：
+
+1. 这个群在不在控制台的「监控范围」里（没勾的群只落库，不唤醒）
+2. 运行模式是不是 `stopped`（群里发 `/auto` 恢复）
+3. 审计里有没有 `auto_reply` 记录 —— 有记录说明发出去了，那就是 QQ 侧的问题
+</details>
+
+<details>
+<summary><b>控制台里改了设置没反应</b></summary>
+
+先确认那个页面显示的确实是你的新值（不是被刷回去了）。
+如果值对但行为没变，多半是进程还跑着改动前的代码 —— 重启一次。
+
+界面上的值来自后端，只有「保存」成功才会落盘；
+顶部会弹提示，保存失败会直接说原因。
+</details>
+
+<details>
+<summary><b>控制台里图片显示「图片已过期或取不到」</b></summary>
+
+QQ 图床的链接是带签名的临时链，几小时后会失效。这是正常的，不是 BUG。
+如果你需要长期留档，得在收到消息时就另存一份。
+</details>
+
+<details>
+<summary><b>收不到某个群的消息</b></summary>
+
+按顺序排查：OneBot 连接（控制台右上角是不是「QQ 已连接」）→ 监控范围有没有勾这个群
+→ 群在不在 SnowLuma 的监听列表里。
+</details>
 
 ## License
 
