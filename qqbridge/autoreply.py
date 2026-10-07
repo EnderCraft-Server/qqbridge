@@ -171,27 +171,31 @@ class AutoReply:
     async def _tick(self):
         if not self.agent or not self.agent.llm.configured:
             return
-        pending = self.bus.pending(include_low=True, limit=10)
-        if not pending:
+        # 取「所有未处理事件」而不是只看 pending 队列。
+        # 历史教训：只读 pending 时，因冷却条件未入队的消息会被静默跳过 ——
+        # 既没有 auto_reply 也没有 auto_silent，日志里一片空白，看起来像"收不到"。
+        cursor = self.bus.status()["cursor"]
+        fresh = [e for e in self.bus.since(cursor, limit=50) if not e.get("is_self")]
+        if not fresh:
             return
-        if not self._rate_ok():
-            log.info("autoreply: 每分钟上限，暂停接话")
+        has_mention = any(e.get("mentions_me") for e in fresh)
+        if not self._rate_ok() and not has_mention:
+            log.info("autoreply: 每分钟上限，暂停接话（积压 %d 条）", len(fresh))
             return
+        # 必须按 **id 顺序** 取，不能按优先级排序后跳着处理 ——
+        # mark_processed 是「推进到某个 id」，跳着处理会把中间未处理的消息一起划掉。
+        # 优先级只用于限流放行（@ 不受每分钟上限限制）。
+        pending = fresh
 
         # 一次处理一条，避免刷屏
         ev = pending[0]
         self.agent.observe(ev)
 
-        in_agent_mode = bool(self.control) and self.control.is_agent()
+        # 全自动分流：不再需要人工切模式。
+        #   管理员  -> 带工具的 agent 路径，由 AI 自己决定「用工具办事」还是「直接聊天」
+        #   其他人  -> 纯聊天路径（不碰文件/命令）
         is_admin = str(ev.get("user_id") or "") in config.admins
-
-        if in_agent_mode:
-            # agent 模式：只认管理员，走工具循环
-            if not is_admin:
-                self.bus.mark_processed(ev["id"])
-                self.last_action = "agent 模式忽略非管理员消息"
-                self.last_at = time.time()
-                return
+        if is_admin:
             decided = await self._run_agent(ev)
         else:
             decided = await self.agent.decide(ev)

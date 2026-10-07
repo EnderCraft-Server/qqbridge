@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 MODES = ("auto", "stopped", "manual")
-# 行为模式：chat = 群友闲聊（所有人都能聊）；agent = 只认管理员，可调工具干活
+# 行为模式已改为全自动（管理员走 agent 路径、其他人走 chat），此字段仅保留兼容
 AGENT_MODES = ("chat", "agent")
 
 
