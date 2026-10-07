@@ -186,10 +186,13 @@ ok.append("边界：管理员在群里闲聊（没 @）走批处理，不会被�
 llm = FakeLLM(['{"reply": "接", "reason": "x"}'])
 store, bus, bot = FakeStore(), FakeBus([ev(1, "刚发的", at=time.time())]), FakeBot()
 agent = QqAgent(llm, "p", store=store)
-ar = AutoReply(bus, store, agent, bot, FakeControl(), settle_seconds=6, max_batch_age=45)
+ar = AutoReply(bus, store, agent, bot, FakeControl(), settle_seconds=3, max_batch_age=45)
 asyncio.run(ar._tick())
 assert not bot.msgs and not llm.calls, "最后一条刚来，应当先等着看还有没有人接着说"
-ok.append("攒一段：最后一条之后静默期内不出手（max_batch_age 兜底不会饿死）")
+# 默认值也要跟着改，别只在测试里写死
+assert AutoReply(bus, store, agent, bot, FakeControl()).settle_seconds == 3.0, \
+    "默认静默窗口应当是 3 秒"
+ok.append("攒一段：最后一条之后静默 3 秒内不出手（max_batch_age 兜底不会饿死）")
 
 # 8) 纯文本多行回复不能被砍成第一行（老 bug 回归）
 from qqbridge.agent import clean_reply, tidy_plain
