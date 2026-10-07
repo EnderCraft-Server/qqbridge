@@ -72,7 +72,9 @@ class Config:
         # 内置 Agent：允许模型读写文件、执行命令（替代外部 Agent 宿主）
         self.agent_enabled = _bool("AGENT_ENABLED", True)
         self.agent_root = (os.environ.get("AGENT_ROOT") or str(ROOT)).strip()
-        self.agent_max_steps = _int("AGENT_MAX_STEPS", 30)
+        # 单次任务的工具调用上限。默认给得比较松：真正兜底的是 autoreply 的
+        # agent_timeout（90 秒）和 agentloop 里的死循环检测，不是这个数字。
+        self.agent_max_steps = _int("AGENT_MAX_STEPS", 60)
 
         raw_watch = (os.environ.get("WATCH_GROUPS") or "").strip()
         self.watch_groups = {x.strip() for x in raw_watch.replace("，", ",").split(",") if x.strip()}
