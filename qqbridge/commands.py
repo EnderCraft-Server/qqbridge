@@ -36,3 +36,42 @@ def parse_switch(text: str) -> str | None:
     if len(parts) < 2:
         return "?"
     return SWITCHES.get(parts[1].lower().strip())
+
+# 自然语言切换：说「使用agent模式执行：xxx」也能切，不用记命令
+import re as _re
+
+_NATURAL = (
+    _re.compile(r"^\s*(?:请)?(?:使用|用|切换到|切到|开启|进入)?\s*agent\s*模式\s*(?:执行|运行|来|干|做)?\s*[:：]?\s*(.*)$", _re.I | _re.S),
+    _re.compile(r"^\s*(?:请)?(?:使用|用|切换到|切到|开启|进入)?\s*chat\s*模式\s*(?:执行|运行|来)?\s*[:：]?\s*(.*)$", _re.I | _re.S),
+)
+_CN = (
+    _re.compile(r"^\s*(?:请)?(?:使用|用)?\s*(?:干活|工作|任务)\s*模式\s*[:：]?\s*(.*)$", _re.S),
+    _re.compile(r"^\s*(?:请)?(?:使用|用)?\s*(?:聊天|闲聊)\s*模式\s*[:：]?\s*(.*)$", _re.S),
+)
+
+
+def parse_natural_switch(text: str):
+    """识别「使用agent模式执行：xxx」这类说法。
+
+    返回 (目标模式, 剩余内容)；不像切换指令则返回 None。
+    只认明确带「模式」二字且以切换语开头的说法，避免误伤正常聊天。
+    """
+    raw = (text or "").strip()
+    if not raw or "/switch" in raw:
+        return None
+    # 必须出现「模式」而且句首是切换意图，才认为是控制指令
+    if "模式" not in raw:
+        return None
+    head = raw[:14].lower()
+    if not any(k in head for k in ("使用", "用", "切换", "切到", "开启", "进入",
+                                   "agent", "chat", "干活", "聊天", "闲聊")):
+        return None
+    for rx, mode in zip(_NATURAL, ("agent", "chat")):
+        m = rx.match(raw)
+        if m:
+            return mode, (m.group(1) or "").strip()
+    for rx, mode in zip(_CN, ("agent", "chat")):
+        m = rx.match(raw)
+        if m:
+            return mode, (m.group(1) or "").strip()
+    return None
