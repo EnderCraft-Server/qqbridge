@@ -619,12 +619,15 @@ def _reply(control, conversation: str, text: str):
         if _BOT is None or _MAIN_LOOP is None:
             log.info("control reply (bot not ready): %s", text)
             return
+        # 不等待结果：这是在 WebSocket 事件线程里，阻塞会拖住事件流。
         fut = asyncio.run_coroutine_threadsafe(
             _BOT.call("send_group_msg" if is_group else "send_private_msg",
                       **({"group_id": int(conv)} if is_group else {"user_id": int(conv)}),
                       message=text),
             _MAIN_LOOP)
-        fut.result(timeout=10)
+        fut.add_done_callback(
+            lambda f: log.warning("control reply failed: %s", f.exception())
+            if f.exception() else None)
     except Exception:
         log.exception("control reply failed")
 

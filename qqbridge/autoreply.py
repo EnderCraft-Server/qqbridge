@@ -13,6 +13,8 @@ import asyncio
 import logging
 import time
 
+from .config import config
+
 log = logging.getLogger("qqbridge.autoreply")
 
 
@@ -31,6 +33,8 @@ class AutoReply:
         self._task = None
         self._stop = asyncio.Event()
         self._sent: list[float] = []
+        self._fail_count: dict[int, int] = {}      # ev.id -> 连续失败次数
+        self.max_retry = 3
         self.last_action = ""
         self.last_at = 0.0
         self.errors = 0
@@ -81,9 +85,25 @@ class AutoReply:
                 continue
             try:
                 await self._tick()
-            except Exception:
+            except Exception as exc:
                 self.errors += 1
                 log.exception("autoreply tick failed")
+                # 卡住保护：同一条反复失败就跳过它，别把整条队列堵死
+                try:
+                    pending = self.bus.pending(include_low=True, limit=1)
+                    if pending:
+                        eid = pending[0]["id"]
+                        self._fail_count[eid] = self._fail_count.get(eid, 0) + 1
+                        if self._fail_count[eid] >= self.max_retry:
+                            log.warning("事件 %s 连续失败 %d 次，跳过并推进游标：%s",
+                                        eid, self._fail_count[eid], str(exc)[:120])
+                            self.store.audit("auto", "auto_skip", str(eid),
+                                             {"error": str(exc)[:200],
+                                              "tries": self._fail_count[eid]}, "SKIPPED")
+                            self.bus.mark_processed(eid)
+                            self._fail_count.pop(eid, None)
+                except Exception:
+                    log.exception("skip-guard failed")
 
     def control_allows(self) -> bool:
         try:
@@ -175,4 +195,5 @@ class AutoReply:
             self.store.audit("auto", "auto_silent", ev.get("group_id", ""), {"reason": decided["reason"]},
                              "SUCCEEDED")
         self.last_at = time.time()
+        self._fail_count.pop(through, None)
         self.bus.mark_processed(through)
