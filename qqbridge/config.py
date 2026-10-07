@@ -21,6 +21,12 @@ def _int(name: str, default: int) -> int:
         return default
 
 
+def admins() -> set:
+    """管理员：可以执行 /stop /start /auto。留空则退回 OWNER_IDS。"""
+    raw = os.environ.get("ADMIN_IDS") or ""
+    return {x.strip() for x in raw.replace("，", ",").split(",") if x.strip()}
+
+
 def owners() -> set:
     raw = os.environ.get("OWNER_IDS") or ""
     return {x.strip() for x in raw.replace("，", ",").split(",") if x.strip()}
@@ -40,6 +46,7 @@ class Config:
         self.allow_send = _bool("ALLOW_SEND", False)
         self.allow_manage = _bool("ALLOW_MANAGE", False)
         self.owners = owners()
+        self.admins = admins() or self.owners
         self.mcp_token = (os.environ.get("MCP_TOKEN") or "").strip() or "change-me"
         raw_watch = (os.environ.get("WATCH_GROUPS") or "").strip()
         self.watch_groups = {x.strip() for x in raw_watch.replace("，", ",").split(",") if x.strip()}
@@ -81,6 +88,7 @@ class Config:
             "port": self.port,
             "path": self.path,
             "owners": sorted(self.owners),
+            "admins": sorted(self.admins),
             "allow_send": self.allow_send,
             "allow_manage": self.allow_manage,
             "cooldown_seconds": self.cooldown,

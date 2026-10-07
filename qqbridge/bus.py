@@ -15,20 +15,47 @@ class EventBus:
     """Thread-safe ring buffer of normalised message events."""
 
     def __init__(self, size: int = 500, cooldown_seconds: int = 0, self_id: str = "",
-                 rules=None, watch_groups=None):
+                 rules=None, watch_groups=None, control=None, store=None):
         self._lock = threading.RLock()
         self._events = deque(maxlen=size)
-        self._seq = itertools.count(1)
-        self._processed = 0          # cursor: highest id handed to the model
+        # Durable id sequence + cursor. Both live in the store when one is supplied, so a
+        # restart resumes where it left off instead of rewinding to 1. Without this, an
+        # external poller (e.g. dsh-qqbridge-wake) keeps its own monotonic cursor, sees every
+        # new id as "already processed", and silently stops waking anyone until it is restarted.
+        self._store = store
+        self._seq_value = self._load_int("bus.seq", 0)
+        self._seq = itertools.count(self._seq_value + 1)
+        self._processed = self._load_int("bus.cursor", 0)   # cursor: highest id handed to the model
         self._last_own_send = 0.0
         self.cooldown = cooldown_seconds
         self.self_id = self_id
         self.rules = rules
         # 只监控这些群；空集合表示全部群
         self.watch_groups = set(str(g) for g in (watch_groups or []))
+        # 运行时控制（/stop 挂起）。为 None 时视为不暂停。
+        self.control = control
         self._pending_high: list = []   # @me
         self._pending_mid: list = []    # keyword hits
         self._pending_low: list = []    # cooldown chatter
+
+    # ---------- durable state ----------
+    def _load_int(self, key: str, default: int = 0) -> int:
+        if self._store is None:
+            return default
+        try:
+            return max(0, int(self._store.get_state(key, default)))
+        except (TypeError, ValueError):
+            return default
+
+    def _save_int(self, key: str, value: int) -> None:
+        if self._store is not None:
+            self._store.set_state(key, int(value))
+
+    def _next_id(self) -> int:
+        """Allocate the next event id, durably, so ids never repeat across restarts."""
+        self._seq_value += 1
+        self._save_int("bus.seq", self._seq_value)
+        return next(self._seq)
 
     # ---------- ingest ----------
     def push(self, event: dict) -> dict | None:
@@ -60,7 +87,7 @@ class EventBus:
         sender = event.get("sender") or {}
         topic = str(event.get("message_type") or "group")
         record = {
-            "id": next(self._seq),
+            "id": self._next_id(),
             "at": time.time(),
             "platform": "qq",
             "message_type": topic,
@@ -82,7 +109,8 @@ class EventBus:
             if self.watch_groups and record["group_id"] not in self.watch_groups and record["message_type"] == "group":
                 return record          # 落库但绝不入队，完全不唤醒
             self._events.append(record)
-            if not record["is_self"]:
+            paused = bool(self.control) and self.control.paused()
+            if not record["is_self"] and not paused:
                 if record["mentions_me"]:
                     self._pending_high.append(record["id"])
                 elif hit:
@@ -118,6 +146,8 @@ class EventBus:
             "last_own_send": self._last_own_send,
             "cooldown_seconds": self.cooldown,
             "watch_groups": sorted(self.watch_groups),
+            "paused": bool(self.control) and self.control.paused(),
+            "mode": self.control.mode if self.control else "auto",
         }
 
     def pending(self, include_low: bool = True, limit: int = 50) -> list:
@@ -145,4 +175,5 @@ class EventBus:
             self._pending_high = [i for i in self._pending_high if i > through_id]
             self._pending_mid = [i for i in self._pending_mid if i > through_id]
             self._pending_low = [i for i in self._pending_low if i > through_id]
+            self._save_int("bus.cursor", self._processed)
             return self._processed

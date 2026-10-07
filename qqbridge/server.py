@@ -21,7 +21,9 @@ from mcp.server.transport_security import TransportSecuritySettings
 from .bus import EventBus
 from .config import config
 from .onebot import OneBot
+from .control import Control
 from .rules import Rules
+from . import commands
 from .scheduler import Scheduler
 from .store import Store
 from .tools import Denied, Toolbox
@@ -166,6 +168,22 @@ def build_tools(box: Toolbox, rules: Rules, sched: Scheduler):
         box.store.audit(actor, "set_scheduler", "scheduler", saved, "SUCCEEDED")
         return sched.status()
 
+    @tool("get_control", "查看运行模式（auto/stopped/manual）。", {"type": "object",
+          "properties": {}, "additionalProperties": False})
+    async def _ctl_get(**kw):
+        return control.status()
+
+    @tool("set_control", "切换运行模式：auto 自动唤醒 / stopped 强制静默 / manual 手动。仅管理员。",
+          {"type": "object", "properties": {
+              "actor": {"type": "string"},
+              "mode": {"type": "string", "enum": ["auto", "stopped", "manual"]},
+              "reason": {"type": "string", "default": ""}},
+           "required": ["actor", "mode"], "additionalProperties": False})
+    async def _ctl_set(actor: str, mode: str, reason: str = "", **kw):
+        if str(actor) not in config.admins:
+            raise Denied(f"{actor} 不是管理员，不能切换运行模式。")
+        return control.set(mode, actor=actor, reason=reason)
+
     @tool("audit_tail", "查看最近的操作审计记录。", {"type": "object",
           "properties": {"limit": {"type": "integer", "default": 30}}, "additionalProperties": False})
     async def _audit(limit: int = 30, **kw):
@@ -178,7 +196,9 @@ def create_app() -> FastAPI:
     store = Store(config.data_dir / "qqbridge.sqlite3")
     rules = Rules(path=config.data_dir / "keywords.json")
     bus = EventBus(size=config.ring_size, cooldown_seconds=config.cooldown, rules=rules,
-                   watch_groups=config.watch_groups)
+                   watch_groups=config.watch_groups, store=store)
+    control = Control(config.data_dir / "control.json", bus, store)
+    bus.control = control
     sched = Scheduler(config.data_dir / "scheduler.json", bus, store)
     bot = OneBot(config.http, config.ws, config.token, config.ws_token)
     box = Toolbox(bot, bus, store)
@@ -224,7 +244,7 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def _startup():
-        await bot.start(on_event=lambda ev: _ingest(ev, bus, store))
+        await bot.start(on_event=lambda ev: _ingest(ev, bus, store, control))
         await sched.start()
         app.state.session_task = asyncio.create_task(_run_manager())
 
@@ -260,6 +280,7 @@ def create_app() -> FastAPI:
             "config": config.describe(),
             "bot": {"self_id": bot.self_id, "ws_connected": bot.connected, "last_event_at": bot.last_event_at},
             "scheduler": sched.status(),
+            "control": control.status(),
             "keywords": rules.keywords,
         }
 
@@ -279,6 +300,9 @@ def create_app() -> FastAPI:
     async def api_pending(request: Request, cursor: int = 0, groups: str = ""):
         """Cheap poll for the wake plugin. Empty list when nothing new — costs no model tokens."""
         _ui_auth(request)
+        if control.paused():
+            return {"events": [], "count": 0, "cursor": cursor, "empty": True,
+                    "paused": True, "mode": control.mode}
         wanted = {g.strip() for g in groups.split(",") if g.strip()} or set(config.watch_groups)
         with bus._lock:
             events = [e for e in bus._events if e["id"] > cursor]
@@ -301,6 +325,13 @@ def create_app() -> FastAPI:
     async def api_audit(request: Request, limit: int = 20):
         _ui_auth(request)
         return {"records": store.audit_tail(limit)}
+
+    @app.post("/api/control")
+    async def api_control(request: Request):
+        _ui_auth(request)
+        body = await request.json()
+        mode = str(body.get("mode") or "")
+        return control.set(mode, actor="gui", reason=str(body.get("reason") or ""))
 
     @app.post("/api/scheduler")
     async def api_scheduler(request: Request):
@@ -346,7 +377,9 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health():
-        return JSONResponse(box.get_status())
+        out = box.get_status()
+        out["control"] = control.status()
+        return JSONResponse(out)
 
     async def endpoint(scope, receive, send):
         request = Request(scope, receive)
@@ -361,8 +394,18 @@ def create_app() -> FastAPI:
     return app
 
 
-def _ingest(event: dict, bus: EventBus, store: Store):
+def _ingest(event: dict, bus: EventBus, store: Store, control: "Control" = None):
     """Callback from the WebSocket thread: store + queue. Never touches the model."""
+    # 管理员命令在入队前拦下
+    if control is not None and event.get("post_type") == "message":
+        raw = event.get("raw_message") or ""
+        target = commands.parse(raw)
+        if target:
+            sender = str(event.get("user_id") or "")
+            if sender in config.admins:
+                control.set(target, actor=sender, reason=raw.strip()[:80])
+                log.info("control: %s -> %s by %s", raw.strip()[:20], target, sender)
+                return              # 命令本身不入库、不入队
     record = bus.push(event)
     if record:
         try:

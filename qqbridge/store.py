@@ -30,6 +30,9 @@ CREATE TABLE IF NOT EXISTS audit(
 
 CREATE TABLE IF NOT EXISTS dedupe(
   key TEXT PRIMARY KEY, at REAL NOT NULL, result TEXT);
+
+CREATE TABLE IF NOT EXISTS state(
+  key TEXT PRIMARY KEY, value TEXT NOT NULL, updated REAL);
 """
 
 
@@ -131,3 +134,24 @@ class Store:
         with self._lock, self.connect() as db:
             db.execute("INSERT OR REPLACE INTO dedupe(key,at,result) VALUES(?,?,?)",
                        (key, time.time(), json.dumps(result, ensure_ascii=False)))
+
+    # ---------- durable scalars ----------
+    def get_state(self, key: str, default=None):
+        """Read a persisted scalar. Returns default when absent or unreadable."""
+        try:
+            with self.connect() as db:
+                row = db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+            if row is None:
+                return default
+            return json.loads(row["value"])
+        except (sqlite3.Error, ValueError):
+            return default
+
+    def set_state(self, key: str, value):
+        """Persist a scalar. Best-effort: a write failure must never break ingest."""
+        try:
+            with self._lock, self.connect() as db:
+                db.execute("INSERT OR REPLACE INTO state(key,value,updated) VALUES(?,?,?)",
+                           (key, json.dumps(value), time.time()))
+        except sqlite3.Error:
+            pass
