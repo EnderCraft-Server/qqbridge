@@ -9,6 +9,7 @@ __pycache__/
 *.py[cod]
 .venv/
 .tmp/
+workspace/
 
 # 编辑器
 .vscode/

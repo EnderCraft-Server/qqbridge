@@ -79,6 +79,16 @@ qqbridge/
 - `set_group_whole_ban(group_id, enable)` — 全员禁言
 - `set_group_leave(group_id)` — 退群
 
+## 控制台门禁与自动说说
+
+控制台不是「拿到 URL 就能进」：首次访问必须同意《使用须知》+《最终用户许可协议》并设置账号密码，
+之后走登录。鉴权顺序是 HttpOnly Cookie 里的会话 token → `X-Bridge-Token`（留给脚本/自动化）。
+MCP 端点用的是独立的 Bearer token，两者互不影响。密码用 PBKDF2-SHA256 加盐存 `data/auth.json`。
+
+自动说说是一个独立的后台循环（`qzone_auto.py`）：60 秒醒一次判断「到点没有」，
+到点才调模型，平时零 token 消耗。它和群聊接话共用同一个 `LLM` 实例与审计表，
+配置存 `data/qzone.json`（频率 + 预设主题 + 历史）。
+
 ## 安全设计（吸取 Tulpa 的教训）
 
 1. **owner 白名单**：写操作只接受配置里列的 QQ 号发起的指令；

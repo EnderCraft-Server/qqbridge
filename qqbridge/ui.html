@@ -115,10 +115,84 @@
     border-radius:var(--radius);padding:12px 18px;opacity:0;transform:translateY(8px);transition:.22s;
     pointer-events:none;box-shadow:0 10px 30px -12px #0003}
   .toast.show{opacity:1;transform:none}
+  /* ---------- 登录 / 协议门禁 ---------- */
+  .gate{position:fixed;inset:0;z-index:50;background:var(--background);display:none;
+    place-items:center;padding:24px;overflow:auto}
+  .gate.show{display:grid}
+  .gate .box{width:100%;max-width:620px;background:var(--card);border:1px solid var(--border);
+    border-radius:calc(var(--radius) + 4px);padding:28px 30px;box-shadow:0 24px 60px -30px #0004}
+  .gate .box.wide{max-width:760px}
+  .gate h2{margin:0 0 4px;font-size:19px;font-weight:600}
+  .gate .sub{margin:0 0 18px;color:var(--muted-fg);font-size:13px}
+  .gate .view{display:none}.gate .view.on{display:block}
+  .gate label{display:block;font-size:12.5px;color:var(--muted-fg);margin:14px 0 6px}
+  .gate input[type=text],.gate input[type=password]{width:100%;padding:10px 12px;border:1px solid var(--border);
+    border-radius:var(--radius);background:var(--background);color:var(--fg);font:14px/1.5 inherit;outline:none}
+  .gate input:focus{border-color:var(--ring);box-shadow:0 0 0 3px oklch(68.5% .155 230 / .18)}
+  .gate button{all:unset;display:inline-flex;justify-content:center;align-items:center;padding:10px 20px;
+    border-radius:var(--radius);background:var(--primary);color:var(--primary-fg);font-size:13.5px;
+    font-weight:600;cursor:pointer;transition:opacity .15s}
+  .gate button:hover{opacity:.9}
+  .gate button.ghost{background:var(--muted);color:var(--fg);font-weight:500}
+  .gate button[disabled]{opacity:.45;cursor:not-allowed}
+  .gate .full{width:100%;margin-top:20px}
+  .agr{max-height:290px;overflow:auto;border:1px solid var(--border);border-radius:var(--radius);
+    padding:16px 18px;background:var(--background);font-size:12.5px;line-height:1.75;white-space:pre-wrap;
+    color:var(--muted-fg)}
+  .agr b{color:var(--fg)}
+  .tabs{display:flex;gap:6px;margin-bottom:12px}
+  .tabs button{background:var(--muted);color:var(--muted-fg);font-weight:500;padding:7px 16px;font-size:12.5px}
+  .tabs button.on{background:var(--primary);color:var(--primary-fg);font-weight:600}
+  .check{display:flex;align-items:flex-start;gap:9px;margin-top:16px;font-size:13px;color:var(--fg)}
+  .check input{width:16px;height:16px;margin-top:2px;accent-color:var(--primary)}
+  .err{color:var(--bad);font-size:12.5px;margin-top:12px;min-height:18px}
+
   @media(max-width:760px){aside{width:64px;flex:0 0 64px}.brand b,nav button span,{display:none}.side-foot{display:none}}
 </style>
 </head>
 <body>
+<div class="gate" id="gate">
+  <div class="box wide" id="g-box">
+    <div class="brand" style="padding:0 0 14px"><div class="mark">Q</div><b>qqbridge 控制台</b></div>
+
+    <!-- 1. 首次进入：协议 -->
+    <div class="view" id="v-agree">
+      <h2>使用须知与许可协议</h2>
+      <div class="sub">首次使用前请完整阅读。继续使用即视为您已同意全部条款。</div>
+      <div class="tabs">
+        <button class="on" data-agr="terms">使用须知</button>
+        <button data-agr="eula">最终用户许可协议</button>
+      </div>
+      <div class="agr" id="agr-text">加载中…</div>
+      <label class="check"><input type="checkbox" id="agr-ok">
+        <span>我已阅读并同意《使用须知》与《最终用户许可协议》</span></label>
+      <button class="full" id="agr-go" disabled>同意并继续</button>
+      <div class="err" id="agr-err"></div>
+    </div>
+
+    <!-- 2. 首次进入：设置后台账号 -->
+    <div class="view" id="v-setup">
+      <h2>设置后台账号</h2>
+      <div class="sub">用于登录本控制台。密码经 PBKDF2-SHA256 加盐存储，不保存明文。</div>
+      <label>用户名</label><input type="text" id="su-user" autocomplete="username" placeholder="至少 2 位">
+      <label>密码</label><input type="password" id="su-pass" autocomplete="new-password" placeholder="至少 8 位">
+      <label>确认密码</label><input type="password" id="su-pass2" autocomplete="new-password">
+      <button class="full" id="su-go">创建并进入</button>
+      <div class="err" id="su-err"></div>
+    </div>
+
+    <!-- 3. 登录 -->
+    <div class="view" id="v-login">
+      <h2>登录控制台</h2>
+      <div class="sub">需要账号与密码才能进入后台。</div>
+      <label>用户名</label><input type="text" id="lg-user" autocomplete="username">
+      <label>密码</label><input type="password" id="lg-pass" autocomplete="current-password">
+      <button class="full" id="lg-go">登录</button>
+      <div class="err" id="lg-err"></div>
+    </div>
+  </div>
+</div>
+
 <div class="app">
   <aside>
     <div class="brand"><div class="mark">Q</div><b>qqbridge</b></div>
@@ -127,12 +201,15 @@
       <button data-page="model"><i class="ic">◆</i><span>模型与人格</span></button>
       <button data-page="watch"><i class="ic">◷</i><span>巡检与唤醒</span></button>
       <button data-page="safety"><i class="ic">⬡</i><span>权限与安全</span></button>
+      <button data-page="qzone"><i class="ic">✦</i><span>自动说说</span></button>
       <button data-page="agent"><i class="ic">⌘</i><span>内置 Agent</span></button>
       <button data-page="logs"><i class="ic">≡</i><span>日志与审计</span></button>
     </nav>
     <div class="side-foot">
       <div id="f-self">账号 —</div>
       <div id="f-model">模型 —</div>
+      <button id="logout" style="all:unset;margin-top:8px;display:block;cursor:pointer;
+        color:var(--primary);font-size:11.5px;font-weight:600">退出登录</button>
     </div>
   </aside>
 
@@ -251,9 +328,64 @@
           <button id="save-perm" style="margin-top:16px">保存</button>
         </div>
         <div class="card">
+          <h2>后台账号</h2><div class="sub">改完密码后需要重新登录</div>
+          <label>当前用户名</label><input id="acct-user" disabled>
+          <div class="grid2">
+            <div><label>原密码</label><input type="password" id="acct-old" autocomplete="current-password"></div>
+            <div><label>新密码（至少 8 位）</label><input type="password" id="acct-new" autocomplete="new-password"></div>
+          </div>
+          <button id="acct-save" style="margin-top:16px">修改密码</button>
+          <div class="hint">密码用 PBKDF2-SHA256（20 万次迭代）加盐保存，不存明文。连续输错会被审计记录。</div>
+        </div>
+        <div class="card">
           <h2>管理员</h2><div class="sub">可用 /stop /start /auto 与内置 Agent</div>
           <label>ADMIN_IDS（.env 中配置）</label><input id="admins" disabled>
           <div class="hint">白名单与管理员都写进 <code>.env</code>，重启后保持。</div>
+        </div>
+      </section>
+
+      <!-- 自动说说 -->
+      <section class="page" id="page-qzone">
+        <div class="card">
+          <h2>自动发说说</h2><div class="sub">按节奏用模型生成内容，发到 bot 自己的 QQ 空间</div>
+          <div class="switch">
+            <div><div class="t">启用自动说说</div><div class="d">关掉后只在下面手动发</div></div>
+            <label class="toggle"><input type="checkbox" id="qz_enabled"><i></i></label>
+          </div>
+          <div class="grid2">
+            <div><label>频率模式</label>
+              <select id="qz_mode"><option value="interval">按间隔</option><option value="daily">按时刻</option></select>
+            </div>
+            <div><label>间隔（小时）</label><input type="number" id="qz_interval" min="1" max="168"></div>
+          </div>
+          <label>每天发帖时刻（按时刻模式用，逗号分隔）</label>
+          <input id="qz_times" placeholder="12:30,21:00">
+          <div class="grid2">
+            <div><label>最短间隔（小时）</label><input type="number" id="qz_mingap" min="0" max="168"></div>
+            <div><label>主题轮换</label>
+              <select id="qz_order"><option value="random">随机</option><option value="rotate">轮转</option></select>
+            </div>
+          </div>
+          <label>静默时段（不发说说，逗号分隔两个时刻）</label>
+          <div class="row"><input type="time" id="qz_q1"><input type="time" id="qz_q2"></div>
+          <label>字数上限</label><input type="number" id="qz_maxchars" min="20" max="500">
+          <div class="row" style="margin-top:16px">
+            <button id="qz-save">保存</button>
+            <button class="ghost" id="qz-now">立刻发一条</button>
+            <span class="hint" id="qz-hint" style="margin:0"></span>
+          </div>
+        </div>
+        <div class="card">
+          <h2>主题</h2><div class="sub">预设主题已内置，可增删改；只有勾选的会被用到</div>
+          <div class="list" id="qz-themes"></div>
+          <label>新主题名称</label><input id="qz-new-name" placeholder="例如：运动打卡">
+          <label>写作方向（给模型的提示）</label><input id="qz-new-hint" placeholder="例如：跑步、健身、球赛，口语化，别写成鸡汤">
+          <button class="ghost" id="qz-add" style="margin-top:14px">添加主题</button>
+          <label>词条：已选主题（逗号分隔 id，留空=全部）</label><input id="qz-active" placeholder="daily,code,late">
+          <div class="hint" id="qz-active-hint">—</div>
+        </div>
+        <div class="card">
+          <h2>发送记录</h2><div class="list" id="qz-history"></div>
         </div>
       </section>
 
@@ -301,7 +433,65 @@ async function api(path, opts = {}) {
 }
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const hhmm = (t) => new Date((t || 0) * 1000).toLocaleTimeString("zh-CN", { hour12: false });
-const titles = { overview: "概览", model: "模型与人格", watch: "巡检与唤醒", safety: "权限与安全", agent: "内置 Agent", logs: "日志与审计" };
+const titles = { overview: "概览", model: "模型与人格", watch: "巡检与唤醒", qzone: "自动说说", safety: "权限与安全", agent: "内置 Agent", logs: "日志与审计" };
+
+/* ---------------- 登录门禁 ---------------- */
+const mdLite = (s) => esc(s || "")
+  .replace(/^### (.*)$/gm, '<b style="font-size:13px">$1</b>')
+  .replace(/^## (.*)$/gm, '<b style="font-size:13.5px;display:block;margin-top:10px">$1</b>')
+  .replace(/^# (.*)$/gm, '<b style="font-size:15px;display:block;margin-bottom:6px">$1</b>')
+  .replace(/^---$/gm, '<hr style="border:0;border-top:1px solid var(--border);margin:12px 0">')
+  .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+const gate = $("gate");
+const showView = (id) => { document.querySelectorAll(".gate .view").forEach((v) => v.classList.toggle("on", v.id === id)); };
+let AGREEMENTS = null;
+
+async function boot() {
+  let st;
+  try { st = await api("/api/auth/state"); } catch { st = { agreed: false, logged_in: false }; }
+  if (st.logged_in) { gate.classList.remove("show"); refresh(); setInterval(refresh, 4000); return; }
+  gate.classList.add("show");
+  if (!st.agreed) {
+    try { AGREEMENTS = await api("/api/auth/agreements"); } catch { AGREEMENTS = { terms: "加载失败", eula: "" }; }
+    $("agr-text").innerHTML = mdLite(AGREEMENTS.terms);
+    showView("v-agree");
+  } else {
+    showView("v-login");
+  }
+}
+
+document.querySelectorAll(".tabs button[data-agr]").forEach((b) => {
+  b.onclick = () => {
+    document.querySelectorAll(".tabs button[data-agr]").forEach((x) => x.classList.toggle("on", x === b));
+    $("agr-text").innerHTML = mdLite((AGREEMENTS || {})[b.dataset.agr]);
+  };
+});
+$("agr-ok").onchange = (e) => { $("agr-go").disabled = !e.target.checked; };
+$("agr-go").onclick = () => { $("agr-err").textContent = ""; showView("v-setup"); };
+
+async function doAccept() {
+  const u = $("su-user").value.trim(), p = $("su-pass").value, p2 = $("su-pass2").value;
+  $("su-err").textContent = "";
+  if (p !== p2) { $("su-err").textContent = "两次输入的密码不一致。"; return; }
+  try {
+    await api("/api/auth/accept", { method: "POST", body: JSON.stringify({ agreed: true, username: u, password: p }) });
+  } catch (e) { $("su-err").textContent = "创建失败：" + e.message; return; }
+  toast("后台账号已创建"); boot();
+}
+$("su-go").onclick = doAccept;
+$("su-pass2").onkeydown = (e) => { if (e.key === "Enter") doAccept(); };
+
+async function doLogin() {
+  $("lg-err").textContent = "";
+  try {
+    await api("/api/auth/login", { method: "POST", body: JSON.stringify({ username: $("lg-user").value.trim(), password: $("lg-pass").value }) });
+  } catch (e) { $("lg-err").textContent = "登录失败：" + e.message; return; }
+  $("lg-pass").value = ""; boot();
+}
+$("lg-go").onclick = doLogin;
+$("lg-pass").onkeydown = (e) => { if (e.key === "Enter") doLogin(); };
+
+$("logout").onclick = async () => { try { await api("/api/auth/logout", { method: "POST" }); } catch {} location.reload(); };
 
 $("nav").addEventListener("click", (e) => {
   const b = e.target.closest("button[data-page]"); if (!b) return;
@@ -310,7 +500,43 @@ $("nav").addEventListener("click", (e) => {
   document.querySelectorAll(".page").forEach((p) => p.classList.remove("active"));
   $("page-" + b.dataset.page).classList.add("active");
   $("page-title").textContent = titles[b.dataset.page] || b.dataset.page;
+  if (b.dataset.page === "qzone") loadQzone();
 });
+
+/* ---------------- 说说详情 ---------------- */
+async function loadQzone() {
+  let q;
+  try { q = await api("/api/qzone"); } catch (e) { toast("读取说说设置失败：" + e.message); return; }
+  window._qzThemes = q.themes || [];
+  const active = q.active_themes || [];
+  $("qz_maxchars").value = q.max_chars || 80;
+  $("qz-themes").innerHTML = (q.themes || []).map((t) => {
+    const on = active.length === 0 || active.includes(t.id);
+    const win = (t.hours || []).map(([a, b]) => a + "–" + b).join(" ");
+    return '<div class="item"><span class="tag ' + (on ? "ok" : "") + '">' + (on ? "启用" : "停用") + '</span>' +
+      '<span class="who">' + esc(t.name) + '</span>' +
+      '<span class="txt">' + esc(t.hint || "") + (win ? ' <b>［仅 ' + esc(win) + '］</b>' : "") + '</span>' +
+      '<span class="time">' + esc(t.id) + '</span>' +
+      '<button class="ghost sm" data-qz-del="' + esc(t.id) + '" style="all:unset;cursor:pointer;color:var(--bad);font-size:12px">删除</button></div>';
+  }).join("") || '<div class="empty">还没有主题</div>';
+  $("qz-active-hint").textContent = active.length
+    ? ("当前只用：" + active.join(" / ") + "；留空表示全部主题都用。")
+    : "留空 = 所有主题轮流用。";
+  $("qz-history").innerHTML = (q.history || []).slice().reverse().map((h) =>
+    '<div class="item"><span class="tag low">' + esc(h.theme || "—") + '</span>' +
+    '<span class="time">' + hhmm(h.at) + '</span>' +
+    '<span class="txt">' + esc(h.text) + '</span></div>').join("") || '<div class="empty">还没发过</div>';
+
+  document.querySelectorAll("[data-qz-del]").forEach((btn) => btn.onclick = async () => {
+    const id = btn.dataset.qzDel;
+    const rest = (window._qzThemes || []).filter((t) => t.id !== id);
+    if (!rest.length) { toast("至少保留一个主题"); return; }
+    const keep = (q.active_themes || []).filter((x) => x !== id);
+    try { await api("/api/qzone", { method: "POST", body: JSON.stringify({ themes: rest, active_themes: keep }) });
+      toast("已删除"); loadQzone();
+    } catch (e) { toast("失败：" + e.message); }
+  });
+}
 
 const save = async (fn, msg) => { try { await fn(); toast(msg); refresh(); } catch (e) { toast("失败：" + e.message); } };
 
@@ -327,12 +553,29 @@ async function refresh() {
       $("allow_send").checked = !!s.config.allow_send; $("allow_manage").checked = !!s.config.allow_manage;
       $("owners").value = (s.config.owners || []).join(",");
       $("admins").value = (s.config.admins || []).join(",");
+      $("acct-user").value = (s.auth || {}).username || "";
       $("watch").value = (s.config.watch_groups || []).join(",");
       $("keywords").value = (s.keywords || []).join(" ");
       $("auto_reply").checked = !!s.config.auto_reply;
       $("api_base").value = llm.api_base || ""; $("model").value = llm.model || "";
       $("max_tokens").value = llm.max_tokens || 1024;
     }
+    const qz = s.qzone || {};
+    if (editable) {
+      $("qz_enabled").checked = !!qz.enabled;
+      $("qz_mode").value = qz.mode || "interval";
+      $("qz_interval").value = qz.interval_hours ?? 12;
+      $("qz_times").value = (qz.daily_times || []).join(",");
+      $("qz_mingap").value = qz.min_gap_hours ?? 4;
+      $("qz_order").value = qz.order || "random";
+      const qq = (qz.quiet_hours || [])[0] || ["", ""];
+      $("qz_q1").value = qq[0] || ""; $("qz_q2").value = qq[1] || "";
+      $("qz-active").value = (qz.active_themes || []).join(",");
+    }
+    $("qz-hint").textContent = qz.last_post_at
+      ? ("上次发布 " + hhmm(qz.last_post_at) + " · 累计 " + (qz.posted || 0) + " 条 · " +
+         (qz.next_in_seconds != null ? ("约 " + Math.round(qz.next_in_seconds / 60) + " 分钟后到点") : "未排期"))
+      : "还没发过";
     $("f-self").textContent = "账号 " + (s.bot.self_id || "?");
     $("f-model").textContent = (llm.model || "未配置模型");
     $("c-ws").innerHTML = '<i class="dot ' + (s.bot.ws_connected ? "on" : "off") + '"></i>' + (s.bot.ws_connected ? "QQ 已连接" : "QQ 断开");
@@ -396,6 +639,13 @@ $("save-sched").onclick = () => save(() => api("/api/scheduler", { method: "POST
   enabled: $("enabled").checked, interval_seconds: +$("interval").value, min_gap_seconds: +$("min_gap").value,
   max_turns_per_hour: +$("max_turns").value,
   quiet_hours: ($("q1").value && $("q2").value) ? [[$("q1").value, $("q2").value]] : [] }) }), "巡检设置已保存");
+$("acct-save").onclick = async () => {
+  try {
+    await api("/api/auth/password", { method: "POST", body: JSON.stringify({ old: $("acct-old").value, new: $("acct-new").value }) });
+    $("acct-old").value = ""; $("acct-new").value = "";
+    toast("密码已修改，请重新登录"); setTimeout(() => location.reload(), 1200);
+  } catch (e) { toast("失败：" + e.message); }
+};
 $("save-perm").onclick = () => save(() => api("/api/permissions", { method: "POST", body: JSON.stringify({
   allow_send: $("allow_send").checked, allow_manage: $("allow_manage").checked,
   owners: $("owners").value.split(/[,，\s]+/).filter(Boolean) }) }), "权限已保存");
@@ -412,14 +662,43 @@ document.querySelectorAll("[data-set]").forEach((x) => x.onclick = () => { $("in
 document.querySelectorAll("[data-mode]").forEach((x) => x.onclick = () => save(() =>
   api("/api/control", { method: "POST", body: JSON.stringify({ mode: x.dataset.mode }) }), "已切换：" + x.dataset.mode));
 
+const qzPatch = (extra = {}) => ({ ...extra,
+  enabled: $("qz_enabled").checked, mode: $("qz_mode").value,
+  interval_hours: +$("qz_interval").value, min_gap_hours: +$("qz_mingap").value,
+  daily_times: $("qz_times").value.split(/[,，\s]+/).filter(Boolean),
+  order: $("qz_order").value, max_chars: +$("qz_maxchars").value || 80,
+  active_themes: $("qz-active").value.split(/[,，\s]+/).filter(Boolean),
+  quiet_hours: ($("qz_q1").value && $("qz_q2").value) ? [[$("qz_q1").value, $("qz_q2").value]] : [] });
+
+$("qz-save").onclick = () => save(() => api("/api/qzone", { method: "POST", body: JSON.stringify(qzPatch()) }), "说说设置已保存");
+$("qz-now").onclick = async () => {
+  toast("正在生成…");
+  try {
+    const r = await api("/api/qzone/post", { method: "POST", body: JSON.stringify({}) });
+    if (r.ok) { toast("已发送：" + r.text.slice(0, 24)); } else { toast("失败：" + (r.error || "未知")); }
+  } catch (e) { toast("失败：" + e.message); }
+  refresh();
+};
+$("qz-add").onclick = async () => {
+  const name = $("qz-new-name").value.trim(), hint = $("qz-new-hint").value.trim();
+  if (!name) { toast("主题名称不能为空"); return; }
+  const id = "t" + Date.now().toString(36);
+  const cur = (window._qzThemes || []).filter((t) => t.id !== id).concat([{ id, name, hint: hint || name }]);
+  try { await api("/api/qzone", { method: "POST", body: JSON.stringify(qzPatch({ themes: cur })) });
+    $("qz-new-name").value = ""; $("qz-new-hint").value = "";
+    $("qz-active").value = ($("qz-active").value ? $("qz-active").value + "," : "") + id;
+    toast("主题已添加"); refresh();
+  } catch (e) { toast("失败：" + e.message); }
+};
+
 async function loadPrompt() {
   try { const r = await api("/api/prompt");
     $("prompt").value = r.prompt || "";
     $("prompt-hint").textContent = (r.chars || 0) + " 字符";
   } catch (e) { $("prompt-hint").textContent = "读取失败"; }
 }
-if (!TOKEN) { const v = prompt("请输入访问令牌（.env 的 MCP_TOKEN）"); if (v) { TOKEN = v.trim(); localStorage.setItem("qqbridge_token", TOKEN); } }
-loadPrompt(); refresh(); setInterval(refresh, 4000);
+loadPrompt();
+boot();
 </script>
 </body>
 </html>
