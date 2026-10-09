@@ -186,8 +186,10 @@ class AutoReply:
             "  list_dir(path)            列目录\n"
             "  search_files(pattern)     按文件名找\n"
             "  run_command(cmd)          跑本地命令\n"
-            "  send_image(image,caption) 把一张图发到这个群（本地路径或 http/https 链接）\n"
+            "  send_image(image,caption,expect)  把一张图发到这个群（本地路径或 http/https 链接）\n"
             "                            —— 要发图就用它，别拿 run_command 去拼 CQ 码\n"
+            "                            expect 必填：这张图应该是什么。系统会先看图核验，\n"
+            "                            不安全或和图对不上都会被打回，别硬发。\n"
         )
         # 派活里也可能是学术题（管理员 @ 一道数学题）。命中就换学术人设并放开长度。
         academic_on, academic_why = False, ""

@@ -20,6 +20,8 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
+from .config import config
+
 log = logging.getLogger("qqbridge.agenttools")
 
 MAX_READ_BYTES = 256 * 1024
@@ -268,7 +270,7 @@ class LocalTools:
         self._image_sent = [t for t in self._image_sent if now - t < self.IMAGE_WINDOW]
         return len(self._image_sent) < self.IMAGE_MAX_PER_WINDOW
 
-    async def send_image(self, image: str = "", caption: str = "") -> dict:
+    async def send_image(self, image: str = "", caption: str = "", expect: str = "") -> dict:
         """把一张图发到**当前这一轮对应的群**。
 
         两条来源，各自的护栏不同：
@@ -292,6 +294,27 @@ class LocalTools:
             self._record("send_image", raw, {"window": self.IMAGE_WINDOW}, "DENIED", "限流")
             raise ToolError(f"发图太频繁（{self.IMAGE_WINDOW:.0f} 秒内最多 "
                             f"{self.IMAGE_MAX_PER_WINDOW} 张），先攒着。")
+
+        # 发送前必须有人先看过这张图 —— 既查安不安全，也查是不是要的那张。
+        # 出过事：有人要「宛平南路六百号」的照片，结果抓了张萝莉图发进群。
+        # 模型只是把一条链接/路径转手丢出去，全程没有任何环节看过内容。
+        # 校验不通过就**不发**；校验本身跑不起来也**不发**（fail closed）。
+        reviewed = ""
+        if config.send_image_review:
+            from . import vision
+            data_url = await vision.to_data_url(raw)
+            if not data_url:
+                self._record("send_image", raw, {}, "DENIED", "读不到图片内容，无法核验")
+                raise ToolError("读不到这张图，没法核验，不发。")
+            verdict = await vision.review(data_url, expect)
+            if not verdict.get("ok"):
+                self._record("send_image", raw,
+                             {"desc": verdict.get("desc") or "",
+                              "unsafe": verdict.get("unsafe"),
+                              "match": verdict.get("match")},
+                             "DENIED", verdict.get("reason") or "核验未通过")
+                raise ToolError("发图前核验没通过：" + (verdict.get("reason") or "拿不准就不发"))
+            reviewed = verdict.get("desc") or ""
 
         parsed = urlparse(raw)
         payload = ""
@@ -329,8 +352,9 @@ class LocalTools:
             self._record("send_image", raw, detail, "FAILED", str(exc)[:200])
             raise ToolError(f"发送失败：{exc}") from None
         self._image_sent.append(time.time())
-        self._record("send_image", raw, {**detail, "group": gid}, "SUCCEEDED", str(result)[:120])
-        return {"sent": True, "group_id": gid, "detail": detail}
+        self._record("send_image", raw, {**detail, "group": gid, "reviewed": reviewed[:150]},
+                     "SUCCEEDED", str(result)[:120])
+        return {"sent": True, "group_id": gid, "detail": detail, "reviewed": reviewed}
 
     @staticmethod
     def _public_host(host: str) -> bool:
@@ -385,11 +409,16 @@ class LocalTools:
                 "name": "send_image",
                 "description": "把一张图发到当前这个群。image 可以是工作区内的本地文件路径，"
                                "也可以是 http/https 图片链接。要发图就用这个 —— 别用 run_command "
-                               "去拼 CQ 码。目标群由系统决定，你不用也不能指定。",
+                               "去拼 CQ 码。目标群由系统决定，你不用也不能指定。"
+                               "**发送前系统会先用视觉核验这张图**：内容不安全、或者和图不对版，"
+                               "都会被拦下并告诉你原因 —— 所以 expect 一定要如实写。",
                 "parameters": {"type": "object", "properties": {
                     "image": {"type": "string", "description": "本地文件路径或 http/https 图片 URL"},
-                    "caption": {"type": "string", "default": "", "description": "可选的配文"}},
-                    "required": ["image"]}}},
+                    "caption": {"type": "string", "default": "", "description": "可选的配文"},
+                    "expect": {"type": "string", "default": "",
+                               "description": "这张图应该是什么（一句话）。系统会拿它和图的实际内容"
+                                              "比对，对不上就不发。别乱写，也别为了过关而编。"}},
+                    "required": ["image", "expect"]}}},
             {"type": "function", "function": {
                 "name": "run_command",
                 "description": "执行一条 PowerShell 命令（最长 60 秒，默认 15 秒）。"
