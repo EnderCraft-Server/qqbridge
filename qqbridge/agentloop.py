@@ -31,8 +31,12 @@ class AgentLoop:
                 "errors": self.errors, "max_steps": self.max_steps,
                 "root": str(getattr(self.tools, "root", ""))}
 
-    async def run(self, system: str, task: str, *, history: list[dict] | None = None) -> dict:
-        """跑一次完整的工具循环，返回 {text, steps, tool_calls, log}。"""
+    async def run(self, system: str, task: str, *, history: list[dict] | None = None,
+                  max_tokens: int | None = None) -> dict:
+        """跑一次完整的工具循环，返回 {text, steps, tool_calls, log}。
+
+        max_tokens 会在每一步都生效 —— 学术模式要放开长度，普通派活仍然沿用默认值。
+        """
         if not self.llm.configured:
             raise LLMError("模型未配置：无法运行内置 Agent。")
         messages: list[dict] = [{"role": "system", "content": system}]
@@ -45,7 +49,8 @@ class AgentLoop:
         fail_seen: dict = {}       # 同一个调用反复失败就别再耗步数了
         for step in range(1, self.max_steps + 1):
             self.steps += 1
-            out = await self.llm.chat(messages, tools=self.tools.schemas())
+            out = await self.llm.chat(messages, tools=self.tools.schemas(),
+                                      max_tokens=max_tokens)
             calls = out.get("tool_calls") or []
             text = out.get("text") or ""
 

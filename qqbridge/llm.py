@@ -70,15 +70,21 @@ class LLM:
             self.temperature = float(temperature)
         return self.describe()
 
-    async def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
-        """一次非流式对话。返回 {text, tool_calls, usage}。"""
+    async def chat(self, messages: list[dict], tools: list[dict] | None = None,
+                   *, max_tokens: int | None = None,
+                   temperature: float | None = None) -> dict:
+        """一次非流式对话。返回 {text, tool_calls, usage}。
+
+        max_tokens / temperature 可以按次覆盖实例默认值 —— 学术模式要放开长度，
+        但闲聊那边仍然该省，所以只能按调用点给，不能全局调。
+        """
         if not self.configured:
             raise LLMError("模型未配置：需要在 .env 里填 LLM_API_BASE / LLM_API_KEY / LLM_MODEL。")
         body: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
+            "max_tokens": self.max_tokens if max_tokens is None else int(max_tokens),
+            "temperature": self.temperature if temperature is None else float(temperature),
             "stream": False,
         }
         # DeepSeek 的思考开关：thinking.type = enabled/disabled
