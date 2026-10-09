@@ -321,10 +321,12 @@ def create_app() -> FastAPI:
     if not prompt_path.is_absolute():
         prompt_path = config.data_dir.parent / config.system_prompt_file
     agent = QqAgent(llm, load_system_prompt(prompt_path, DEFAULT_SYSTEM), store=store)
+    # bot 必须在 local_tools 之前建 —— send_image 要用它。
+    # （之前顺序写反了，直接 UnboundLocalError，start.bat 一闪就退。）
+    bot = OneBot(config.http, config.ws, config.token, config.ws_token)
     local_tools = LocalTools(Path(config.agent_root) if config.agent_root else config.ROOT,
                              store, bot=bot)
     agent_loop = AgentLoop(llm, local_tools, max_steps=config.agent_max_steps, store=store)
-    bot = OneBot(config.http, config.ws, config.token, config.ws_token)
     auth = Auth(config.data_dir / "auth.json")
     qzone = QzoneAuto(config.data_dir / "qzone.json", llm, bot, store)
     autoreply = AutoReply(bus, store, agent, bot, control, enabled=config.auto_reply,
