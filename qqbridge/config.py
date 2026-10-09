@@ -61,6 +61,9 @@ class Config:
         self.vision_enabled = _bool("VISION_ENABLED", True)
         # 群里发的链接：抓回正文再判断（闲聊路径没有工具，否则链接永远被无视）
         self.link_preview = _bool("LINK_PREVIEW", True)
+        # 发图前用视觉模型核验内容（安全 + 是否符合预期用途）。默认开，
+        # 关掉等于允许未经任何人过目的图直接进群 —— 出过萝莉图的事，别关。
+        self.send_image_review = _bool("SEND_IMAGE_REVIEW", True)
         # 学术模式：命中学术/技术提问时，关掉群友人设并放开长度上限
         self.academic_mode = _bool("ACADEMIC_MODE", True)
         self.llm_academic_max_tokens = _int("LLM_ACADEMIC_MAX_TOKENS", 8192)
