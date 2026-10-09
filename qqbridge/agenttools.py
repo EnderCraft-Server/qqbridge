@@ -65,9 +65,15 @@ class ToolError(RuntimeError):
 
 
 class LocalTools:
-    def __init__(self, root: Path, store=None, logger_name: str = "agent"):
+    def __init__(self, root: Path, store=None, logger_name: str = "agent", bot=None):
         self.root = Path(root).resolve()
         self.store = store
+        # 发图要用的 OneBot 客户端；为 None 时 send_image 直接拒绝（工具仍然可选）。
+        self.bot = bot
+        # 当前这一轮要发给哪个群/人。由调用方（autoreply）在跑之前设好 ——
+        # 绝不从模型参数里取目标，否则等于让模型自己挑发到哪。
+        self.target_group = ""
+        self._image_sent: list[float] = []
         self.log_path = self.root / "data" / "agent.log"
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -241,6 +247,109 @@ class LocalTools:
         return {"url": target, "status": resp.status_code, "content": text[:max_bytes],
                 "bytes": len(raw)}
 
+    # ---------- 发图 ----------
+    IMAGE_WINDOW = 60.0            # 限流窗口（秒）
+    IMAGE_MAX_PER_WINDOW = 3       # 窗口内最多发几张，防刷屏
+    IMAGE_MAX_BYTES = 8 * 1024 * 1024
+
+    def _sniff_image(self, head: bytes) -> str:
+        if head[:8] == b"\x89PNG\r\n\x1a\n":
+            return "png"
+        if head[:3] == b"GIF":
+            return "gif"
+        if head[:2] == b"\xff\xd8":
+            return "jpg"
+        if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+            return "webp"
+        return ""
+
+    def _rate_ok(self) -> bool:
+        now = time.time()
+        self._image_sent = [t for t in self._image_sent if now - t < self.IMAGE_WINDOW]
+        return len(self._image_sent) < self.IMAGE_MAX_PER_WINDOW
+
+    async def send_image(self, image: str = "", caption: str = "") -> dict:
+        """把一张图发到**当前这一轮对应的群**。
+
+        两条来源，各自的护栏不同：
+          - 本地文件：必须在工作区内（走 _safe），且按 magic bytes 确认真是图片。
+            不接受"用户随口给的任意路径"，避免被引导去读工作区外的文件。
+          - http/https 链接：拒绝内网/回环（防 SSRF），并确认返回的确实是图。
+
+        目标群不来自参数 —— 由调用方设定，模型没有选择权。
+        """
+        raw = (image or "").strip()
+        if not raw:
+            raise ToolError("要给图片的路径或 URL。")
+        if not self.bot:
+            self._record("send_image", raw, {}, "DENIED", "未接入 OneBot 客户端")
+            raise ToolError("发图未启用（没接上 OneBot 客户端）。")
+        gid = (self.target_group or "").strip()
+        if not gid:
+            self._record("send_image", raw, {}, "DENIED", "没有目标会话")
+            raise ToolError("这一轮没有可发送的目标会话。")
+        if not self._rate_ok():
+            self._record("send_image", raw, {"window": self.IMAGE_WINDOW}, "DENIED", "限流")
+            raise ToolError(f"发图太频繁（{self.IMAGE_WINDOW:.0f} 秒内最多 "
+                            f"{self.IMAGE_MAX_PER_WINDOW} 张），先攒着。")
+
+        parsed = urlparse(raw)
+        payload = ""
+        if parsed.scheme in ALLOWED_SCHEMES and parsed.hostname:
+            if not self._public_host(parsed.hostname):
+                self._record("send_image", raw, {}, "DENIED", "内网地址")
+                raise ToolError("不接受内网/本机地址。")
+            payload = f"[CQ:image,file={raw}]"
+            detail = {"via": "url"}
+        elif parsed.scheme:
+            self._record("send_image", raw, {}, "DENIED", f"不支持的协议 {parsed.scheme}")
+            raise ToolError("只支持本地文件路径或 http/https 链接。")
+        else:
+            p = self._safe(raw)              # 越界会在这里抛
+            if not p.is_file():
+                self._record("send_image", str(p), {}, "FAILED", "文件不存在")
+                raise ToolError(f"文件不存在：{p}")
+            size = p.stat().st_size
+            if size > self.IMAGE_MAX_BYTES:
+                self._record("send_image", str(p), {"bytes": size}, "DENIED", "文件过大")
+                raise ToolError("图片太大了。")
+            head = p.open("rb").read(16)
+            kind = self._sniff_image(head)
+            if not kind:
+                self._record("send_image", str(p), {"bytes": size}, "DENIED", "不是图片")
+                raise ToolError("这个文件按内容判断不是图片。")
+            # 本机路径交给 OneBot 时用 file:// URI，避免它按相对路径找错地方
+            payload = f"[CQ:image,file=file:///{str(p).replace(chr(92), '/')}]"
+            detail = {"via": "path", "bytes": size, "kind": kind}
+
+        msg = payload if not caption.strip() else f"{caption.strip()}\n{payload}"
+        try:
+            result = await self.bot.call("send_group_msg", group_id=int(gid), message=msg)
+        except Exception as exc:
+            self._record("send_image", raw, detail, "FAILED", str(exc)[:200])
+            raise ToolError(f"发送失败：{exc}") from None
+        self._image_sent.append(time.time())
+        self._record("send_image", raw, {**detail, "group": gid}, "SUCCEEDED", str(result)[:120])
+        return {"sent": True, "group_id": gid, "detail": detail}
+
+    @staticmethod
+    def _public_host(host: str) -> bool:
+        import ipaddress
+        import socket
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except Exception:
+            return False
+        for info in infos:
+            try:
+                ip = ipaddress.ip_address(info[4][0])
+            except ValueError:
+                return False
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+                return False
+        return True
+
     # ---------- 给模型看的 schema ----------
     @staticmethod
     def schemas() -> list[dict]:
@@ -273,6 +382,15 @@ class LocalTools:
                 "parameters": {"type": "object", "properties": {
                     "url": {"type": "string"}}, "required": ["url"]}}},
             {"type": "function", "function": {
+                "name": "send_image",
+                "description": "把一张图发到当前这个群。image 可以是工作区内的本地文件路径，"
+                               "也可以是 http/https 图片链接。要发图就用这个 —— 别用 run_command "
+                               "去拼 CQ 码。目标群由系统决定，你不用也不能指定。",
+                "parameters": {"type": "object", "properties": {
+                    "image": {"type": "string", "description": "本地文件路径或 http/https 图片 URL"},
+                    "caption": {"type": "string", "default": "", "description": "可选的配文"}},
+                    "required": ["image"]}}},
+            {"type": "function", "function": {
                 "name": "run_command",
                 "description": "执行一条 PowerShell 命令（最长 60 秒，默认 15 秒）。"
                                "仅用于本地文件/程序操作；抓网页请用 fetch_url。一次只跑一条。",
@@ -287,6 +405,10 @@ class LocalTools:
         历史教训：run_command 是同步 subprocess.run，直接在 async 里调用会把
         整个服务卡住 —— 一个 21 秒的 curl 期间，HTTP 和 WebSocket 全部无响应。
         """
+        # send_image 自己就是异步的（要 await HTTP），不能再套线程 ——
+        # 丢进线程池只会拿到一个没人 await 的协程。
+        if name == "send_image":
+            return await self.send_image(**(args or {}))
         return await asyncio.to_thread(self.dispatch, name, args)
 
     def dispatch(self, name: str, args: dict) -> dict:
