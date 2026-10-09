@@ -281,6 +281,9 @@ def build_tools(box: Toolbox, rules: Rules, sched: Scheduler, control: Control,
         if max_steps and int(max_steps) != agent_loop.max_steps:
             agent_loop.max_steps = max(1, min(int(max_steps), 20))
         system = agent.system_prompt + "\n\n你还可以使用工具读写文件、执行命令。改动前先看清楚目标。"
+        # 这条是外部 MCP 调用，没有群上下文 —— 必须清掉上一轮可能残留的目标，
+        # 否则 agent 会把图发到之前那个群。要发图请直接用 send_image 工具。
+        agent_loop.tools.target_group = ""
         return await agent_loop.run(system, task)
 
     @tool("agent_log", "查看内置 Agent 的文件读写/命令执行日志。", {"type": "object",
@@ -318,7 +321,8 @@ def create_app() -> FastAPI:
     if not prompt_path.is_absolute():
         prompt_path = config.data_dir.parent / config.system_prompt_file
     agent = QqAgent(llm, load_system_prompt(prompt_path, DEFAULT_SYSTEM), store=store)
-    local_tools = LocalTools(Path(config.agent_root) if config.agent_root else config.ROOT, store)
+    local_tools = LocalTools(Path(config.agent_root) if config.agent_root else config.ROOT,
+                             store, bot=bot)
     agent_loop = AgentLoop(llm, local_tools, max_steps=config.agent_max_steps, store=store)
     bot = OneBot(config.http, config.ws, config.token, config.ws_token)
     auth = Auth(config.data_dir / "auth.json")

@@ -165,10 +165,18 @@ class AutoReply:
         except Exception:
             return True
 
-    async def _run_task(self, task: str) -> str:
-        """把模型认出来的活交给内置 Agent 去干，返回要发到群里的那句话。"""
+    async def _run_task(self, task: str, gid: str = "") -> str:
+        """把模型认出来的活交给内置 Agent 去干，返回要发到群里的那句话。
+
+        gid 是这一轮的会话：agent 的 send_image 只能发到这里。
+        目标由我们设，模型没有选择权 —— 不给它"发到哪个群"这个参数。
+        """
         if not self.agent_loop:
             return ""
+        try:
+            self.agent_loop.tools.target_group = str(gid or "")
+        except AttributeError:
+            pass
         tools_block = (
             "\n\n【覆盖上面的 JSON 格式要求】不要输出 JSON，直接说人话。\n"
             "工具（一次选对，别反复试）：\n"
@@ -178,6 +186,8 @@ class AutoReply:
             "  list_dir(path)            列目录\n"
             "  search_files(pattern)     按文件名找\n"
             "  run_command(cmd)          跑本地命令\n"
+            "  send_image(image,caption) 把一张图发到这个群（本地路径或 http/https 链接）\n"
+            "                            —— 要发图就用它，别拿 run_command 去拼 CQ 码\n"
         )
         # 派活里也可能是学术题（管理员 @ 一道数学题）。命中就换学术人设并放开长度。
         academic_on, academic_why = False, ""
@@ -428,7 +438,7 @@ class AutoReply:
             "有活就干（用工具办），干完回一句；没活就直接回一句。"
         )
         try:
-            reply = await self._run_task(task)
+            reply = await self._run_task(task, gid)
         except Exception:
             self.errors += 1
             log.exception("处理派活时出错")
