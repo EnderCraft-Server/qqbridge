@@ -12,6 +12,9 @@ import time
 from collections import deque
 from pathlib import Path
 
+from . import academic, vision
+from . import webpage
+from .config import config
 from .llm import LLM, LLMError
 
 log = logging.getLogger("qqbridge.agent")
@@ -112,6 +115,7 @@ class QqAgent:
         key = (batch[-1].get("group_id") or "?") if batch else "?"
 
         lines = []
+        fresh_texts: list[str] = []
         fresh_count = 0
         fresh_mention = False
         for ev in batch:
@@ -120,6 +124,7 @@ class QqAgent:
             is_fresh = ev.get("id", 0) > fresh_from
             if is_fresh:
                 fresh_count += 1
+                fresh_texts.append(text)
                 if ev.get("mentions_me"):
                     fresh_mention = True
             lines.append(("[新] " if is_fresh else "    ") + f"{who}：{text}")
@@ -128,7 +133,8 @@ class QqAgent:
             "上面是你上次看群之后，群里新冒出来的一段（带 [新] 标记的那几行），"
             "前面没标记的是你已经在场看过的上下文，用来看懂在聊什么。\n\n"
             "你现在刚拿起手机扫了一眼。\n"
-            "- 有人 @ 你、或者点了你的名字 —— **必须回一句**。\n"
+            "- 有人 @ 你、或者点了你的名字 —— **必须回一句**（被 @ 是欠一个回应，不是欠一场对骂；\n"
+            "  连着被同一个人挑衅时，回一句之后就不再接，别对轰）。\n"
             "- 除此之外，**大多数时候你什么都不想说**。只有这段里真有让你想插一句的东西"
             "（有梗、能怼、你懂行、有话接）才回。\n"
             "- 只是「冒泡」「打卡」「早」「在吗」这种刷存在感的、或者单独一个「。」「？」「6」，一律不接。\n"
@@ -138,14 +144,68 @@ class QqAgent:
         if fresh_count > 0 and not fresh_mention:
             hint += "\n\n（这一段里没有人 @ 你。）"
 
+        # 学术模式：只拿「新来的那几条」判断 —— 旧上下文里出现过一道题，
+        # 不该让后面十句闲聊都被答成论文。
+        academic_on, academic_why = False, ""
+        if config.academic_mode:
+            academic_on, academic_why = academic.detect("\n".join(fresh_texts))
+        if academic_on:
+            system_content = academic.build_academic_system(self.system_prompt, json_mode=True)
+            hint = ("【学术提问】带 [新] 标记的那几条里有学术/技术问题。"
+                    "按学术模式认真作答：先结论后理由，该多长就多长，"
+                    "不要用群友口吻敷衍，也不要怼人。")
+            max_tokens = config.llm_academic_max_tokens
+            reply_limit = config.academic_reply_chars
+            log.info("学术模式触发（%s）：%s", academic_why, fresh_texts[-1][:40] if fresh_texts else "")
+        else:
+            system_content = self.system_prompt
+            max_tokens = None
+            reply_limit = 800
+
+        # 群里发的图片：取回来一起喂给视觉模型。只带本轮新来的那几张 ——
+        # 历史里的图不重复送，否则每轮都在为同一张图付 token。
+        images = []
+        if vision.vision_enabled():
+            try:
+                images = await vision.collect_for_turn(batch, fresh_from)
+            except Exception:
+                log.exception("vision: 收集图片失败，本轮按纯文本处理")
+        # 消息里带链接：抓回正文再判断。带工具的 Agent 那条路管理员才走得通，
+        # 闲聊这条路本来没有任何取网页的手段，链接就永远被无视了。
+        pages = []
+        if config.link_preview:
+            try:
+                pages = await webpage.collect_for_turn(batch, fresh_from)
+            except Exception:
+                log.exception("webpage: 抓链接失败，本轮按纯文本处理")
+        if pages:
+            for pg in pages:
+                lines.append(f"[链接正文] {pg['url']} → {pg['text'][:1200]}")
+            log.info("webpage: 本轮带上 %d 个链接正文", len(pages))
+
+        convo_text = "以下是这个群最近的对话：\n" + "\n".join(lines)
+        if images:
+            convo_content: list = [{"type": "text", "text": convo_text}]
+            for im in images:
+                convo_content.append(
+                    {"type": "text", "text": f"（{im['sender']} 发的图，见下）"})
+                convo_content.append(
+                    {"type": "image_url", "image_url": {"url": im["data_url"]}})
+            convo_msg = {"role": "user", "content": convo_content}
+            hint += ("\n\n本轮消息里带了图片，图就在下面 —— **先看清图里是什么再决定怎么回**，"
+                     "不要假装看见了，也不要凭空猜内容；看不清就直说看不清。")
+            log.info("vision: 本轮带上 %d 张图", len(images))
+        else:
+            convo_msg = {"role": "user", "content": convo_text}
+
         messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": "以下是这个群最近的对话：\n" + "\n".join(lines)},
+            {"role": "system", "content": system_content},
+            convo_msg,
             {"role": "user", "content":
                 hint + '\n\n以 JSON 回复：{"reply": "要发的话", "reason": "一句理由"}。只输出 JSON。'},
         ]
         self.decisions += 1
-        out = await self.llm.chat(messages)
+        out = await self.llm.chat(messages, max_tokens=max_tokens)
         raw = out.get("text") or ""
         data, how = parse_decision(raw)
         reply, reason = "", ""
@@ -160,8 +220,9 @@ class QqAgent:
             reply = (data.get("reply") or "").strip()
             reason = str(data.get("reason") or "")[:200]
             reply, _ = clean_reply(json.dumps({"reply": reply}, ensure_ascii=False))
-        if len(reply) > 800:
-            reply = reply[:800]
+        # 学术模式按 academic_reply_chars 截断，不再套群聊的 800 字
+        if len(reply) > reply_limit:
+            reply = reply[:reply_limit]
         if reply:
             self.replies += 1
         else:
@@ -169,7 +230,8 @@ class QqAgent:
         if how != "ok":
             reason = f"[{how}] " + reason
         return {"reply": reply, "reason": reason, "key": key,
-                "parse": how, "fresh": fresh_count, "mention": fresh_mention}
+                "parse": how, "fresh": fresh_count, "mention": fresh_mention,
+                "academic": academic_on, "academic_why": academic_why}
 
     async def decide(self, ev: dict, *, force: bool = False) -> dict:
         """让模型决定这条要不要接。返回 {reply, reason}。"""
@@ -192,8 +254,22 @@ class QqAgent:
         if force:
             hint += "（群主点名让你说话）"
 
+        # 学术模式（单条路径同样适用）
+        academic_on, academic_why = False, ""
+        if config.academic_mode:
+            academic_on, academic_why = academic.detect(ev.get("text") or "")
+        if academic_on:
+            system_content = academic.build_academic_system(self.system_prompt, json_mode=True)
+            hint = "【学术提问】按学术模式认真作答：先结论后理由，该多长就多长，不怼人。"
+            max_tokens = config.llm_academic_max_tokens
+            reply_limit = config.academic_reply_chars
+        else:
+            system_content = self.system_prompt
+            max_tokens = None
+            reply_limit = 800
+
         messages = [
-            {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": system_content},
             *ctx,
             {"role": "user", "content": (
                 f"【系统】{hint}\n"
@@ -202,11 +278,11 @@ class QqAgent:
             )},
         ]
         self.decisions += 1
-        out = await self.llm.chat(messages)
+        out = await self.llm.chat(messages, max_tokens=max_tokens)
         raw = out["text"] or ""
         reply, how = clean_reply(raw)
-        if len(reply) > 800:
-            reply = reply[:800]
+        if len(reply) > reply_limit:
+            reply = reply[:reply_limit]
         if how == "failed":
             log.warning("decide: 输出解析失败，改判沉默。原文前 200 字：%s", raw[:200])
             if self.store:

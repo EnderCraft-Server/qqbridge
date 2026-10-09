@@ -57,6 +57,15 @@ class Config:
         self.llm_api_key = (os.environ.get("LLM_API_KEY") or os.environ.get("DEEPSEEK_API_KEY") or "").strip()
         self.llm_model = (os.environ.get("LLM_MODEL") or "deepseek-chat").strip()
         self.llm_max_tokens = _int("LLM_MAX_TOKENS", 2048)
+        # 群里的图片：取回来喂给视觉模型（模型名里带 vision 才真正生效）
+        self.vision_enabled = _bool("VISION_ENABLED", True)
+        # 群里发的链接：抓回正文再判断（闲聊路径没有工具，否则链接永远被无视）
+        self.link_preview = _bool("LINK_PREVIEW", True)
+        # 学术模式：命中学术/技术提问时，关掉群友人设并放开长度上限
+        self.academic_mode = _bool("ACADEMIC_MODE", True)
+        self.llm_academic_max_tokens = _int("LLM_ACADEMIC_MAX_TOKENS", 8192)
+        # 学术答案不按群聊长度截断（群聊默认 800 字）
+        self.academic_reply_chars = _int("ACADEMIC_REPLY_CHARS", 6000)
         self.llm_thinking = (os.environ.get("LLM_THINKING") or "disabled").strip().lower()
         self.llm_reasoning_effort = (os.environ.get("LLM_REASONING_EFFORT") or "").strip().lower()
         self.llm_timeout = float((os.environ.get("LLM_TIMEOUT") or "60").strip() or 60)
@@ -129,6 +138,9 @@ class Config:
                 "model": self.llm_model,
                 "has_key": bool(self.llm_api_key),
                 "max_tokens": self.llm_max_tokens,
+                "academic_mode": self.academic_mode,
+                "academic_max_tokens": self.llm_academic_max_tokens,
+                "vision_enabled": self.vision_enabled,
                 "temperature": self.llm_temperature,
                 "thinking": self.llm_thinking or "default",
             },

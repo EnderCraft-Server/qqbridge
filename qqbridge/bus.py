@@ -207,13 +207,23 @@ class EventBus:
             cut = self._processed
             return [e for e in self._events if e["id"] > cut and not e["is_self"]][:limit]
 
-    def context(self, limit: int = 40) -> list:
+    def context(self, limit: int = 40, max_age: float = 0.0) -> list:
         """给模型看的上下文：最近 limit 条（**含自己说过的话**），按 id 升序。
 
         只看「新消息」是不够的 —— 得知道在聊什么，才知道这句要不要接。
+
+        max_age > 0 时再按时间切一刀：只保留最近 max_age 秒内的。
+        只按条数限制有个坑 —— 群里一安静，40 条能横跨好几小时，
+        模型就拿着几小时前的语境去接现在的话，看起来像答非所问。
         """
         with self._lock:
-            return list(self._events)[-limit:]
+            events = list(self._events)
+        if max_age > 0:
+            cut = time.time() - max_age
+            fresh_ev = [e for e in events if (e.get("at") or 0) >= cut]
+            # 全被时间切没了就退回按条数：宁可给点旧上下文，也别给空
+            events = fresh_ev or events
+        return events[-limit:]
 
     def mark_looked(self, through_id: int) -> int:
         """整段处理完之后推进「已看过」标记。
