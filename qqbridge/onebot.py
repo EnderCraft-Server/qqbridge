@@ -12,6 +12,7 @@ import time
 
 import httpx
 import websockets
+from urllib.parse import urlparse
 
 log = logging.getLogger("qqbridge.onebot")
 
@@ -35,9 +36,31 @@ class OneBot:
         self.on_event = None
 
     # ---------- lifecycle ----------
+    def _trust_env(self) -> bool:
+        """要不要让 httpx 读系统代理设置。
+
+        **回环地址一律不走代理。** 踩过的坑：宿主机开了梯子（系统代理
+        127.0.0.1:7897）之后，httpx 默认 trust_env=True 会把
+        http://127.0.0.1:3000/get_login_info 也丢给代理，
+        而代理不转发回环地址 -> ConnectError: All connection attempts failed
+        -> 拿不到 self_id -> @ 消息全部识别不出来。
+
+        OneBot 挂在本机时不需要代理；挂在远端时才跟随系统设置。
+        """
+        host = (urlparse(self.http).hostname or "").lower()
+        if host in ("127.0.0.1", "localhost", "::1", "[::1]"):
+            return False
+        try:
+            import ipaddress
+            if ipaddress.ip_address(host).is_loopback:
+                return False
+        except ValueError:
+            pass
+        return True
+
     async def start(self, on_event):
         self.on_event = on_event
-        self._client = httpx.AsyncClient(timeout=30.0)
+        self._client = httpx.AsyncClient(timeout=30.0, trust_env=self._trust_env())
         self._stop.clear()
         self._ws_task = asyncio.create_task(self._ws_loop())
         try:

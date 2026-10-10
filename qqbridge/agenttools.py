@@ -66,6 +66,22 @@ class ToolError(RuntimeError):
     pass
 
 
+def _is_loopback(host: str) -> bool:
+    """是不是本机地址。用来决定要不要绕开系统代理。
+
+    宿主机开梯子后，系统代理会把 127.0.0.1 也拦下来 —— OneBot 那边已经
+    因此拿不到 self_id，凡是取本机服务的都该绕开。
+    """
+    import ipaddress
+    h = (host or "").lower()
+    if h in ("localhost", "127.0.0.1", "::1", "[::1]"):
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
 class LocalTools:
     def __init__(self, root: Path, store=None, logger_name: str = "agent", bot=None):
         self.root = Path(root).resolve()
@@ -231,7 +247,10 @@ class LocalTools:
             raise ToolError("只允许抓取 http/https 地址。")
         import httpx
         try:
+            # 回环地址绕开系统代理：开了梯子之后，代理会把 127.0.0.1 也拦下来，
+            # 「取本机某个服务」就永远连不上。
             with httpx.Client(timeout=20.0, follow_redirects=True,
+                              trust_env=not _is_loopback(parsed.hostname or ""),
                               headers={"User-Agent": "Mozilla/5.0 (qqbridge)"}) as client:
                 resp = client.get(target)
                 raw = resp.content[: min(int(max_bytes), MAX_FETCH_BYTES)]
