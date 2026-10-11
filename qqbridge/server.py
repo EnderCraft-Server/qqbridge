@@ -282,7 +282,8 @@ def build_tools(box: Toolbox, rules: Rules, sched: Scheduler, control: Control,
             agent_loop.max_steps = max(1, min(int(max_steps), 20))
         system = agent.system_prompt + "\n\n你还可以使用工具读写文件、执行命令。改动前先看清楚目标。"
         # 这条是外部 MCP 调用，没有群上下文 —— 必须清掉上一轮可能残留的目标，
-        # 否则 agent 会把图发到之前那个群。要发图请直接用 send_image 工具。
+        # 否则 agent 会把图/群管理动作打到之前那个群。
+        # 要发图请用 MCP 的 send_image，要群管理请用 MCP 的 manage_group。
         agent_loop.tools.target_group = ""
         return await agent_loop.run(system, task)
 

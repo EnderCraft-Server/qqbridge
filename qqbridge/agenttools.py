@@ -393,6 +393,93 @@ class LocalTools:
                 return False
         return True
 
+    # ---------- 群管理 ----------
+    # 只在「管理员直接跟机器人说话」那条路上可用（autoreply 的 _handle_task 才会
+    # 设 target_group）。闲聊那条路没有这个工具，模型也不能指定目标群。
+    MANAGE_ACTIONS = ("mute", "unmute", "kick", "rename", "card", "whole_ban")
+    MUTE_MAX_SECONDS = 30 * 24 * 3600      # QQ 单次禁言上限 30 天
+
+    async def manage_group(self, action: str = "", user_id: str = "",
+                           duration_seconds: int = 0, value: str = "") -> dict:
+        """群管理。和目标群一样，**权限面由调用方兜底**：没有 target_group 就拒绝。
+
+        不做 leave（退群）—— 那是不可逆且影响全群的，留给人在客户端点。
+        """
+        act = (action or "").strip().lower()
+        if act not in self.MANAGE_ACTIONS:
+            raise ToolError("action 只能是：" + "/".join(self.MANAGE_ACTIONS))
+        if not self.bot:
+            raise ToolError("群管理未启用（没接上 OneBot 客户端）。")
+        if not config.allow_manage:
+            self._record("manage_group", act, {}, "DENIED", "ALLOW_MANAGE=false")
+            raise ToolError("群管理被关闭了（ALLOW_MANAGE=false）。")
+        gid = (self.target_group or "").strip()
+        if not gid:
+            self._record("manage_group", act, {}, "DENIED", "没有目标会话")
+            raise ToolError("这条指令不是管理员在当前群当面说的，不能执行群管理。")
+
+        uid = str(user_id or "").strip()
+        dur = int(duration_seconds or 0)
+        detail = {"group": gid, "action": act, "user_id": uid, "duration": dur}
+
+        needs_user = act in ("mute", "unmute", "kick", "card")
+        if needs_user and not uid:
+            raise ToolError("这个动作需要 user_id（对方 QQ 号）。")
+        if act == "mute" and dur <= 0:
+            # set_group_ban 的 duration=0 是**解除禁言**，不是禁言 0 秒 —— 别搞反。
+            raise ToolError("禁言必须给 duration_seconds（大于 0）；要解除请用 unmute。")
+        if act == "mute":
+            dur = min(dur, self.MUTE_MAX_SECONDS)
+            detail["duration"] = dur
+        if act == "rename" and not (value or "").strip():
+            raise ToolError("改群名需要 value。")
+
+        # 角色核对：QQ 不允许对群主操作；同级管理员之间也常常互相动不了。
+        if needs_user:
+            target = None
+            try:
+                target = self.store.member(gid, uid) if self.store else None
+            except Exception:
+                target = None
+            role = (target or {}).get("role") or ""
+            detail["target_role"] = role
+            if role == "owner":
+                self._record("manage_group", act, detail, "REJECTED", "目标是群主")
+                raise ToolError("对方是群主，QQ 不允许对群主做这个操作。")
+            if act in ("mute", "kick") and role == "admin":
+                self._record("manage_group", act, detail, "REJECTED", "目标是管理员")
+                raise ToolError("对方是管理员，同级之间通常动不了；要动手请群主在客户端操作。")
+
+        try:
+            if act == "mute":
+                result = await self.bot.call("set_group_ban", group_id=int(gid),
+                                             user_id=int(uid), duration=dur)
+            elif act == "unmute":
+                result = await self.bot.call("set_group_ban", group_id=int(gid),
+                                             user_id=int(uid), duration=0)
+            elif act == "kick":
+                result = await self.bot.call("set_group_kick", group_id=int(gid),
+                                             user_id=int(uid), reject_add_request=False)
+            elif act == "rename":
+                result = await self.bot.call("set_group_name", group_id=int(gid),
+                                             group_name=value)
+            elif act == "card":
+                result = await self.bot.call("set_group_card", group_id=int(gid),
+                                             user_id=int(uid), card=value)
+            else:
+                truthy = str(value).strip().lower() in ("1", "true", "yes", "on", "开")
+                result = await self.bot.call("set_group_whole_ban", group_id=int(gid),
+                                             enable=truthy)
+        except Exception as exc:
+            self._record("manage_group", act, detail, "FAILED", str(exc)[:200])
+            raise ToolError("执行失败：" + str(exc)[:150]) from None
+
+        self._record("manage_group", act, detail, "SUCCEEDED", str(result)[:120])
+        # 审计只说明「请求发出去了」—— 是否真生效要回查，别替服务端打包票
+        return {"done": True, "action": act, "group_id": gid, "user_id": uid,
+                "duration_seconds": dur, "result": result,
+                "note": "这是接口返回值，不保证已生效；要确认请回查成员角色或禁言状态。"}
+
     # ---------- 给模型看的 schema ----------
     @staticmethod
     def schemas() -> list[dict]:
@@ -439,6 +526,25 @@ class LocalTools:
                                               "比对，对不上就不发。别乱写，也别为了过关而编。"}},
                     "required": ["image", "expect"]}}},
             {"type": "function", "function": {
+                "name": "manage_group",
+                "description": "QQ 群管理。**只有在管理员当面跟你说话时才能用** —— "
+                               "目标群由系统决定，你不用也不能指定。"
+                               "action: mute 禁言 / unmute 解除禁言 / kick 踢出 / "
+                               "rename 改群名 / card 改群名片 / whole_ban 全员禁言。"
+                               "禁言必须给 duration_seconds（秒，上限 30 天）；"
+                               "解除禁言用 unmute，**不要**用 mute + 0（0 就是解除）。",
+                "parameters": {"type": "object", "properties": {
+                    "action": {"type": "string",
+                               "enum": ["mute", "unmute", "kick", "rename", "card",
+                                        "whole_ban"]},
+                    "user_id": {"type": "string", "default": "",
+                                "description": "对方 QQ 号；mute/unmute/kick/card 必填"},
+                    "duration_seconds": {"type": "integer", "default": 0,
+                                         "description": "仅 mute 用，秒，上限 2592000"},
+                    "value": {"type": "string", "default": "",
+                              "description": "rename 用新群名；card 用新名片；whole_ban 用 开/关"}},
+                    "required": ["action"]}}},
+            {"type": "function", "function": {
                 "name": "run_command",
                 "description": "执行一条 PowerShell 命令（最长 60 秒，默认 15 秒）。"
                                "仅用于本地文件/程序操作；抓网页请用 fetch_url。一次只跑一条。",
@@ -457,6 +563,8 @@ class LocalTools:
         # 丢进线程池只会拿到一个没人 await 的协程。
         if name == "send_image":
             return await self.send_image(**(args or {}))
+        if name == "manage_group":
+            return await self.manage_group(**(args or {}))
         return await asyncio.to_thread(self.dispatch, name, args)
 
     def dispatch(self, name: str, args: dict) -> dict:

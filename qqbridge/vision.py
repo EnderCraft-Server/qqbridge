@@ -166,10 +166,15 @@ async def to_data_url(image: str) -> str | None:
         return None
     if not body or len(body) > IMAGE_MAX_BYTES:
         return None
-    kind = _sniff(body[:16])
-    if not kind:
+    # _sniff 返回的是**完整 MIME**（image/png）。之前这里又拼了一次 "image/"，
+    # 拼出 data:image/image/png —— 模型直接 400「unsupported image」，
+    # 于是本地图片永远过不了核验、永远发不出去。URL 那条路走的是 HTTP
+    # content-type 所以没事，只有本地文件踩了这个坑。
+    mime = _sniff(body[:16])
+    if not mime:
         return None
-    mime = "image/jpeg" if kind == "jpg" else "image/" + kind
+    if not mime.startswith("image/"):
+        mime = "image/jpeg" if mime == "jpg" else "image/" + mime
     return "data:%s;base64,%s" % (mime, base64.b64encode(body).decode())
 
 
@@ -195,9 +200,12 @@ async def review(data_url: str, expect: str = "") -> dict:
             ]},
         ], max_tokens=400)
     except Exception as exc:
-        log.warning("vision: 发图前核验失败：%s", str(exc)[:120])
+        # 把真实原因带上 —— 只写异常类型的话，排查时完全看不出是
+        # 「图太大」「格式不对」还是「网络不通」。
+        detail = str(exc).strip().replace("\n", " ")[:200]
+        log.warning("vision: 发图前核验失败：%s | %s", type(exc).__name__, detail)
         return {"ok": False, "desc": "", "unsafe": None, "match": None,
-                "reason": "核验调用失败（%s），保险起见不发。" % type(exc).__name__}
+                "reason": "核验调用失败（%s）：%s" % (type(exc).__name__, detail or "无详情")}
 
     import json as _json
     text = (out.get("text") or "").strip()
