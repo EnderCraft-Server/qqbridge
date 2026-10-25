@@ -18,6 +18,8 @@ import re
 from pathlib import Path
 from urllib.parse import urlparse
 
+from . import net
+
 log = logging.getLogger("qqbridge.vision")
 
 # 与 server.py 的 /api/image 同一份白名单
@@ -54,9 +56,9 @@ async def fetch_data_url(url: str) -> str | None:
         return _cache[url]
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-            resp = await client.get(url, headers={"User-Agent": "qqbridge/1.0"})
-            resp.raise_for_status()
+        resp = await net.arequest("GET", url, headers={"User-Agent": "qqbridge/1.0"},
+                                  timeout=15.0, follow_redirects=True)
+        resp.raise_for_status()
         body = resp.content
     except Exception as exc:
         log.warning("vision: 取图失败 %s: %s", host, type(exc).__name__)
@@ -147,6 +149,26 @@ REVIEW_SYSTEM = (
 )
 
 
+def _as_bool(v):
+    """把审核模型的输出转成 True/False；认不出来返回 None（= 判不通过）。
+
+    **不能只判 is True。** 实测过：模型回 {"unsafe": "true", "match": "false"}
+    （字符串而不是布尔，弱模型很常见）时，unsafe is True 和 match is False
+    两个判断全部落空，等于整道发图闸门被无声绕过 —— 危险图照样发出去。
+    所以这里显式认字符串，认不出来一律 fail closed。
+    """
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    s = str(v).strip().lower()
+    if s in ("true", "yes", "y", "1", "是", "安全", "匹配", "符合"):
+        return True
+    if s in ("false", "no", "n", "0", "否", "不安全", "不匹配", "不符合"):
+        return False
+    return None
+
+
 async def to_data_url(image: str) -> str | None:
     """把「本地文件路径」或「http(s) 图片链接」变成 data URL。失败返回 None。"""
     raw = (image or "").strip()
@@ -217,17 +239,17 @@ async def review(data_url: str, expect: str = "") -> dict:
         except ValueError:
             data = {}
     desc = str(data.get("desc") or "").strip()
-    unsafe = data.get("unsafe")
-    match = data.get("match")
+    unsafe = _as_bool(data.get("unsafe"))
+    match = _as_bool(data.get("match"))
     reason = str(data.get("unsafe_reason") or data.get("match_reason") or "").strip()
 
     if not desc or unsafe is None or match is None:
         return {"ok": False, "desc": desc, "unsafe": unsafe, "match": match,
                 "reason": "核验输出无法解析，保险起见不发。"}
-    if unsafe is True:
+    if unsafe:
         return {"ok": False, "desc": desc, "unsafe": True, "match": match,
                 "reason": "内容不适合发到群里：" + (reason or "判定为不安全内容")}
-    if expect.strip() and match is False:
+    if expect.strip() and not match:
         return {"ok": False, "desc": desc, "unsafe": False, "match": False,
                 "reason": "图和要发的东西对不上（图里实际是：%s）。%s" % (desc, reason)}
     return {"ok": True, "desc": desc, "unsafe": False, "match": match, "reason": reason}

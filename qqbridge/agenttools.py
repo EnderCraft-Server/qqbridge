@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -20,6 +21,8 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
+from . import net
+from .agent import escape_cq, is_safe_cq_param
 from .config import config
 
 log = logging.getLogger("qqbridge.agenttools")
@@ -83,6 +86,16 @@ def _is_loopback(host: str) -> bool:
 
 
 class LocalTools:
+    """工具集。
+
+    ⚠️ `target_group` 是**本轮会话**，不是配置。它不能放在共享实例上：
+    两个后台任务并发时（max_concurrent_tasks 默认 2），B 群会把 A 群的赋值覆盖掉，
+    A 群模型动手时读到的是 B 群 —— 实测两张图都发进了同一个群。
+    换成人话就是：**会禁言错的人、踢错的人、把图发错群。**
+
+    所以每个 run 都要拿一份自己的副本：`tools.for_target(gid)`。
+    """
+
     def __init__(self, root: Path, store=None, logger_name: str = "agent", bot=None):
         self.root = Path(root).resolve()
         self.store = store
@@ -94,6 +107,17 @@ class LocalTools:
         self._image_sent: list[float] = []
         self.log_path = self.root / "data" / "agent.log"
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def for_target(self, group_id: str) -> "LocalTools":
+        """返回一份**只服务于指定会话**的副本。
+
+        浅拷贝：bot / store / root / log 与原实例共享，只有 target_group 是独立的。
+        `_image_sent` 有意保持同一个 list 对象 —— 发图限流是全局的，
+        不能因为来了个副本就把 60 秒 3 张的限制翻倍。
+        """
+        clone = copy.copy(self)
+        clone.target_group = str(group_id or "")
+        return clone
 
     # ---------- 日志 ----------
     def _record(self, action: str, target: str, detail: dict, state: str, result: str = ""):
@@ -247,14 +271,12 @@ class LocalTools:
             raise ToolError("只允许抓取 http/https 地址。")
         import httpx
         try:
-            # 回环地址绕开系统代理：开了梯子之后，代理会把 127.0.0.1 也拦下来，
-            # 「取本机某个服务」就永远连不上。
-            with httpx.Client(timeout=20.0, follow_redirects=True,
-                              trust_env=not _is_loopback(parsed.hostname or ""),
-                              headers={"User-Agent": "Mozilla/5.0 (qqbridge)"}) as client:
-                resp = client.get(target)
-                raw = resp.content[: min(int(max_bytes), MAX_FETCH_BYTES)]
-                text = raw.decode(resp.encoding or "utf-8", errors="replace")
+            # 出口策略统一交给 net：回环走直连，远端代理连不上会自动退回直连。
+            # 以前这里只处理了回环，代理一挂 fetch_url 也跟着全废。
+            resp = net.request("GET", target, timeout=20.0,
+                               headers={"User-Agent": "Mozilla/5.0 (qqbridge)"})
+            raw = resp.content[: min(int(max_bytes), MAX_FETCH_BYTES)]
+            text = raw.decode(resp.encoding or "utf-8", errors="replace")
         except Exception as exc:
             self._record("fetch_url", target, {}, "FAILED", str(exc)[:200])
             raise ToolError(f"抓取失败：{exc}") from None
@@ -341,6 +363,14 @@ class LocalTools:
             if not self._public_host(parsed.hostname):
                 self._record("send_image", raw, {}, "DENIED", "内网地址")
                 raise ToolError("不接受内网/本机地址。")
+            # **整串必须是一个干净的 URL。** urlparse 只看开头，所以
+            # "https://a/x.png] [CQ:at,qq=all][CQ:image,file=http://127.0.0.1:5700/b"
+            # 的 hostname 是 a，能通过主机检查 —— 但拼进 CQ 码之后，
+            # 第一段提前闭合，后面那段就成了第二条指令：全员 @ 或者
+            # 再塞一张完全没过审核、没做 SSRF 校验的图进来。
+            if not is_safe_cq_param(raw):
+                self._record("send_image", raw, {}, "DENIED", "URL 里含 CQ 码分隔符")
+                raise ToolError("这个图片地址里含 [ ] & 或逗号/空白，不能作为 CQ 参数，拒绝发送。")
             payload = f"[CQ:image,file={raw}]"
             detail = {"via": "url"}
         elif parsed.scheme:
@@ -364,7 +394,9 @@ class LocalTools:
             payload = f"[CQ:image,file=file:///{str(p).replace(chr(92), '/')}]"
             detail = {"via": "path", "bytes": size, "kind": kind}
 
-        msg = payload if not caption.strip() else f"{caption.strip()}\n{payload}"
+        # 配文是模型写的，同样要转义 —— 否则 caption="[CQ:at,qq=all] 快来" 就是全员轰炸。
+        cap = escape_cq(caption.strip())
+        msg = payload if not cap else f"{cap}\n{payload}"
         try:
             result = await self.bot.call("send_group_msg", group_id=int(gid), message=msg)
         except Exception as exc:

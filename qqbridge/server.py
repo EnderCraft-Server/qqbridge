@@ -20,6 +20,7 @@ from mcp.server.lowlevel import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 
+from . import net
 from .bus import EventBus
 from .config import config
 from .onebot import OneBot
@@ -281,11 +282,12 @@ def build_tools(box: Toolbox, rules: Rules, sched: Scheduler, control: Control,
         if max_steps and int(max_steps) != agent_loop.max_steps:
             agent_loop.max_steps = max(1, min(int(max_steps), 20))
         system = agent.system_prompt + "\n\n你还可以使用工具读写文件、执行命令。改动前先看清楚目标。"
-        # 这条是外部 MCP 调用，没有群上下文 —— 必须清掉上一轮可能残留的目标，
-        # 否则 agent 会把图/群管理动作打到之前那个群。
+        # 这条是外部 MCP 调用，**没有群上下文**：显式给它一份空目标的副本。
+        # 注意不能只把共享实例的字段清空 —— 清空发生在并发窗口之外，
+        # 正在跑的 autoreply 任务随时会把字段写成某个群，
+        # 于是 MCP 派出的 agent 就凭空获得了往那个群发图/群管理的能力。
         # 要发图请用 MCP 的 send_image，要群管理请用 MCP 的 manage_group。
-        agent_loop.tools.target_group = ""
-        return await agent_loop.run(system, task)
+        return await agent_loop.run(system, task, tools=local_tools.for_target(""))
 
     @tool("agent_log", "查看内置 Agent 的文件读写/命令执行日志。", {"type": "object",
           "properties": {"limit": {"type": "integer", "default": 40}}, "additionalProperties": False})
@@ -527,8 +529,9 @@ def create_app() -> FastAPI:
         if hit is None:
             import httpx
             try:
-                async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                    resp = await client.get(u, headers={"User-Agent": "qqbridge-console/1.0"})
+                resp = await net.arequest("GET", u,
+                                          headers={"User-Agent": "qqbridge-console/1.0"},
+                                          timeout=15.0, follow_redirects=True)
                 resp.raise_for_status()
             except Exception as exc:
                 log.warning("图片代理失败 %s: %s", host, exc)
@@ -594,12 +597,21 @@ def create_app() -> FastAPI:
     @app.get("/api/events")
     async def api_events(request: Request, limit: int = 25):
         _ui_auth(request)
+        limit = max(1, min(int(limit), 200))     # 防负数 LIMIT 把整表倒出来
         with bus._lock:
             events = list(bus._events)[-limit:]
-            high, mid, low = set(bus._pending_high), set(bus._pending_mid), set(bus._pending_low)
+            seen_at = bus._seen_at
         out = []
         for e in events:
-            prio = "high" if e["id"] in high else "mid" if e["id"] in mid else "low" if e["id"] in low else "stored"
+            # 优先级现算：水位线之后的才算待处理，否则只是"库里的历史"
+            if e["is_self"] or e["at"] <= seen_at:
+                prio = "stored"
+            elif e.get("mentions_me"):
+                prio = "high"
+            elif e.get("keyword_hit"):
+                prio = "mid"
+            else:
+                prio = "low"
             out.append({**e, "priority": prio})
         return {"events": out}
 
@@ -791,9 +803,19 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health():
-        out = box.get_status()
-        out["control"] = control.status()
-        return JSONResponse(out)
+        """**无鉴权**的存活探针 —— 所以只能给"活着没有"，不能给配置。
+
+        以前这里直接返回 box.get_status()，里面含 config.describe()，
+        也就是 OWNER_IDS / ADMIN_IDS / 监控群号全都能被任何能连到这个端口的人读到。
+        而 OWNER_IDS 正是所有 MCP 写操作的授权凭据 —— 等于把"谁能下命令"
+        明文挂在网上。要完整状态请走 /api/status（有鉴权）。
+        """
+        return JSONResponse({
+            "ok": True,
+            "ws_connected": bool(bot.connected),
+            "bus": {"stored": len(bus._events), "dropped": bus._dropped},
+            "paused": control.paused(),
+        })
 
     async def endpoint(scope, receive, send):
         request = Request(scope, receive)
