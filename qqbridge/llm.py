@@ -12,6 +12,8 @@ from typing import Any
 
 import httpx
 
+from . import net
+
 log = logging.getLogger("qqbridge.llm")
 
 
@@ -98,10 +100,12 @@ class LLM:
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         t0 = time.time()
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.post(url, json=body, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
+            # 别直接用 httpx 默认值：trust_env=True 会走系统代理，
+            # 代理一挂整个机器人就哑了。net.arequest 会自动退回直连。
+            resp = await net.arequest("POST", url, json=body, headers=headers,
+                                      timeout=self.timeout)
+            resp.raise_for_status()
+            data = resp.json()
         except httpx.HTTPStatusError as exc:
             detail = exc.response.text[:300] if exc.response is not None else ""
             self.last_error = f"HTTP {exc.response.status_code}: {detail}"

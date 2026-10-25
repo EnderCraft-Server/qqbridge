@@ -40,7 +40,9 @@ env_keys = {line.split("=", 1)[0].strip()
             for line in env_example.splitlines()
             if "=" in line and not line.strip().startswith("#")}
 # 审计状态、协议名之类的全大写词不是环境变量，别误伤
-NON_ENV = {"JSON", "HTTP", "DENIED", "SUCCEEDED", "SKIPPED", "MIT", "README", "EULA"}
+# 系统环境变量（代理之类）不是本项目的 .env 配置项，别当成漏写
+NON_ENV = {"JSON", "HTTP", "DENIED", "SUCCEEDED", "SKIPPED", "MIT", "README", "EULA",
+           "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY"}
 referenced = set(re.findall(r"`([A-Z][A-Z0-9_]{3,})`", text)) - NON_ENV
 bad_env = sorted(referenced - env_keys)
 assert not bad_env, f"README 提到了 .env.example 里没有的变量：{bad_env}"

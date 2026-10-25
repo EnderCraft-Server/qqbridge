@@ -397,6 +397,7 @@ python tests/test_autoreply.py     # 批量闲聊、派活直连 Agent、被 @ �
 python tests/test_agenttools.py    # 命令黑名单别误杀、卡住时别发废话
 python tests/test_bus.py           # 事件总线：批量标记、启动回填、溢出计数
 python tests/test_onebot.py        # WebSocket 事件流：断线退避、connected 不说谎
+python tests/test_net.py           # 出口策略：代理挂了要能自动退回直连
 node   tests/ui_console.mjs        # 控制台前端脚本（假 DOM 里跑 ui.html）
 python tests/test_readme.py        # 这份 README 有没有跟代码对不上
 ```
@@ -407,6 +408,19 @@ python tests/test_readme.py        # 这份 README 有没有跟代码对不上
   因为控制台接口会把设置写回 `.env`，测试一旦认错目录就会把线上配置冲掉
 - `test_readme.py` 检查这份 README：提到的命令、环境变量、MCP 工具、目录结构、
   测试脚本是不是都真实存在，工具数量对不对得上。文档一漂就报错
+
+## 出口网络：代理挂了不能让机器人哑掉
+
+所有对外请求（模型、看图、抓网页、控制台图片代理）都走 `qqbridge/net.py`，规矩三条：
+
+1. **回环地址永远直连** —— 系统代理不转发 127.0.0.1，走代理只会连不上
+2. **远端先按系统代理走，连不上自动退回直连**，并记住上次成功的路径，
+   不会每次都先在死代理上耗一个超时
+3. 两种都不通时抛出带代理地址的可读错误，而不是一句 `All connection attempts failed`
+
+> 这是踩出来的：梯子关掉之后，进程环境里还留着 `HTTPS_PROXY`，
+> httpx 默认 `trust_env=True` 把所有请求丢给没人监听的端口，
+> 于是模型、说说、Agent 一起静默，只有兜底短句还能发出去。
 
 ## 常见问题
 

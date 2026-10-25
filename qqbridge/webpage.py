@@ -16,6 +16,8 @@ import re
 import socket
 from urllib.parse import urlparse
 
+from . import net
+
 log = logging.getLogger("qqbridge.webpage")
 
 MAX_BYTES = 300 * 1024
@@ -72,9 +74,8 @@ async def fetch_text(url: str) -> dict | None:
         return None
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True,
-                                     headers={"User-Agent": UA}) as client:
-            resp = await client.get(url)
+        resp = await net.arequest("GET", url, headers={"User-Agent": UA},
+                                  timeout=TIMEOUT, follow_redirects=True)
         raw = resp.content[:MAX_BYTES]
     except Exception as exc:
         log.warning("webpage: 抓取失败 %s: %s", host, type(exc).__name__)
