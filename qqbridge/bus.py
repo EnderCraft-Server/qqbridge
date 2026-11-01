@@ -6,6 +6,7 @@ cost) and the agent pulls whatever is pending whenever it happens to run.
 from __future__ import annotations
 
 import itertools
+import json
 import logging
 import threading
 import time
@@ -43,6 +44,12 @@ class EventBus:
         #   1) 水位只能推到**缓冲里真实存在的那条消息**的时间上，推不过去；
         #   2) push 保证 at 严格递增且互不相同，所以不存在并列导致的漏看/重看。
         self._seen_at = self._load_float("bus.seen_at", 0.0)
+        # ---------- 按会话（群 / 私聊）各记各的水位线 ----------
+        # 原来只有一个全局水位：A 群处理完把水位推过去，B 群里比它旧的消息
+        # 就再也不会被看到了 —— 而且上下文取的是全局最近 N 条，
+        # A 群的话题会混进 B 群的判断里（实测回复过另一个群的梗）。
+        # 现在每个会话一份水位线，互不影响。
+        self._seen_by_key: dict[str, float] = self._load_json("bus.seen_by_key", {})
         self._last_ts = 0.0          # 上一个事件的 at，用来保证严格递增
 
         self._last_own_send = 0.0
@@ -90,6 +97,22 @@ class EventBus:
     def _save_float(self, key: str, value: float) -> None:
         if self._store is not None:
             self._store.set_state(key, float(value))
+
+    def _load_json(self, key: str, default):
+        if self._store is None:
+            return default
+        try:
+            raw = self._store.get_state(key, None)
+            if raw in (None, ""):
+                return default
+            val = json.loads(raw) if isinstance(raw, str) else raw
+            return val if isinstance(val, type(default)) else default
+        except (TypeError, ValueError):
+            return default
+
+    def _save_json(self, key: str, value) -> None:
+        if self._store is not None:
+            self._store.set_state(key, json.dumps(value, ensure_ascii=False))
 
     def _next_id(self) -> int:
         """Allocate the next event id, durably, so ids never repeat across restarts."""
@@ -218,28 +241,62 @@ class EventBus:
                      if unprocessed else "")
         return len(added)
 
+    # ---------- 会话（群 / 私聊） ----------
+    @staticmethod
+    def key_of(ev: dict) -> str:
+        """一条消息属于哪个会话。群聊用群号，私聊用对方 QQ 号。"""
+        return str(ev.get("group_id") or ev.get("user_id") or "")
+
+    def _seen_for(self, key: str) -> float:
+        """这个会话的水位线。没有记录时退回全局水位（升级时不重放历史）。"""
+        if key in self._seen_by_key:
+            return self._seen_by_key[key]
+        return self._seen_at
+
     # ---------- 批量视图（接话循环用这个，不再按条取） ----------
-    def unseen(self, limit: int = 200) -> list:
+    def unseen(self, limit: int = 200, key: str | None = None) -> list:
         """水位线之后新来的消息，按时间升序。
 
         这是接话循环唯一的时间线：一次拿到一整段，而不是一条一条地取。
         不包含自己的发言 —— 自己说的不用回。
+        key 给定时只看这个会话。
         """
         with self._lock:
-            cut = self._seen_at
-            return [e for e in self._events if e["at"] > cut and not e["is_self"]][:limit]
+            cut = self._seen_for(key) if key is not None else self._seen_at
+            return [e for e in self._events
+                    if e["at"] > cut and not e["is_self"]
+                    and (key is None or self.key_of(e) == key)][:limit]
 
-    def context(self, limit: int = 40, max_age: float = 0.0) -> list:
+    def unseen_by_key(self, limit: int = 200) -> dict:
+        """按会话分桶的未读消息：{key: [事件…]}，每个桶按时间升序。
+
+        接话循环按桶逐个处理 —— 一个群一段独立会话，
+        不再把所有群的消息揉成一批交给模型。
+        """
+        with self._lock:
+            out: dict[str, list] = {}
+            for e in self._events:
+                if e.get("is_self"):
+                    continue
+                k = self.key_of(e)
+                if (e.get("at") or 0.0) <= self._seen_for(k):
+                    continue
+                out.setdefault(k, []).append(e)
+        return {k: v[:limit] for k, v in out.items()}
+
+    def context(self, limit: int = 40, max_age: float = 0.0,
+                key: str | None = None) -> list:
         """给模型看的上下文：最近 limit 条（**含自己说过的话**），按 id 升序。
 
         只看「新消息」是不够的 —— 得知道在聊什么，才知道这句要不要接。
+        key 给定时**只取这个会话的**：A 群的上下文绝不能出现在 B 群的判断里。
 
         max_age > 0 时再按时间切一刀：只保留最近 max_age 秒内的。
         只按条数限制有个坑 —— 群里一安静，40 条能横跨好几小时，
         模型就拿着几小时前的语境去接现在的话，看起来像答非所问。
         """
         with self._lock:
-            events = list(self._events)
+            events = [e for e in self._events if key is None or self.key_of(e) == key]
         if max_age > 0:
             cut = time.time() - max_age
             fresh_ev = [e for e in events if (e.get("at") or 0) >= cut]
@@ -247,7 +304,14 @@ class EventBus:
             events = fresh_ev or events
         return events[-limit:]
 
-    def mark_seen_at(self, through_at: float) -> float:
+    def _save_by_key(self) -> None:
+        # 群会越来越多，别让这张表无限长；留最近活跃的 200 个
+        if len(self._seen_by_key) > 200:
+            keep = sorted(self._seen_by_key.items(), key=lambda kv: kv[1])[-200:]
+            self._seen_by_key = dict(keep)
+        self._save_json("bus.seen_by_key", self._seen_by_key)
+
+    def mark_seen_at(self, through_at: float, key: str | None = None) -> float:
         """把水位线推到 through_at —— **永远不会超过缓冲里最新那条的时间**。
 
         这是整套机制的安全阀。以前是 `self._processed = max(_, through_id)`，
@@ -257,14 +321,21 @@ class EventBus:
         最多是让当前这批不需要再回了，绝不会吃掉还没到的消息。
         """
         with self._lock:
-            newest = max((e["at"] for e in self._events), default=0.0)
+            newest = max((e["at"] for e in self._events
+                          if key is None or self.key_of(e) == key), default=0.0)
             target = min(float(through_at), newest)
-            if target > self._seen_at:
-                self._seen_at = target
-                self._save_float("bus.seen_at", self._seen_at)
-            return self._seen_at
+            if key is None:
+                if target > self._seen_at:
+                    self._seen_at = target
+                    self._save_float("bus.seen_at", self._seen_at)
+                return self._seen_at
+            cur = self._seen_by_key.get(key, self._seen_at)
+            if target > cur:
+                self._seen_by_key[key] = target
+                self._save_by_key()
+            return self._seen_by_key.get(key, self._seen_at)
 
-    def mark_looked(self, through_id: int) -> float:
+    def mark_looked(self, through_id: int, key: str | None = None) -> float:
         """按事件 id 推进水位线（批处理路径用）。
 
         **id 找不到就什么都不做** —— 这是关键：调用方拿到的 id 一定来自
@@ -275,7 +346,8 @@ class EventBus:
         if rec is None:
             log.warning("mark_looked(%s)：缓冲里没有这个 id，水位线不动", through_id)
             return self._seen_at
-        return self.mark_seen_at(rec["at"])
+        # 没显式给 key 就用这条消息自己的会话，避免拿 A 群的消息推 B 群的水位
+        return self.mark_seen_at(rec["at"], key or self.key_of(rec))
 
     # ---------- read ----------
     def _get(self, event_id: int) -> dict | None:
