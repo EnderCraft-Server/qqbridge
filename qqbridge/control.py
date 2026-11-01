@@ -54,12 +54,17 @@ class Control:
         }, ensure_ascii=False, indent=1), encoding="utf-8")
 
     def _apply(self):
-        """暂停时清空待处理队列，避免恢复后一次性爆发。"""
+        """暂停时清空待处理队列，避免恢复后一次性爆发。
+
+        水位线模型下，"清空队列"就是把水位推到最新那条 —— 之后 everything
+        都被视为已看过，恢复时不会再一次性炸出来。
+        注意是 mark_seen_at（带钳制），不是自己改 _seen_at：钳制逻辑只能有一处。
+        """
         if self.mode == "stopped":
             with self.bus._lock:
-                self.bus._pending_high.clear()
-                self.bus._pending_mid.clear()
-                self.bus._pending_low.clear()
+                newest = max((e["at"] for e in self.bus._events), default=0.0)
+            if newest:
+                self.bus.mark_seen_at(newest)
 
     def paused(self) -> bool:
         return self.mode == "stopped"

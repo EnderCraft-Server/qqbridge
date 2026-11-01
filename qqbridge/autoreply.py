@@ -12,9 +12,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 
 from . import academic
-from .agent import clean_reply, render_text
+from .agent import clean_reply, escape_cq, render_text
 from .config import config
 
 log = logging.getLogger("qqbridge.autoreply")
@@ -78,6 +79,9 @@ class AutoReply:
         # 派活的 agent loop 可能跑满 agent_timeout，绝不能堵着接话循环。
         self.max_concurrent_tasks = max_concurrent_tasks
         self._bg_tasks: set = set()
+        # 并发满时的等待队列。**有界**：无限排下去等于把内存交出去。
+        self._task_queue: deque = deque()
+        self.max_pending_tasks = 8
         self._task = None
         self._stop = asyncio.Event()
         self._sent: list[float] = []
@@ -108,6 +112,7 @@ class AutoReply:
             except (asyncio.CancelledError, Exception):
                 pass
         # 后台的派活也要收干净，别让它关停之后还往群里发消息
+        self._task_queue.clear()
         for t in list(self._bg_tasks):
             t.cancel()
         if self._bg_tasks:
@@ -173,10 +178,13 @@ class AutoReply:
         """
         if not self.agent_loop:
             return ""
+        # 每个 run 拿一份自己的工具副本 —— 目标会话绝不能写在共享实例上。
+        # 以前是 self.agent_loop.tools.target_group = gid，两个后台任务并发时
+        # 后一个会把前一个覆盖掉，于是 A 群的禁言/发图落到 B 群（实测复现过）。
         try:
-            self.agent_loop.tools.target_group = str(gid or "")
+            run_tools = self.agent_loop.tools.for_target(gid)
         except AttributeError:
-            pass
+            run_tools = None
         tools_block = (
             "\n\n【覆盖上面的 JSON 格式要求】不要输出 JSON，直接说人话。\n"
             "工具（一次选对，别反复试）：\n"
@@ -211,7 +219,8 @@ class AutoReply:
             system = (self.agent.system_prompt or "") + tools_block + "干完回一句短的，说清结果。别汇报过程。"
             max_tokens = None
         try:
-            out = await asyncio.wait_for(self.agent_loop.run(system, task, max_tokens=max_tokens),
+            out = await asyncio.wait_for(self.agent_loop.run(system, task, max_tokens=max_tokens,
+                                                             tools=run_tools),
                                          timeout=self.agent_timeout)
             reply, how = clean_reply(out.get("text") or "")
             if how == "failed":
@@ -233,11 +242,15 @@ class AutoReply:
             # 学术模式的答案可能几千字，QQ 单条消息塞不下 —— 按段落切成几条发。
             chunks = split_message(reply) if len(reply) > SEND_CHUNK else [reply]
             for part in chunks:
+                # **出去之前必须转义 CQ 码。** 正文是模型产的，而模型又受群消息影响：
+                # 群友只要诱导它输出 "[CQ:at,qq=all]" 就能全员轰炸，或者塞一个
+                # [CQ:image,file=...] 绕过发图审核。转义之后这些只会按字面显示。
+                safe_part = escape_cq(part)
                 if private:
                     await self.bot.call("send_private_msg", user_id=int(target["user_id"]),
-                                        message=part)
+                                        message=safe_part)
                 else:
-                    await self.bot.call("send_group_msg", group_id=int(gid), message=part)
+                    await self.bot.call("send_group_msg", group_id=int(gid), message=safe_part)
                 if len(chunks) > 1:
                     await asyncio.sleep(0.4)   # 连发别把服务端刷爆
             self._sent.append(time.time())
@@ -252,6 +265,8 @@ class AutoReply:
             self.last_action = f"发送失败: {exc}"
             log.warning("autoreply send failed: %s", exc)
     FORCED_FALLBACK = "在，你说。"
+    # 派活队列彻底溢出时的回执。宁可说一句"忙不过来"，也不能让人干等。
+    TASK_OVERFLOW_REPLY = "这边活排满了，过会儿再说。"
 
     async def _forced_reply(self, ev: dict) -> str:
         """被 @ 时的硬兜底：模型没给话就再问一次，只要一句人话。
@@ -322,11 +337,16 @@ class AutoReply:
                 # 立刻就能看到最新语境，不用等 agent 干完。
                 for e in fresh:
                     self.agent.observe(e)
-                # 认领游标 + 扔后台：agent loop 最长要跑 agent_timeout(90s)，
-                # 以前是 await 它，于是整个接话循环停摆 90 秒，闲聊全排队，
-                # 等轮到的时候已经滞后好几分钟（实测 162 秒）。
+                # 扔后台：agent loop 最长要跑 agent_timeout(90s)，以前是 await 它，
+                # 于是整个接话循环停摆 90 秒，闲聊全排队，等轮到已经滞后好几分钟
+                # （实测 162 秒）。并发满时 _spawn_task 会排队，不再直接丢。
+                scheduled = self._spawn_task(ev)
                 self.bus.mark_looked(fresh[-1]["id"])
-                self._spawn_task(ev)
+                if not scheduled:
+                    # 连等待队列都满了（极端积压）。水位线已经推进，所以不会重试，
+                    # 那就必须明确回一句 —— 否则用户等一个永远不会来的回复。
+                    gid = ev.get("group_id") or ev.get("user_id") or ""
+                    await self._send(ev, gid, self.TASK_OVERFLOW_REPLY, "派活队列溢出")
                 return
 
         now = time.time()
@@ -407,24 +427,49 @@ class AutoReply:
             return False
         return bool(ev.get("mentions_me")) or ev.get("message_type") == "private"
 
-    def _spawn_task(self, ev: dict):
+    def _spawn_task(self, ev: dict) -> bool:
         """把派活扔进后台，绝不阻塞接话循环。
 
         以前是 `await self._handle_task(...)`，agent loop 最长跑 agent_timeout(90s)，
-        这 90 秒里整个 `_loop` 停摆：闲聊不处理、游标不推进，等它干完接着一条条
-        补，实测滞后到 162 秒。游标已由调用方认领，这里只负责异步执行。
+        这 90 秒里整个 `_loop` 停摆：闲聊不处理、水位线不推进，等它干完接着一条条
+        补，实测滞后到 162 秒。
+
+        **并发满时排队，不丢。** 原来的写法是并发满就 `return` 什么都不做，
+        而调用方已经先把水位线推过去了 —— 于是管理员 @ 了机器人，
+        任务没建、消息却已算处理完：**永无回复、无重试、无痕迹**。
+        现在满了就进等待队列，槽位一空立刻补上。
+        只有连队列都满（极端积压）才返回 False，由调用方明确告知用户。
         """
-        running = [t for t in self._bg_tasks if not t.done()]
-        self._bg_tasks = set(running)
-        if len(running) >= self.max_concurrent_tasks:
-            log.info("派活并发已满（%d），跳过这条：%s", len(running),
-                     (ev.get("text") or "")[:40])
-            self.store.audit("auto", "auto_task_skip", str(ev.get("id")),
-                             {"running": len(running)}, "SKIPPED")
-            return
+        self._drain_task_queue()
+        if len(self._bg_tasks) >= self.max_concurrent_tasks:
+            if len(self._task_queue) >= self.max_pending_tasks:
+                log.warning("派活并发与等待队列都满了（%d/%d），这条只能放弃：%s",
+                            len(self._bg_tasks), len(self._task_queue),
+                            (ev.get("text") or "")[:40])
+                self.store.audit("auto", "auto_task_overflow", str(ev.get("id")),
+                                 {"running": len(self._bg_tasks),
+                                  "queued": len(self._task_queue)}, "SKIPPED")
+                return False
+            self._task_queue.append(ev)
+            log.info("派活并发已满，进等待队列（%d）：%s",
+                     len(self._task_queue), (ev.get("text") or "")[:40])
+            return True
+        self._start_task(ev)
+        return True
+
+    def _start_task(self, ev: dict):
         task = asyncio.create_task(self._handle_task(ev))
         self._bg_tasks.add(task)
-        task.add_done_callback(self._bg_tasks.discard)
+        task.add_done_callback(self._on_task_done)
+
+    def _on_task_done(self, task):
+        self._bg_tasks.discard(task)
+        # 腾出槽位就立刻补下一个，别让队列干等
+        self._drain_task_queue()
+
+    def _drain_task_queue(self):
+        while self._task_queue and len(self._bg_tasks) < self.max_concurrent_tasks:
+            self._start_task(self._task_queue.popleft())
 
     async def _handle_task(self, ev: dict):
         """直接调用内置 Agent 干活，不走批量决策。

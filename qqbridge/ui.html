@@ -38,7 +38,9 @@
     display:grid;place-items:center;font-weight:700;font-size:15px}
   .brand b{font-size:15px;font-weight:600;letter-spacing:.01em}
   nav{display:flex;flex-direction:column;gap:2px}
-  nav button{all:unset;display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:10px;
+  /* 同样：all:unset 会把 box-sizing 重置回 content-box。这里暂时没有 width:100%，
+     所以还没暴露；补上是为了防止以后有人给它加个满宽就又冒出一个溢出。 */
+  nav button{all:unset;box-sizing:border-box;display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:10px;
     color:var(--sidebar-fg);font-size:13.5px;cursor:pointer;transition:background .15s,color .15s}
   nav button:hover{background:oklch(90% .025 230 / .6)}
   nav button.active{background:var(--primary);color:var(--primary-fg);font-weight:600}
@@ -154,13 +156,16 @@
   .gate input[type=text],.gate input[type=password]{width:100%;padding:10px 12px;border:1px solid var(--border);
     border-radius:var(--radius);background:var(--background);color:var(--fg);font:14px/1.5 inherit;outline:none}
   .gate input:focus{border-color:var(--ring);box-shadow:0 0 0 3px oklch(68.5% .155 230 / .18)}
-  .gate button{all:unset;display:inline-flex;justify-content:center;align-items:center;padding:10px 20px;
-    border-radius:var(--radius);background:var(--primary);color:var(--primary-fg);font-size:13.5px;
-    font-weight:600;cursor:pointer;transition:opacity .15s}
+  /* all:unset 会连 box-sizing 一起重置成 content-box，把上面 *{box-sizing:border-box} 盖掉。
+     于是 .full 的 width:100% 再加上左右各 20px 内边距，按钮就会比登录框宽出 40px。
+     这里必须显式补回来 —— 用 all:unset 做按钮重置时，box-sizing 是最容易漏的一个。 */
+  .gate button{all:unset;box-sizing:border-box;display:inline-flex;justify-content:center;align-items:center;
+    padding:10px 20px;border-radius:var(--radius);background:var(--primary);color:var(--primary-fg);
+    font-size:13.5px;font-weight:600;cursor:pointer;transition:opacity .15s}
   .gate button:hover{opacity:.9}
   .gate button.ghost{background:var(--muted);color:var(--fg);font-weight:500}
   .gate button[disabled]{opacity:.45;cursor:not-allowed}
-  .gate .full{width:100%;margin-top:20px}
+  .gate .full{width:100%;max-width:100%;box-sizing:border-box;margin-top:20px}
   .agr{max-height:290px;overflow:auto;border:1px solid var(--border);border-radius:var(--radius);
     padding:16px 18px;background:var(--background);font-size:12.5px;line-height:1.75;white-space:pre-wrap;
     color:var(--muted-fg)}

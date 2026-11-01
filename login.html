@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    height: 100%;
+  }
+
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 24px;
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", Helvetica, Arial, sans-serif;
+    background: linear-gradient(135deg, #eef4ff 0%, #dbe7ff 100%);
+    color: #1f2a44;
+  }
+
+  .card {
+    width: 100%;
+    max-width: 360px;
+    padding: 36px 28px;
+    background: #ffffff;
+    border-radius: 16px;
+    box-shadow: 0 12px 32px rgba(38, 70, 140, 0.12);
+  }
+
+  .card h1 {
+    font-size: 22px;
+    font-weight: 600;
+    text-align: center;
+    line-height: 1.4;
+    margin-bottom: 6px;
+  }
+
+  .card p.sub {
+    font-size: 13px;
+    color: #8a93a8;
+    text-align: center;
+    line-height: 1.5;
+    margin-bottom: 28px;
+  }
+
+  .field {
+    margin-bottom: 18px;
+  }
+
+  .field label {
+    display: block;
+    font-size: 13px;
+    color: #5a6478;
+    margin-bottom: 6px;
+    line-height: 1.4;
+  }
+
+  .field input {
+    width: 100%;
+    height: 44px;
+    padding: 0 14px;
+    font-size: 15px;
+    color: #1f2a44;
+    background: #f7f9fc;
+    border: 1px solid #dce3f0;
+    border-radius: 10px;
+    outline: none;
+    transition: border-color 0.2s, background 0.2s;
+  }
+
+  .field input::placeholder {
+    color: #aab3c4;
+  }
+
+  .field input:focus {
+    background: #ffffff;
+    border-color: #4c7dff;
+  }
+
+  .btn {
+    display: block;
+    width: 100%;
+    height: 46px;
+    margin-top: 26px;
+    font-size: 15px;
+    font-weight: 600;
+    color: #ffffff;
+    background: #4c7dff;
+    border: none;
+    border-radius: 10px;
+    cursor: pointer;
+    transition: background 0.2s, transform 0.05s;
+  }
+
+  .btn:hover { background: #3d6bed; }
+  .btn:active { transform: scale(0.99); }
+  .btn:disabled { background: #a9bdf5; cursor: not-allowed; }
+
+  .foot {
+    margin-top: 20px;
+    font-size: 13px;
+    color: #8a93a8;
+    text-align: center;
+    line-height: 1.6;
+  }
+
+  .foot a {
+    color: #4c7dff;
+    text-decoration: none;
+  }
+
+  .foot a:hover { text-decoration: underline; }
+
+  .tip {
+    display: none;
+    margin-top: 14px;
+    padding: 10px 12px;
+    font-size: 13px;
+    line-height: 1.5;
+    color: #b03a3a;
+    background: #fdf0f0;
+    border: 1px solid #f5d6d6;
+    border-radius: 8px;
+    word-break: break-all;
+  }
+</style>
+</head>
+<body>
+  <main class="card">
+    <h1>欢迎登录</h1>
+    <p class="sub">请输入你的账号信息</p>
+
+    <form id="loginForm" novalidate>
+      <div class="field">
+        <label for="account">账号</label>
+        <input id="account" name="account" type="text" placeholder="手机号或邮箱" autocomplete="username" maxlength="64">
+      </div>
+
+      <div class="field">
+        <label for="password">密码</label>
+        <input id="password" name="password" type="password" placeholder="请输入密码" autocomplete="current-password" maxlength="64">
+      </div>
+
+      <button class="btn" type="submit" id="submitBtn">登 录</button>
+      <div class="tip" id="tip"></div>
+    </form>
+
+    <p class="foot">还没有账号？<a href="#">立即注册</a></p>
+  </main>
+
+<script>
+  var form = document.getElementById('loginForm');
+  var account = document.getElementById('account');
+  var password = document.getElementById('password');
+  var tip = document.getElementById('tip');
+  var btn = document.getElementById('submitBtn');
+
+  function showTip(msg) {
+    tip.textContent = msg;
+    tip.style.display = 'block';
+  }
+
+  function clearTip() {
+    tip.textContent = '';
+    tip.style.display = 'none';
+  }
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    clearTip();
+
+    var a = account.value.trim();
+    var p = password.value;
+
+    if (!a) { showTip('账号不能为空'); account.focus(); return; }
+    if (!p) { showTip('密码不能为空'); password.focus(); return; }
+    if (p.length < 6) { showTip('密码至少 6 位'); password.focus(); return; }
+
+    btn.disabled = true;
+    btn.textContent = '登录中…';
+
+    // 这里替换为真实接口
+    setTimeout(function () {
+      btn.disabled = false;
+      btn.textContent = '登 录';
+      showTip('演示界面：账号 ' + a + ' 校验通过，请接入后端接口。');
+    }, 800);
+  });
+</script>
+</body>
+</html>

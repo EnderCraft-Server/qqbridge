@@ -42,11 +42,18 @@ assert bus.status()["stored"] == 5
 assert bus.since(0)[0]["id"] == 1, "id 应当从 1 开始"
 assert bus.status()["pending_low"] == 5, "冷却期已过，普通闲聊该进低位队列"
 assert not [e for e in bus.since(0) if e["mentions_me"]], "没人 @ 的时候不该判成 @我"
+seen_before = bus.status()["seen_at"]
 bus.mark_processed(3)
-assert bus.status()["cursor"] == 3
+assert bus.status()["cursor"] == 3, "按 id 标完，兼容字段应当能映回那个 id"
+assert bus.status()["seen_at"] > seen_before, "水位线（时间戳）该往前走"
 assert len(bus.since(3)) == 2, "游标之后应当只剩 2 条"
-assert bus.since(0)[0]["id"] == 1, "since() 是纯读，不该因为游标推进而看不到历史"
-ok.append("入库 / 自增 id / 游标推进 / since 纯读 都正确")
+assert bus.since(0)[0]["id"] == 1, "since() 是纯读，不该因为水位线推进而看不到历史"
+# 水位线模型的核心保证：编造的 id 推不动水位线
+before = bus.status()["seen_at"]
+bus.mark_processed(99999999)
+assert bus.status()["seen_at"] == before, "不存在的 id 绝不能推高水位线"
+assert len(bus.unseen()) == 2, "推不动，所以剩下的两条还在"
+ok.append("入库 / 自增 id / 水位线推进 / 编造 id 推不动 / since 纯读 都正确")
 
 # ---------- 2. 监控范围外的群：落库但不入队 ----------
 other = bus.push(event(99, gid="999999"))
@@ -60,7 +67,9 @@ ok.append("监控范围外的群：只落库、不入队、不进缓冲")
 # ---------- 3. 重启：id 不回退、游标不丢 ----------
 bus2 = EventBus(size=10, cooldown_seconds=90, rules=rules,
                 watch_groups=["1060667115"], store=store)
-assert bus2.status()["cursor"] == 3, "游标没恢复，重启后会重发一遍"
+# 水位线是时间戳，重启后必须原样恢复 —— 否则会把处理过的消息再回一遍。
+# （旧的 id 游标在这里被换掉了：它单调、可被编造、还能永久卡死机器人。）
+assert bus2.status()["seen_at"] == bus.status()["seen_at"], "水位线没恢复，重启后会重发一遍"
 assert bus2.status()["stored"] == 0, "新进程缓冲本来就是空的"
 new_rec = bus2.push(event(100))
 store.add_message(new_rec)
