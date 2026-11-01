@@ -117,5 +117,43 @@ assert 高, "没识别出 @ 我"
 assert 高[0]["text"].strip() == "在吗", f"raw_message 缺失时文本没从分段拼回来：{高[0]['text']!r}"
 ok.append("关键词进中优先级、@ 进高优先级，且 @ 时文本拼接正确")
 
+# ---------- 7. 按会话分桶：水位线各记各的（这次改动的核心） ----------
+bus5 = EventBus(size=50, cooldown_seconds=90, rules=rules,
+                watch_groups=["1060667115", "1083430859"])
+bus5.push(event(1, text="A1", gid="1060667115"))
+bus5.push(event(2, text="B1", gid="1083430859"))
+bus5.push(event(3, text="A2", gid="1060667115"))
+bus5.push(event(4, text="B2", gid="1083430859"))
+
+buckets = bus5.unseen_by_key()
+assert set(buckets) == {"1060667115", "1083430859"}, buckets.keys()
+assert [e["text"] for e in buckets["1060667115"]] == ["A1", "A2"]
+assert [e["text"] for e in buckets["1083430859"]] == ["B1", "B2"]
+ok.append("unseen_by_key 按群分桶，各群只看自己的")
+
+# 只推进 A 群的水位线，B 群不能受影响
+bus5.mark_looked(3, key="1060667115")
+buckets = bus5.unseen_by_key()
+assert "1060667115" not in buckets, "A 群已经看完了，不该还有未读"
+assert [e["text"] for e in buckets["1083430859"]] == ["B1", "B2"], "B 群被 A 群的水位线连累了"
+ok.append("推进 A 群水位线不会吃掉 B 群的未读（这正是原来混在一起的病根）")
+
+# 上下文按会话取，绝不跨群
+ctx_a = bus5.context(50, key="1060667115")
+ctx_b = bus5.context(50, key="1083430859")
+assert [e["text"] for e in ctx_a] == ["A1", "A2"], ctx_a
+assert [e["text"] for e in ctx_b] == ["B1", "B2"], ctx_b
+assert bus5.key_of({"group_id": "123"}) == "123"
+assert bus5.key_of({"group_id": "", "user_id": "456"}) == "456", "私聊要按对方 QQ 分桶"
+ok.append("context 按会话取，A 群的上下文不会出现在 B 群")
+
+# 水位线只在真实消息的时间上推进，推不过去（安全阀仍然有效）
+before = bus5._seen_by_key.get("1083430859", 0.0)
+bus5.mark_seen_at(9e9, key="1083430859")
+assert bus5._seen_by_key["1083430859"] <= max(e["at"] for e in bus5._events), "水位被推到了未来"
+assert bus5._seen_by_key["1083430859"] > before
+ok.append("按会话推进水位线时，安全阀依然把它钳在真实消息时间上")
+
+
 print("\n".join("PASS  " + x for x in ok))
 print("ALL PASS")

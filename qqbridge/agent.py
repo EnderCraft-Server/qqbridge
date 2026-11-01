@@ -16,6 +16,7 @@ from . import academic, vision
 from . import webpage
 from .config import config
 from .llm import LLM, LLMError
+from .textnorm import split_messages, tidy_outgoing
 
 log = logging.getLogger("qqbridge.agent")
 
@@ -138,8 +139,13 @@ class QqAgent:
             "- 除此之外，**大多数时候你什么都不想说**。只有这段里真有让你想插一句的东西"
             "（有梗、能怼、你懂行、有话接）才回。\n"
             "- 只是「冒泡」「打卡」「早」「在吗」这种刷存在感的、或者单独一个「。」「？」「6」，一律不接。\n"
-            "- 回就回一句，别逐条点评、别总结、别复述。\n"
-            "- 不想说就留空 reply —— 这是最常见的正确答案。"
+            "- 别逐条点评、别总结、别复述。\n"
+            "- 想说的多就拆成 2~3 条短消息（replies 数组），程序会分几次发出去；\n"
+            "  **不要在一个字符串里塞换行或空格来装多条**。\n"
+            "- 每条都要短，能一句说完就一句。句尾不要加「。」。\n"
+            "  想表达无语/尴尬就用「。。。」；想卖萌或玩梗可以在句尾加一个不闭合的「（」；\n"
+            "  遇到很抽象的问题可以直接甩「？？？」。\n"
+            "- 不想说就留空 replies —— 这是最常见的正确答案。"
         )
         if fresh_count > 0 and not fresh_mention:
             hint += "\n\n（这一段里没有人 @ 你。）"
@@ -202,7 +208,8 @@ class QqAgent:
             {"role": "system", "content": system_content},
             convo_msg,
             {"role": "user", "content":
-                hint + '\n\n以 JSON 回复：{"reply": "要发的话", "reason": "一句理由"}。只输出 JSON。'},
+                hint + '\n\n以 JSON 回复：{"replies": ["第一句", "第二句"], "reason": "一句理由"}。'
+                '只发一条就写成只有一项的数组。不说话就空数组。只输出 JSON。'},
         ]
         self.decisions += 1
         out = await self.llm.chat(messages, max_tokens=max_tokens)
@@ -217,19 +224,33 @@ class QqAgent:
                 except Exception:
                     pass
         else:
-            reply = (data.get("reply") or "").strip()
             reason = str(data.get("reason") or "")[:200]
-            reply, _ = clean_reply(json.dumps({"reply": reply}, ensure_ascii=False))
-        # 学术模式按 academic_reply_chars 截断，不再套群聊的 800 字
-        if len(reply) > reply_limit:
-            reply = reply[:reply_limit]
-        if reply:
-            self.replies += 1
+            raw_parts: list = []
+            arr = data.get("replies")
+            if isinstance(arr, list):
+                raw_parts.extend(arr)
+            one = (data.get("reply") or "").strip()      # 兼容只给一条的老格式
+            if one:
+                raw_parts.append(one)
+            if academic_on:
+                # 学术回答不该被拆成几条、也不该去掉句末标点
+                joined, _ = clean_reply(json.dumps(
+                    {"reply": "\n".join(str(x) for x in raw_parts)}, ensure_ascii=False))
+                parts = [joined[:reply_limit]] if joined else []
+            else:
+                parts = []
+                for piece in split_messages(raw_parts):
+                    cleaned, _ = clean_reply(piece)
+                    if cleaned:
+                        parts.append(cleaned[:reply_limit])
+            reply = "\n".join(parts)                    # 兼容字段：合并视图
+        if parts:
+            self.replies += len(parts)
         else:
             self.silences += 1
         if how != "ok":
             reason = f"[{how}] " + reason
-        return {"reply": reply, "reason": reason, "key": key,
+        return {"reply": reply, "replies": parts, "reason": reason, "key": key,
                 "parse": how, "fresh": fresh_count, "mention": fresh_mention,
                 "academic": academic_on, "academic_why": academic_why}
 

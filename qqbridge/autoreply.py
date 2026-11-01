@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from collections import deque
 
 from . import academic
 from .agent import clean_reply, escape_cq, render_text
+from .textnorm import tidy_outgoing
 from .config import config
 
 log = logging.getLogger("qqbridge.autoreply")
@@ -55,7 +57,8 @@ class AutoReply:
                  agent_timeout: float = 90.0, settle_seconds: float = 3.0,
                  max_batch_age: float = 45.0, batch_limit: int = 200,
                  context_size: int = 40, context_max_age: float = 300.0,
-                 max_backlog_age: float = 120.0, max_concurrent_tasks: int = 2):
+                 max_backlog_age: float = 120.0, max_concurrent_tasks: int = 2,
+                 multi_send_gap: float = 1.2):
         self.bus = bus
         self.store = store
         self.agent = agent
@@ -74,6 +77,8 @@ class AutoReply:
         # 上下文除了「最近多少条」，还限「最近多少秒」—— 只看条数时，群里一慢下来
         # 40 条能横跨好几小时，模型就会拿着几小时前的语境去接现在的话。
         self.context_max_age = context_max_age
+        # 分多条发时，条与条之间停一下。一次全发完特别机械。
+        self.multi_send_gap = multi_send_gap
         # 积压太久就丢掉，只接最近的：回一条三分钟前的消息比不回更糟。
         self.max_backlog_age = max_backlog_age
         # 派活的 agent loop 可能跑满 agent_timeout，绝不能堵着接话循环。
@@ -236,12 +241,28 @@ class AutoReply:
             log.warning("干活失败：%s", exc)
             return ""
 
-    async def _send(self, target: dict, gid: str, reply: str, reason: str):
+    async def _send(self, target: dict, gid: str, replies, reason: str):
+        """发到群里。replies 可以是字符串，也可以是「分几次发」的列表。
+
+        多条之间要真的隔开：一条一条蹦出来才像人在打字，
+        一次性连发三条反而更像程序在吐数据。
+        """
+        raw = [replies] if isinstance(replies, str) else list(replies or [])
+        parts = [tidy_outgoing(p) for p in raw]
+        parts = [p for p in parts if p]
+        # 单条仍可能超过服务端上限（学术模式的长回答），继续按段落切
+        chunks: list[str] = []
+        for p in parts:
+            chunks.extend(split_message(p) if len(p) > SEND_CHUNK else [p])
+        if not chunks:
+            return
+        reply = "\n".join(chunks)
         try:
             private = target.get("message_type") == "private" or not target.get("group_id")
-            # 学术模式的答案可能几千字，QQ 单条消息塞不下 —— 按段落切成几条发。
-            chunks = split_message(reply) if len(reply) > SEND_CHUNK else [reply]
-            for part in chunks:
+            for i, part in enumerate(chunks):
+                if i:
+                    # 补一句的停顿：固定间隔 + 一点随机，别让节奏太齐整
+                    await asyncio.sleep(self.multi_send_gap + random.uniform(0.0, 0.8))
                 # **出去之前必须转义 CQ 码。** 正文是模型产的，而模型又受群消息影响：
                 # 群友只要诱导它输出 "[CQ:at,qq=all]" 就能全员轰炸，或者塞一个
                 # [CQ:image,file=...] 绕过发图审核。转义之后这些只会按字面显示。
@@ -251,13 +272,12 @@ class AutoReply:
                                         message=safe_part)
                 else:
                     await self.bot.call("send_group_msg", group_id=int(gid), message=safe_part)
-                if len(chunks) > 1:
-                    await asyncio.sleep(0.4)   # 连发别把服务端刷爆
-            self._sent.append(time.time())
+                self._sent.append(time.time())      # 每一条都计入限流
             self.bus.note_own_send()
             self.agent.note_own(gid, reply)
             self.store.audit("auto", "auto_reply", gid,
-                             {"reply": reply, "reason": reason}, "SUCCEEDED")
+                             {"replies": chunks, "reason": reason,
+                              "parts": len(chunks)}, "SUCCEEDED")
             self.last_action = f"回复 {gid}: {reply[:40]}"
             log.info("autoreply: %s -> %s", gid, reply[:60])
         except Exception as exc:
@@ -293,7 +313,28 @@ class AutoReply:
         return self.FORCED_FALLBACK
 
     async def _tick(self):
-        """批量接话：隔一会儿扫一眼整段，而不是一条一条地接。
+        """按会话分桶，一群一段，各处理各的。
+
+        以前是把**所有群**的未读揉成一个批次：上下文取的是全局最近 N 条，
+        于是 A 群的梗会混进 B 群的判断，回复还发给最后一条所在的那个群。
+        现在每个群一份独立会话，水位线也各记各的。
+        """
+        if not self.agent or not self.agent.llm.configured:
+            return
+        buckets = self.bus.unseen_by_key(limit=self.batch_limit)
+        for key, fresh in buckets.items():
+            if not fresh:
+                continue
+            try:
+                await self._tick_session(key, fresh)
+            except Exception:
+                self.errors += 1
+                log.exception("会话 %s 处理失败，跳过（不影响其它群）", key)
+
+    async def _tick_session(self, key: str, fresh: list):
+        """单个会话的一段未读消息。
+
+        批量接话：隔一会儿扫一眼整段，而不是一条一条地接。
 
         以前是按条处理 —— 取 pending[0]，处理完把游标推到它的 id。
         那一套带来两个问题：一是「跳着处理会把中间的消息一起划掉」这类游标 bug，
@@ -304,13 +345,6 @@ class AutoReply:
         处理完整批才推进标记。标记只会落在「模型真的看过的那条」上，
         结构上就不可能跳读。
         """
-        if not self.agent or not self.agent.llm.configured:
-            return
-
-        fresh = self.bus.unseen(limit=self.batch_limit)
-        if not fresh:
-            return
-
         # 积压太久就丢掉旧的，只接最近的。
         # 上游一旦卡住（agent 跑满超时、模型变慢），积压会一直涨；等轮到某条时
         # 它已经是几分钟前的了 —— 回一条三分钟前的消息，比不回更像坏了。
@@ -341,7 +375,7 @@ class AutoReply:
                 # 于是整个接话循环停摆 90 秒，闲聊全排队，等轮到已经滞后好几分钟
                 # （实测 162 秒）。并发满时 _spawn_task 会排队，不再直接丢。
                 scheduled = self._spawn_task(ev)
-                self.bus.mark_looked(fresh[-1]["id"])
+                self.bus.mark_looked(fresh[-1]["id"], key)
                 if not scheduled:
                     # 连等待队列都满了（极端积压）。水位线已经推进，所以不会重试，
                     # 那就必须明确回一句 —— 否则用户等一个永远不会来的回复。
@@ -367,7 +401,7 @@ class AutoReply:
 
         through = fresh[-1]["id"]
         try:
-            decided = await self._compose(fresh)
+            decided = await self._compose(fresh, key)
         except Exception as exc:
             self.errors += 1
             log.exception("autoreply tick failed")
@@ -379,7 +413,7 @@ class AutoReply:
                 self.store.audit("auto", "auto_skip", str(through),
                                  {"error": str(exc)[:200],
                                   "tries": self._fail_count[through]}, "SKIPPED")
-                self.bus.mark_looked(through)
+                self.bus.mark_looked(through, key)
                 self._fail_count.pop(through, None)
             return
         self._fail_count.pop(through, None)
@@ -387,33 +421,40 @@ class AutoReply:
 
         target = fresh[-1]
         gid = target.get("group_id") or target.get("user_id") or ""
-        reply = decided.get("reply") or ""
+        # 模型可以一次给多条，交给 _send 分几次发出去
+        replies = list(decided.get("replies") or [])
+        if not replies and decided.get("reply"):
+            replies = [decided["reply"]]
 
         # 发送前最后一道净化：不管哪条路径产出的，看着像 JSON 就在这儿拦下
-        if reply:
-            reply, how = clean_reply(reply)
-            if not reply:
-                log.warning("发送前净化：输出被判定为不可发送（%s），改判沉默", how)
+        cleaned: list[str] = []
+        for part in replies:
+            text, how = clean_reply(part)
+            if text:
+                cleaned.append(text)
+            else:
+                log.warning("发送前净化：输出被判定为不可发送（%s），丢弃这一条", how)
+        replies = cleaned
 
         # 被 @ 就必须有回音：模型沉默、解析失败、超时、干活链路报错，统统兜底。
         # 被点名还一声不吭，用户只会以为机器人死了。
-        if not reply and has_mention:
-            reply = await self._forced_reply(target)
+        if not replies and has_mention:
+            replies = [await self._forced_reply(target)]
             decided["reason"] = ((decided.get("reason") or "") + " ← @ 兜底").strip()
 
         why = decided.get("reason") or ""
         if decided.get("academic"):
             why = f"[学术:{decided.get('academic_why') or ''}] " + why
-        if reply:
-            await self._send(target, gid, reply, why)
+        if replies:
+            await self._send(target, gid, replies, why)
         else:
             self.last_action = f"沉默（{why[:40]}）"
             self.store.audit("auto", "auto_silent", gid,
                              {"reason": why,
                               "academic": bool(decided.get("academic")),
                               "batch": len(fresh)}, "SUCCEEDED")
-        # 整批处理完才推进，而且推进到「模型真的看过的那条」
-        self.bus.mark_looked(through)
+        # 整批处理完才推进，而且只推进这个会话自己的水位线
+        self.bus.mark_looked(through, key)
 
     @staticmethod
     def _wants_agent(ev: dict) -> bool:
@@ -481,8 +522,8 @@ class AutoReply:
         who = ev.get("sender") or ev.get("user_id") or "?"
         convo = "\n".join(
             ("我" if x.get("is_self") else (x.get("sender") or "?")) + "：" + render_text(x)
-            for x in self.bus.context(self.context_size,
-                                       max_age=self.context_max_age)[-12:])
+            for x in self.bus.context(self.context_size, max_age=self.context_max_age,
+                                       key=gid)[-12:])
         task = (
             f"群 {gid} · {who} 对你说：{render_text(ev)}\n\n"
             f"【最近的对话，供你理解在聊什么】\n{convo}\n\n"
@@ -503,9 +544,12 @@ class AutoReply:
             self.store.audit("auto", "auto_silent", gid,
                              {"reason": "agent 直派，无输出"}, "SUCCEEDED")
 
-    async def _compose(self, fresh: list) -> dict:
-        """闲聊的批量决策。派活不走这里，见 _wants_agent / _handle_task。"""
+    async def _compose(self, fresh: list, key: str) -> dict:
+        """闲聊的批量决策。派活不走这里，见 _wants_agent / _handle_task。
+
+        上下文**只取这个会话的** —— A 群的对话不能出现在 B 群的判断里。
+        """
         for ev in fresh:
             self.agent.observe(ev)
-        batch = self.bus.context(self.context_size, max_age=self.context_max_age)
+        batch = self.bus.context(self.context_size, max_age=self.context_max_age, key=key)
         return await self.agent.decide_batch(batch, fresh_from=fresh[0]["id"] - 1)
