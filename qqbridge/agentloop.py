@@ -32,13 +32,18 @@ class AgentLoop:
                 "root": str(getattr(self.tools, "root", ""))}
 
     async def run(self, system: str, task: str, *, history: list[dict] | None = None,
-                  max_tokens: int | None = None) -> dict:
+                  max_tokens: int | None = None, tools=None) -> dict:
         """跑一次完整的工具循环，返回 {text, steps, tool_calls, log}。
 
         max_tokens 会在每一步都生效 —— 学术模式要放开长度，普通派活仍然沿用默认值。
+
+        tools 可以传一份**本轮专用的副本**（见 LocalTools.for_target）。默认用
+        self.tools。这一条是并发安全的关键：目标会话不能放在共享实例上，
+        否则两个后台任务会互相覆盖 target_group，把操作打到别的群。
         """
         if not self.llm.configured:
             raise LLMError("模型未配置：无法运行内置 Agent。")
+        tl = tools if tools is not None else self.tools
         messages: list[dict] = [{"role": "system", "content": system}]
         if history:
             messages.extend(history[-20:])
@@ -49,7 +54,7 @@ class AgentLoop:
         fail_seen: dict = {}       # 同一个调用反复失败就别再耗步数了
         for step in range(1, self.max_steps + 1):
             self.steps += 1
-            out = await self.llm.chat(messages, tools=self.tools.schemas(),
+            out = await self.llm.chat(messages, tools=tl.schemas(),
                                       max_tokens=max_tokens)
             calls = out.get("tool_calls") or []
             text = out.get("text") or ""
@@ -71,7 +76,7 @@ class AgentLoop:
                     args = {}
                 try:
                     # 走 async 分发：阻塞工具在线程池里跑，不卡事件循环
-                    result = await self.tools.dispatch_async(name, args)
+                    result = await tl.dispatch_async(name, args)
                     ok = True
                 except Exception as exc:
                     result = {"error": str(exc)[:300]}

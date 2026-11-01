@@ -87,7 +87,8 @@ class ScriptLLM:
     def __init__(self, script):
         self.script = list(script)
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, *, max_tokens=None, temperature=None):
+        # agentloop 现在会按次传 max_tokens（学术模式要放开长度），fake 得跟上。
         return self.script.pop(0) if self.script else {"text": ""}
 
 

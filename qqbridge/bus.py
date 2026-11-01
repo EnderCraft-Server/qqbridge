@@ -27,13 +27,24 @@ class EventBus:
         # An external poller keeps its own monotonic cursor and sees every
         # new id as "already processed", and silently stops waking anyone until it is restarted.
         self._store = store
-        # Seed from persisted state; on the first run after an upgrade, fall back to the highest
-        # event id already in the message log so the sequence never steps backwards even once.
+        # 事件 id：只用于展示/审计/外部 poller 的游标，**不再承担"处理到哪了"的职责**。
         self._seq_value = max(self._load_int("bus.seq", 0), self._seed_from_history())
         self._seq = itertools.count(self._seq_value + 1)
         if self._seq_value:
             self._save_int("bus.seq", self._seq_value)
-        self._processed = self._load_int("bus.cursor", 0)   # cursor: highest id handed to the model
+
+        # ---------- 已处理水位线：时间戳，不是 id 游标 ----------
+        # 为什么弃用 id 游标：它是单调的 max()，而且会被持久化。任何一次
+        # mark_processed(大数) —— 模型编一个、或者把别的数字当参数传进来 ——
+        # 都会把水位推到未来永远够不到的地方，同时清空队列，然后**永久静默**：
+        # 读接口一切正常，机器人再也不说话，重启也救不回来（实测复现过）。
+        #
+        # 换成时间戳之后，结构上就堵死了这条路：
+        #   1) 水位只能推到**缓冲里真实存在的那条消息**的时间上，推不过去；
+        #   2) push 保证 at 严格递增且互不相同，所以不存在并列导致的漏看/重看。
+        self._seen_at = self._load_float("bus.seen_at", 0.0)
+        self._last_ts = 0.0          # 上一个事件的 at，用来保证严格递增
+
         self._last_own_send = 0.0
         self.cooldown = cooldown_seconds
         self.self_id = self_id
@@ -42,9 +53,9 @@ class EventBus:
         self.watch_groups = set(str(g) for g in (watch_groups or []))
         # 运行时控制（/stop 挂起）。为 None 时视为不暂停。
         self.control = control
-        self._pending_high: list = []   # @me
-        self._pending_mid: list = []    # keyword hits
-        self._pending_low: list = []    # cooldown chatter
+        # 注：原来的 _pending_high/mid/low 三个 id 列表已删除。
+        # 它们只增不减（被挤出环形缓冲的 id 永远留在里面），
+        # 而且优先级完全可以从事件自身算出来 —— 没必要维护一份会腐烂的副本。
 
     # ---------- durable state ----------
     def _load_int(self, key: str, default: int = 0) -> int:
@@ -67,6 +78,18 @@ class EventBus:
     def _save_int(self, key: str, value: int) -> None:
         if self._store is not None:
             self._store.set_state(key, int(value))
+
+    def _load_float(self, key: str, default: float = 0.0) -> float:
+        if self._store is None:
+            return default
+        try:
+            return max(0.0, float(self._store.get_state(key, default)))
+        except (TypeError, ValueError):
+            return default
+
+    def _save_float(self, key: str, value: float) -> None:
+        if self._store is not None:
+            self._store.set_state(key, float(value))
 
     def _next_id(self) -> int:
         """Allocate the next event id, durably, so ids never repeat across restarts."""
@@ -103,9 +126,17 @@ class EventBus:
 
         sender = event.get("sender") or {}
         topic = str(event.get("message_type") or "group")
+        # at 必须**严格递增且互不相同**：水位线是时间戳，要是两条撞上同一个值，
+        # 用 > 比较就会漏掉其中一条。time.time() 在 Windows 上分辨率不够，
+        # 所以显式兜一下。
+        now = time.time()
+        with self._lock:
+            if now <= self._last_ts:
+                now = self._last_ts + 1e-6
+            self._last_ts = now
         record = {
             "id": self._next_id(),
-            "at": time.time(),
+            "at": now,
             "platform": "qq",
             "message_type": topic,
             "group_id": str(event.get("group_id") or ""),
@@ -131,14 +162,8 @@ class EventBus:
                     log.warning("环形缓冲已满（%d），累计挤掉 %d 条；完整历史在 SQLite 里",
                                 self._events.maxlen, self._dropped)
             self._events.append(record)
-            paused = bool(self.control) and self.control.paused()
-            if not record["is_self"] and not paused:
-                if record["mentions_me"]:
-                    self._pending_high.append(record["id"])
-                elif hit:
-                    self._pending_mid.append(record["id"])
-                elif self.cooldown and (time.time() - self._last_own_send) > self.cooldown:
-                    self._pending_low.append(record["id"])
+            # 不再往 _pending_* 里塞 id：待处理与否完全由「at > 水位线」决定，
+            # 优先级从事件字段现算。少一份会腐烂的副本，就少一类不一致。
         return record
 
     def note_own_send(self):
@@ -171,7 +196,7 @@ class EventBus:
                 if self.watch_groups and gid not in self.watch_groups \
                         and rec.get("message_type") == "group":
                     continue
-                if eid > self._processed:
+                if rec.get("at", 0) > self._seen_at:
                     unprocessed += 1
                 added.append(rec)
                 have.add(eid)
@@ -181,15 +206,12 @@ class EventBus:
                 merged = sorted(list(self._events) + added, key=lambda r: r.get("id") or 0)
                 self._events.clear()
                 self._events.extend(merged[-self._events.maxlen:])
-            newest = max(have) if have else 0
-            if newest > self._processed:
-                self._processed = newest
-                self._save_int("bus.cursor", newest)
-                # 和 mark_processed 一样顺手把队列里过期的清掉，
-                # 否则 pending() 还会把游标之后已经作废的 id 报出来
-                self._pending_high = [i for i in self._pending_high if i > newest]
-                self._pending_mid = [i for i in self._pending_mid if i > newest]
-                self._pending_low = [i for i in self._pending_low if i > newest]
+            # 回填的历史一律"已看过"：重启后去回一条几小时前的消息，
+            # 比漏掉它更奇怪。水位线推到最新那条历史的时间即可。
+            newest_at = max((r.get("at") or 0.0) for r in self._events) if self._events else 0.0
+            if newest_at > self._seen_at:
+                self._seen_at = newest_at
+                self._save_float("bus.seen_at", newest_at)
         if added:
             log.info("启动回填 %d 条历史消息到控制台缓冲%s", len(added),
                      f"，其中 {unprocessed} 条是上次没处理完的（只展示、不补回）"
@@ -198,14 +220,14 @@ class EventBus:
 
     # ---------- 批量视图（接话循环用这个，不再按条取） ----------
     def unseen(self, limit: int = 200) -> list:
-        """上次「看过」之后新来的消息，按 id 升序。
+        """水位线之后新来的消息，按时间升序。
 
         这是接话循环唯一的时间线：一次拿到一整段，而不是一条一条地取。
         不包含自己的发言 —— 自己说的不用回。
         """
         with self._lock:
-            cut = self._processed
-            return [e for e in self._events if e["id"] > cut and not e["is_self"]][:limit]
+            cut = self._seen_at
+            return [e for e in self._events if e["at"] > cut and not e["is_self"]][:limit]
 
     def context(self, limit: int = 40, max_age: float = 0.0) -> list:
         """给模型看的上下文：最近 limit 条（**含自己说过的话**），按 id 升序。
@@ -225,22 +247,35 @@ class EventBus:
             events = fresh_ev or events
         return events[-limit:]
 
-    def mark_looked(self, through_id: int) -> int:
-        """整段处理完之后推进「已看过」标记。
+    def mark_seen_at(self, through_at: float) -> float:
+        """把水位线推到 through_at —— **永远不会超过缓冲里最新那条的时间**。
 
-        和 mark_processed 的区别在语义：批处理模式下，标记之内 = 都喂给模型看过了，
-        所以不存在「跳读」，也就不该报 skip 警告。
-        调用点只有一个：_tick 处理完这一整批之后，推进到这批的最后一条。
-        推进位置永远等于「模型真的看过的那条」，不可能越过没看过的消息。
+        这是整套机制的安全阀。以前是 `self._processed = max(_, through_id)`，
+        没有任何上界，于是一个编出来的大 id 就能把水位推到未来、
+        顺手清空队列、还持久化下来 —— 机器人从此永久静默。
+        现在就算传进来一个荒谬的值，也只会被钳到"最新收到的那条"为止，
+        最多是让当前这批不需要再回了，绝不会吃掉还没到的消息。
         """
-        through_id = int(through_id)
         with self._lock:
-            self._processed = max(self._processed, through_id)
-            self._pending_high = [i for i in self._pending_high if i > through_id]
-            self._pending_mid = [i for i in self._pending_mid if i > through_id]
-            self._pending_low = [i for i in self._pending_low if i > through_id]
-            self._save_int("bus.cursor", self._processed)
-            return self._processed
+            newest = max((e["at"] for e in self._events), default=0.0)
+            target = min(float(through_at), newest)
+            if target > self._seen_at:
+                self._seen_at = target
+                self._save_float("bus.seen_at", self._seen_at)
+            return self._seen_at
+
+    def mark_looked(self, through_id: int) -> float:
+        """按事件 id 推进水位线（批处理路径用）。
+
+        **id 找不到就什么都不做** —— 这是关键：调用方拿到的 id 一定来自
+        poll_events / unseen，所以正常路径必然找得到；找不到说明那个 id 是编的，
+        这时唯一正确的反应是不动，而不是"大概推到那儿吧"。
+        """
+        rec = self._get(int(through_id))
+        if rec is None:
+            log.warning("mark_looked(%s)：缓冲里没有这个 id，水位线不动", through_id)
+            return self._seen_at
+        return self.mark_seen_at(rec["at"])
 
     # ---------- read ----------
     def _get(self, event_id: int) -> dict | None:
@@ -252,14 +287,21 @@ class EventBus:
     def status(self) -> dict:
         with self._lock:
             events = list(self._events)
-            high = list(self._pending_high)
-            mid = list(self._pending_mid)
-            low = list(self._pending_low)
+            unseen = [e for e in events if e["at"] > self._seen_at and not e["is_self"]]
+            # 优先级现算，不再依赖一份会腐烂的 id 列表
+            high = [e for e in unseen if e.get("mentions_me")]
+            mid = [e for e in unseen if not e.get("mentions_me") and e.get("keyword_hit")]
+            low = [e for e in unseen if not e.get("mentions_me") and not e.get("keyword_hit")]
+            seen_at = self._seen_at
         return {
             "stored": len(events),
             "last_id": events[-1]["id"] if events else 0,
-            "cursor": self._processed,
-            "pending_total": len(high) + len(mid) + len(low),
+            # 兼容字段：报水位线处那条事件的 id（没有就是 0）。
+            # 真正的"处理到哪了"现在是 seen_at（时间戳）。
+            "cursor": next((e["id"] for e in reversed(events) if e["at"] <= seen_at), 0),
+            "seen_at": seen_at,
+            "last_at": events[-1]["at"] if events else 0.0,
+            "pending_total": len(unseen),
             "dropped": self._dropped,
             "pending_high": len(high),
             "pending_mid": len(mid),
@@ -272,18 +314,20 @@ class EventBus:
         }
 
     def pending(self, include_low: bool = True, limit: int = 50) -> list:
-        """Return unprocessed events; never blocks."""
+        """水位线之后、值得处理的事件；非阻塞。
+
+        优先级（@ > 关键词 > 普通闲聊）现算，并且**总是包含自己发言**，
+        调用方（poll_events）自己按需要过滤 —— 这一点和以前一致。
+        include_low=False 时只给高/中优先级。
+        """
         with self._lock:
-            ids = list(self._pending_high) + list(self._pending_mid)
-            if include_low:
-                ids += list(self._pending_low)
-            ids = ids[:limit]
-        out = []
-        for i in ids:
-            rec = self._get(i)
-            if rec:
-                out.append(rec)
-        return out
+            cut = self._seen_at
+            events = [e for e in self._events if e["at"] > cut]
+        high = [e for e in events if e.get("mentions_me")]
+        mid = [e for e in events if not e.get("mentions_me") and e.get("keyword_hit")]
+        low = [e for e in events if not e.get("mentions_me") and not e.get("keyword_hit")]
+        out = high + mid + (low if include_low else [])
+        return out[:max(0, int(limit))]
 
     def since(self, cursor: int = 0, limit: int = 100, include_low: bool = True) -> list:
         """**纯读**：返回 id > cursor 的事件。include_low=False 时只给"值得处理"的。
@@ -293,25 +337,22 @@ class EventBus:
         with self._lock:
             events = [e for e in self._events if e["id"] > cursor]
         if not include_low:
-            with self._lock:
-                worth = set(self._pending_high) | set(self._pending_mid)
-            events = [e for e in events if e["id"] in worth or e["is_self"]]
+            events = [e for e in events
+                      if e.get("mentions_me") or e.get("keyword_hit") or e["is_self"]]
         return events[:limit]
 
-    def mark_processed(self, through_id: int) -> int:
-        """推进游标。只进不退；跳过尚未处理的事件会在日志里留警告。"""
-        through_id = int(through_id)
-        with self._lock:
-            # 严格小于 through_id 才算「被跳过」——through_id 正是这条刚处理完的事件，
-            # 用 <= 会把它自己也列进去，日志里就成了「跳过了 1 条：[它自己]」的假警报
-            skipped = [i for i in (self._pending_high + self._pending_mid + self._pending_low)
-                       if self._processed < i < through_id]
-            if skipped:
-                log.warning("mark_processed(%d) 跳过了 %d 条未处理事件：%s",
-                            through_id, len(skipped), skipped[:10])
-            self._processed = max(self._processed, through_id)
-            self._pending_high = [i for i in self._pending_high if i > through_id]
-            self._pending_mid = [i for i in self._pending_mid if i > through_id]
-            self._pending_low = [i for i in self._pending_low if i > through_id]
-            self._save_int("bus.cursor", self._processed)
-            return self._processed
+    def mark_processed(self, through_id: int) -> float:
+        """按事件 id 推进水位线（MCP poll_events 那条路径用）。
+
+        **找不到这个 id 就什么都不做。** 这是弃用 id 游标之后的核心保证：
+        以前 `max(processed, through_id)` 没有任何上界，编一个 99999999 就能
+        把水位推到未来、清空队列、再持久化 —— 机器人从此永远收不到消息，
+        连重启都救不回来（实测复现过）。
+        现在水位只能落在**缓冲里真实存在的那条消息**上，编的 id 找不到就直接忽略。
+        """
+        rec = self._get(int(through_id))
+        if rec is None:
+            log.warning("mark_processed(%s)：缓冲里没有这个 id，水位线不动"
+                        "（编造/过期的 id 不再能推高水位）", through_id)
+            return self._seen_at
+        return self.mark_seen_at(rec["at"])

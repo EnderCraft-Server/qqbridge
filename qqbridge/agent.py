@@ -371,6 +371,39 @@ CQ_LABEL = [
 ]
 
 
+# ---------- CQ 码防护 ----------
+# OneBot 收到字符串 message 就会解析里面的 [CQ:xxx] 段。而我们的正文来自模型，
+# 模型又受群消息影响 —— 等于**群友可以间接让机器人发出任意 CQ 码**：
+#   caption = "[CQ:at,qq=all] 快来"        -> 全员轰炸
+#   image = "https://a/x.png] [CQ:image,file=http://127.0.0.1:5700/b"
+#     -> 第一张过了审核，第二张完全没过审核、也没做 SSRF 校验就一起发出去了
+# 所以：正文一律转义；确实要发 CQ 码的地方（发图）自己拼，并且把参数卡死。
+_CQ_ESCAPE = (("&", "&amp;"), ("[", "&#91;"), ("]", "&#93;"))
+
+
+def escape_cq(text: str) -> str:
+    """转义正文里的 CQ 码分隔符，让它按字面显示而不是被当成指令。
+
+    顺序不能反：& 必须最先换，否则会把后面替换出来的 &#91; 再转一遍。
+    """
+    out = str(text or "")
+    for ch, rep in _CQ_ESCAPE:
+        out = out.replace(ch, rep)
+    return out
+
+
+def is_safe_cq_param(value: str) -> bool:
+    """能不能安全地塞进 CQ 码的参数位。
+
+    任何能提前闭合 CQ 码的字符（[ ] & ,）一律不接受 —— 不接受就拒绝发送，
+    而不是"清洗一下凑合用"，因为清洗过的 URL 多半已经不是原来那张图了。
+    """
+    v = str(value or "")
+    if not v or any(c in v for c in "[]&,") or any(c in v for c in " \t\r\n"):
+        return False
+    return True
+
+
 def render_text(ev: dict) -> str:
     """把一条消息渲染成给模型看的文本。
 

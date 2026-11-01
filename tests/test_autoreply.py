@@ -30,7 +30,7 @@ class FakeLLM:
         self.replies = list(replies)
         self.calls = []
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, *, max_tokens=None, temperature=None):
         self.calls.append(messages)
         return {"text": self.replies.pop(0) if self.replies else ""}
 
@@ -58,7 +58,8 @@ class FakeBus:
     def unseen(self, limit=200):
         return [e for e in self.events if e["id"] > self.looked and not e.get("is_self")][:limit]
 
-    def context(self, limit=40):
+    def context(self, limit=40, max_age=0.0):
+        # bus.context 现在多了按时间收窄的 max_age，签名要对齐
         return list(self.events)[-limit:]
 
     def mark_looked(self, through_id):
@@ -93,9 +94,13 @@ class FakeAgentLoop:
     def __init__(self, text="干完了"):
         self.text = text
         self.tasks = []
+        self.targets = []          # 每轮 tools 副本上的 target_group
 
-    async def run(self, system, task, history=None):
+    async def run(self, system, task, history=None, max_tokens=None, tools=None):
+        # agentloop.run 现在接受 max_tokens（学术模式）和 tools（每轮独立的目标会话），
+        # fake 要对齐；顺便记下这一轮拿到的会话，好断言没有串群。
         self.tasks.append(task)
+        self.targets.append(getattr(tools, "target_group", None))
         return {"text": self.text, "steps": 1, "tool_calls": []}
 
 
@@ -116,7 +121,16 @@ def run(events, replies, *, agent_text="干完了", agent_loop=None):
     loop = agent_loop if agent_loop is not None else FakeAgentLoop(agent_text)
     ar = AutoReply(bus, store, agent, bot, FakeControl(), enabled=True,
                    agent_loop=loop, settle_seconds=0, max_batch_age=0)
-    asyncio.run(ar._tick())
+
+    async def go():
+        await ar._tick()
+        # _tick 现在把派活**扔后台**，不再 await（否则 agent loop 最长 90 秒
+        # 会把整个接话循环堵死，实测滞后到 162 秒）。测试要显式等它跑完，
+        # 否则 asyncio.run 一收尾就把后台任务连同事件循环一起取消了。
+        if ar._bg_tasks:
+            await asyncio.gather(*list(ar._bg_tasks), return_exceptions=True)
+
+    asyncio.run(go())
     return llm, store, bot, bus, loop
 
 

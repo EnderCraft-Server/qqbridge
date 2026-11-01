@@ -1,10 +1,58 @@
 """Configuration loaded from .env next to the project root."""
+import logging
 import os
+import secrets
 from pathlib import Path
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
+
+
+# 这些值等同于「没配」：曾经的默认值和常见占位符。
+_WEAK_TOKENS = {
+    "", "change-me", "changeme", "change_me", "default", "token",
+    "password", "123456", "admin", "secret", "your-token", "xxx",
+}
+
+
+def _resolve_mcp_token() -> str:
+    """取 MCP 令牌；缺失或用了弱默认值时，生成一个并落盘到旁边的小文件。
+
+    为什么不改 .env：
+    这里是 import 时期运行的。在这里重写 .env 等于让"导入模块"这个动作
+    去改用户的生产配置，而且会把原来的令牌覆盖掉。
+    我自己就在这上面踩了一次：一个测试进程把 .env 里的 MCP_TOKEN 换成了新的，
+    而 DSH 那边配的还是旧令牌 —— MCP 连接直接断掉。配置文件不能被库里的代码偷偷改。
+
+    为什么不直接拒绝启动：那会把「没配 token」变成「服务起不来」，
+    对已经跑着的部署是硬中断。
+    """
+    raw = (os.environ.get("MCP_TOKEN") or "").strip()
+    if raw and raw.lower() not in _WEAK_TOKENS:
+        return raw
+
+    # 侧车文件：不碰 .env，但重启后令牌不变（否则 MCP 客户端每次都要重配）
+    side = ROOT / "data" / ".mcp_token"
+    try:
+        if side.is_file():
+            saved = side.read_text(encoding="utf-8").strip()
+            if saved and saved.lower() not in _WEAK_TOKENS:
+                return saved
+    except OSError:
+        pass
+
+    new = secrets.token_urlsafe(32)
+    try:
+        side.parent.mkdir(parents=True, exist_ok=True)
+        side.write_text(new, encoding="utf-8")
+        logging.getLogger(__name__).warning(
+            "MCP_TOKEN 没配或用了弱默认值；已生成随机令牌存到 %s。"
+            "请把它填到 .env 的 MCP_TOKEN，并同步到 MCP 客户端。", side)
+    except OSError:
+        logging.getLogger(__name__).warning(
+            "MCP_TOKEN 没配，随机生成了一份仅本次进程有效的令牌。")
+    return new
 
 
 def _bool(name: str, default: bool = False) -> bool:
@@ -51,7 +99,11 @@ class Config:
         self.allow_manage = _bool("ALLOW_MANAGE", False)
         self.owners = owners()
         self.admins = admins() or self.owners
-        self.mcp_token = (os.environ.get("MCP_TOKEN") or "").strip() or "change-me"
+        # MCP / 控制台共用令牌。**绝不能有众所周知的默认值** ——
+        # 原来这里回退成 "change-me"，而它同时是控制台会话令牌和 MCP bearer：
+        # 谁都能拿它改 OWNER_IDS / ALLOW_SEND / ALLOW_MANAGE、重写 LLM key、派 agent。
+        # 没配就现生成一个强随机值并落盘，同时告警。
+        self.mcp_token = _resolve_mcp_token()
         # 自带模型
         self.llm_api_base = (os.environ.get("LLM_API_BASE") or "https://api.deepseek.com").rstrip("/")
         self.llm_api_key = (os.environ.get("LLM_API_KEY") or os.environ.get("DEEPSEEK_API_KEY") or "").strip()

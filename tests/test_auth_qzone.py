@@ -43,7 +43,7 @@ ok.append("Auth: 初始化/登录/登出/改密 全部正确")
 # ---- QzoneAuto ----
 class FakeLLM:
     configured = True
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, *, max_tokens=None, temperature=None):
         return {"text": "  今天服务器又崩了一次，重启完发现是我自己改坏的。  "}
 
 sent = []
