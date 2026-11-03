@@ -4,6 +4,20 @@ data/
 *.log
 *.log.err
 
+# 内置 Agent 在仓库根目录留下的抓取/调试产物。
+# 2026-11-03：这批文件曾经被 git add -A 一起提交上去（含一个测试 sqlite），
+# 已经用 filter-branch 从历史里清掉，这里补上规则别再犯。
+_h6/
+login.html
+pi_*.txt
+bing*.html
+out.html
+t.html
+gh_code.json
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
 # Python
 __pycache__/
 *.py[cod]
