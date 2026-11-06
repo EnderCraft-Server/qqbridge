@@ -252,6 +252,14 @@ assert clean_reply('{"reply": "hi", ') == ("", "failed")
 assert tidy_plain("a  \n\n\n\nb") == "a\n\nb"
 ok.append("多行纯文本完整保留、坏 JSON 依旧沉默")
 
+# Regression: a truncated model reply must degrade to silence, not crash the batch.
+# decide_batch used to leave `parts` unbound on the "failed" parse path, so the very
+# case the five-level fallback exists for raised UnboundLocalError instead.
+llm, store, bot, bus, _ = run([ev(1, "在吗")], ['{"replies": ["半截", '])
+assert not bot.msgs, bot.msgs
+assert store.states("auto_silent"), "坏 JSON 应当记 auto_silent"
+assert not store.states("auto_reply")
+ok.append("模型输出坏 JSON -> 安静地判沉默，不会崩（回归）")
 
 print("\n".join("PASS  " + x for x in ok))
 print("ALL PASS")

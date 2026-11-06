@@ -229,6 +229,10 @@ class QqAgent:
         raw = out.get("text") or ""
         data, how = parse_decision(raw)
         reply, reason = "", ""
+        # Must be initialised up front: the "failed" branch below skips the splitting
+        # entirely, and the counters/return at the end still read it. Without this a
+        # truncated model reply raised UnboundLocalError instead of degrading to silence.
+        parts: list = []
         if how == "failed":
             log.warning("decide_batch: 输出解析失败，改判沉默。原文前 200 字：%s", raw[:200])
             if self.store:

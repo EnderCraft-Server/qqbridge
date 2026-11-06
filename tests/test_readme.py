@@ -106,7 +106,7 @@ assert not missing_tests, f"README 列了不存在的测试脚本：{missing_tes
 # Both directions are checked: no phantom scripts in the README, no unlisted ones in tests/.
 # Files only: running py_compile drops a tests/__pycache__ directory here, and a bare
 # glob("*") would then report it as an "unlisted script" and fail for no real reason.
-on_disk = {p.name for p in (ROOT / "tests").glob("*")}
+on_disk = {p.name for p in (ROOT / "tests").iterdir() if p.is_file()}
 not_listed = sorted(on_disk - {Path(s).name for s in scripts})
 assert not not_listed, f"tests/ 里有脚本但 README 没列：{not_listed}"
 ok.append("「测试」一节与 tests/ 目录一致：" + " ".join(Path(s).name for s in scripts))
