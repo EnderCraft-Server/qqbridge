@@ -1,12 +1,14 @@
-"""内置 Agent 的本地工具集：读写文件、列目录、跑命令、搜索。
+"""Local toolset for the built-in agent: read/write files, list dirs, run commands, search.
 
-**所有读取与写入都会打印到日志并记入审计表** —— 这是硬要求：
-`data/agent.log` 逐行记录 时间 / 动作 / 路径 / 结果 / 字节数。
+**Every read and write is printed to the log and recorded in the audit table** — this is a
+hard requirement: `data/agent.log` records, one per line, the time / action / path / result /
+byte count.
 
-安全边界：
-- 文件操作被限制在 workspace 根目录内（可配置），越界直接拒绝
-- 命令有黑名单（格式化、关机、删盘之类）
-- 每次调用都有大小/条数上限，避免一次读爆内存
+Safety boundaries:
+- File operations are confined to the workspace root (configurable); anything outside is
+  rejected outright
+- Commands go through a blacklist (formatting, shutdown, disk wiping, and the like)
+- Every call has a size/count cap, so a single call cannot blow up memory
 """
 from __future__ import annotations
 
@@ -31,35 +33,36 @@ MAX_READ_BYTES = 256 * 1024
 MAX_WRITE_BYTES = 1024 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024
 MAX_FETCH_BYTES = 512 * 1024
-DEFAULT_CMD_TIMEOUT = 15          # 秒；超时就掐，别拖住整轮
+DEFAULT_CMD_TIMEOUT = 15          # seconds; kill it on timeout, do not stall the whole turn
 
 ALLOWED_SCHEMES = ("http", "https")
 
-# 危险命令黑名单。
+# Dangerous-command blacklist.
 #
-# 血的教训：第一条原来写的是 r"\bformat\b"，本意是挡「格式化磁盘」，
-# 但 PowerShell 的 Format-List / Format-Table / Format-Wide 全都会命中 ——
-# 于是「systeminfo | ... | Format-List」这种纯读命令被拒，
-# 模型反复重试直到步数耗尽，最后往群里发了一句「步骤用尽」。
-# 现在只匹配真正会毁数据的写法，宁可写长一点。
+# Lesson learned the hard way: the first entry used to be r"\bformat\b", meant to block
+# "format a disk", but PowerShell's Format-List / Format-Table / Format-Wide all matched it —
+# so a pure read like "systeminfo | ... | Format-List" got rejected, the model retried over
+# and over until it ran out of steps, and finally posted "out of steps" into the group.
+# Now only spellings that really destroy data are matched, even if that makes the list longer.
 BANNED = [
-    # 格式化：必须带盘符或 /q /s /f 参数。Format-Volume 是另一个 cmdlet，单列
+    # Format: needs a drive letter or a /q /s /f switch. Format-Volume is a separate cmdlet,
+    # so it gets its own pattern
     r"(?<![\w.-])format(?:\.com)?\s+[a-z]:",
     r"(?<![\w.-])format(?:\.com)?\s+/[qsf]",
     r"\bFormat-Volume\b",
     r"\bmkfs(?:\.\w+)?\b",
-    # 关机 / 重启
+    # Shutdown / reboot
     r"(?<![\w.-])shutdown(?:\.exe)?\s+/[a-z]",
     r"\bStop-Computer\b", r"\bRestart-Computer\b",
     r"(?<![\w.-])reboot(?:\.exe)?\b",
-    # 磁盘与分区
+    # Disks and partitions
     r"\bdiskpart\b", r"\bClear-Disk\b", r"\bInitialize-Disk\b",
     r"\bRemove-Partition\b",
-    # 删根目录
+    # Deleting a root directory
     r"rm\s+-rf\s+/",
     r"del\s+/[sq]\s+[a-z]:\\?\s*$",
     r"Remove-Item.*-Recurse.*[A-Z]:\\?\s*$",
-    # 注册表与关键进程
+    # Registry and critical processes
     r"reg\s+delete\s+HKLM",
     r"\btaskkill\b.*/f.*/im\s+winlogon",
 ]
@@ -70,10 +73,11 @@ class ToolError(RuntimeError):
 
 
 def _is_loopback(host: str) -> bool:
-    """是不是本机地址。用来决定要不要绕开系统代理。
+    """Is this a local address? Decides whether the system proxy has to be bypassed.
 
-    宿主机开梯子后，系统代理会把 127.0.0.1 也拦下来 —— OneBot 那边已经
-    因此拿不到 self_id，凡是取本机服务的都该绕开。
+    Once the host machine is behind a VPN/proxy, the system proxy swallows 127.0.0.1 too —
+    that is already why the OneBot side cannot get self_id, so anything that talks to a
+    local service has to bypass it.
     """
     import ipaddress
     h = (host or "").lower()
@@ -86,40 +90,44 @@ def _is_loopback(host: str) -> bool:
 
 
 class LocalTools:
-    """工具集。
+    """The tool set.
 
-    ⚠️ `target_group` 是**本轮会话**，不是配置。它不能放在共享实例上：
-    两个后台任务并发时（max_concurrent_tasks 默认 2），B 群会把 A 群的赋值覆盖掉，
-    A 群模型动手时读到的是 B 群 —— 实测两张图都发进了同一个群。
-    换成人话就是：**会禁言错的人、踢错的人、把图发错群。**
+    ⚠️ `target_group` is **the session for this run**, not configuration. It cannot live on a
+    shared instance: with two background tasks running concurrently (max_concurrent_tasks
+    defaults to 2), group B overwrites group A's assignment, and when group A's model acts it
+    reads group B's value — in one measured case both images went to the same group.
+    In plain words: **it mutes the wrong person, kicks the wrong person, and posts the image
+    into the wrong group.**
 
-    所以每个 run 都要拿一份自己的副本：`tools.for_target(gid)`。
+    So every run takes its own copy: `tools.for_target(gid)`.
     """
 
     def __init__(self, root: Path, store=None, logger_name: str = "agent", bot=None):
         self.root = Path(root).resolve()
         self.store = store
-        # 发图要用的 OneBot 客户端；为 None 时 send_image 直接拒绝（工具仍然可选）。
+        # OneBot client used for sending images; when None, send_image refuses outright (the
+        # tool is still listed).
         self.bot = bot
-        # 当前这一轮要发给哪个群/人。由调用方（autoreply）在跑之前设好 ——
-        # 绝不从模型参数里取目标，否则等于让模型自己挑发到哪。
+        # Which group/person this run sends to. Set by the caller (autoreply) before the run
+        # starts — never read from model arguments, otherwise the model would be the one
+        # picking the destination.
         self.target_group = ""
         self._image_sent: list[float] = []
         self.log_path = self.root / "data" / "agent.log"
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
 
     def for_target(self, group_id: str) -> "LocalTools":
-        """返回一份**只服务于指定会话**的副本。
+        """Return a copy that **serves only the given session**.
 
-        浅拷贝：bot / store / root / log 与原实例共享，只有 target_group 是独立的。
-        `_image_sent` 有意保持同一个 list 对象 —— 发图限流是全局的，
-        不能因为来了个副本就把 60 秒 3 张的限制翻倍。
+        Shallow copy: bot / store / root / log are shared with the original instance, only
+        target_group is independent. `_image_sent` deliberately stays the same list object —
+        image rate limiting is global, and a fresh copy must not double the 3-per-60s budget.
         """
         clone = copy.copy(self)
         clone.target_group = str(group_id or "")
         return clone
 
-    # ---------- 日志 ----------
+    # ---------- Logging ----------
     def _record(self, action: str, target: str, detail: dict, state: str, result: str = ""):
         line = json.dumps({
             "at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -129,6 +137,8 @@ class LocalTools:
             "state": state,
             "result": result[:300],
         }, ensure_ascii=False)
+        # Logging must never break a tool call: a failed file write only warns, and audit
+        # errors are swallowed.
         try:
             with self.log_path.open("a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
@@ -141,13 +151,14 @@ class LocalTools:
             except Exception:
                 pass
 
-    # ---------- 路径护栏 ----------
+    # ---------- Path guardrails ----------
     def _safe(self, raw: str) -> Path:
         if not raw or not str(raw).strip():
             raise ToolError("路径不能为空。")
         p = Path(str(raw)).expanduser()
         if not p.is_absolute():
             p = self.root / p
+        # Resolve first: ".." segments and symlinks must not slip past the prefix check below.
         p = p.resolve()
         try:
             p.relative_to(self.root)
@@ -155,7 +166,7 @@ class LocalTools:
             raise ToolError(f"越界：只允许操作 {self.root} 之内的路径。") from None
         return p
 
-    # ---------- 工具 ----------
+    # ---------- Tools ----------
     def list_dir(self, path: str = ".") -> dict:
         p = self._safe(path)
         if not p.is_dir():
@@ -186,6 +197,8 @@ class LocalTools:
             self._record("read_file", str(p), {}, "FAILED", str(exc))
             raise ToolError(f"读失败：{exc}") from None
         lines = text.splitlines()
+        # Clamp the window: offset is 1-based, and limit is capped so one call cannot flood the
+        # model.
         off = max(1, int(offset))
         seg = lines[off - 1: off - 1 + max(1, min(int(limit), 2000))]
         self._record("read_file", str(p), {"bytes": size, "lines": len(lines), "offset": off},
@@ -202,6 +215,7 @@ class LocalTools:
         p = self._safe(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         try:
+            # newline="" writes the bytes exactly as given — no CRLF translation on the way out.
             mode = "a" if append else "w"
             with p.open(mode, encoding="utf-8", newline="") as fh:
                 fh.write(data)
@@ -216,6 +230,7 @@ class LocalTools:
         rx = re.compile(pattern)
         hits, scanned = [], 0
         for dirpath, dirnames, filenames in os.walk(base):
+            # Prune noisy dirs and cap the fan-out per level, so a big tree cannot stall this call.
             dirnames[:] = [d for d in dirnames if d not in
                            {".git", "__pycache__", "node_modules", ".venv", "data"}][:20]
             for name in filenames[:200]:
@@ -244,8 +259,10 @@ class LocalTools:
             proc = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", cmd],
                 cwd=str(work), capture_output=True, text=True,
+                # Clamp to [1, 60]: the model may ask for a longer timeout but never gets one.
                 timeout=max(1, min(int(timeout), 60)), encoding="utf-8", errors="replace",
             )
+            # stdout is capped at MAX_OUTPUT_BYTES and stderr at 8 KB, so the tail stays small.
             out = (proc.stdout or "")[:MAX_OUTPUT_BYTES]
             err = (proc.stderr or "")[:8192]
             code = proc.returncode
@@ -263,7 +280,7 @@ class LocalTools:
                 "seconds": round(time.time() - t0, 2)}
 
     def fetch_url(self, url: str, max_bytes: int = 200000, strip_html: bool = True) -> dict:
-        """抓一个网页/接口并返回正文。比让模型拼 curl 省好几步。"""
+        """Fetch a page or API and return its body. Saves the model from chaining curl commands."""
         target = (url or "").strip()
         parsed = urlparse(target)
         if parsed.scheme not in ALLOWED_SCHEMES or not parsed.hostname:
@@ -271,10 +288,12 @@ class LocalTools:
             raise ToolError("只允许抓取 http/https 地址。")
         import httpx
         try:
-            # 出口策略统一交给 net：回环走直连，远端代理连不上会自动退回直连。
-            # 以前这里只处理了回环，代理一挂 fetch_url 也跟着全废。
+            # Egress policy is delegated to net: loopback goes direct, and an unreachable
+            # remote proxy falls back to direct. This used to special-case loopback only, so
+            # when the proxy died fetch_url died with it.
             resp = net.request("GET", target, timeout=20.0,
                                headers={"User-Agent": "Mozilla/5.0 (qqbridge)"})
+            # max_bytes is what the caller asked for; MAX_FETCH_BYTES is the hard ceiling.
             raw = resp.content[: min(int(max_bytes), MAX_FETCH_BYTES)]
             text = raw.decode(resp.encoding or "utf-8", errors="replace")
         except Exception as exc:
@@ -290,12 +309,13 @@ class LocalTools:
         return {"url": target, "status": resp.status_code, "content": text[:max_bytes],
                 "bytes": len(raw)}
 
-    # ---------- 发图 ----------
-    IMAGE_WINDOW = 60.0            # 限流窗口（秒）
-    IMAGE_MAX_PER_WINDOW = 3       # 窗口内最多发几张，防刷屏
+    # ---------- Sending images ----------
+    IMAGE_WINDOW = 60.0            # rate-limit window (seconds)
+    IMAGE_MAX_PER_WINDOW = 3       # max images per window, so it cannot spam the group
     IMAGE_MAX_BYTES = 8 * 1024 * 1024
 
     def _sniff_image(self, head: bytes) -> str:
+        # Magic bytes rather than the file extension — a .jpg that is really HTML must not pass.
         if head[:8] == b"\x89PNG\r\n\x1a\n":
             return "png"
         if head[:3] == b"GIF":
@@ -308,18 +328,23 @@ class LocalTools:
 
     def _rate_ok(self) -> bool:
         now = time.time()
+        # Sliding window: drop timestamps that fell out of the window before counting.
         self._image_sent = [t for t in self._image_sent if now - t < self.IMAGE_WINDOW]
         return len(self._image_sent) < self.IMAGE_MAX_PER_WINDOW
 
     async def send_image(self, image: str = "", caption: str = "", expect: str = "") -> dict:
-        """把一张图发到**当前这一轮对应的群**。
+        """Send one image to **the group this run belongs to**.
 
-        两条来源，各自的护栏不同：
-          - 本地文件：必须在工作区内（走 _safe），且按 magic bytes 确认真是图片。
-            不接受"用户随口给的任意路径"，避免被引导去读工作区外的文件。
-          - http/https 链接：拒绝内网/回环（防 SSRF），并确认返回的确实是图。
+        Two sources, each with its own guardrails:
+          - Local file: must be inside the workspace (goes through _safe), and the magic
+            bytes must confirm it really is an image. Arbitrary paths "someone happened to
+            mention" are refused, so the model cannot be steered into reading files outside
+            the workspace.
+          - http/https link: private/loopback addresses are refused (anti-SSRF), and the
+            response must actually be an image.
 
-        目标群不来自参数 —— 由调用方设定，模型没有选择权。
+        The target group never comes from arguments — the caller sets it, the model has no
+        say in it.
         """
         raw = (image or "").strip()
         if not raw:
@@ -336,10 +361,12 @@ class LocalTools:
             raise ToolError(f"发图太频繁（{self.IMAGE_WINDOW:.0f} 秒内最多 "
                             f"{self.IMAGE_MAX_PER_WINDOW} 张），先攒着。")
 
-        # 发送前必须有人先看过这张图 —— 既查安不安全，也查是不是要的那张。
-        # 出过事：有人要「宛平南路六百号」的照片，结果抓了张萝莉图发进群。
-        # 模型只是把一条链接/路径转手丢出去，全程没有任何环节看过内容。
-        # 校验不通过就**不发**；校验本身跑不起来也**不发**（fail closed）。
+        # Somebody must have looked at the image before it is sent — both to check that it
+        # is safe and to check that it is the one that was asked for. This went wrong once:
+        # someone wanted a photo of 600 Wanping South Road and a loli image got fetched and
+        # posted into the group. The model was only passing a link/path along, and not a
+        # single stage ever looked at the content. If the check fails we **do not send**; if
+        # the check itself cannot run we **do not send** either (fail closed).
         reviewed = ""
         if config.send_image_review:
             from . import vision
@@ -363,11 +390,12 @@ class LocalTools:
             if not self._public_host(parsed.hostname):
                 self._record("send_image", raw, {}, "DENIED", "内网地址")
                 raise ToolError("不接受内网/本机地址。")
-            # **整串必须是一个干净的 URL。** urlparse 只看开头，所以
+            # **The whole string has to be one clean URL.** urlparse only looks at the head,
+            # so for
             # "https://a/x.png] [CQ:at,qq=all][CQ:image,file=http://127.0.0.1:5700/b"
-            # 的 hostname 是 a，能通过主机检查 —— 但拼进 CQ 码之后，
-            # 第一段提前闭合，后面那段就成了第二条指令：全员 @ 或者
-            # 再塞一张完全没过审核、没做 SSRF 校验的图进来。
+            # the hostname is a and it passes the host check — but once spliced into CQ code
+            # the first part closes early and the rest becomes a second instruction: @everyone,
+            # or another image that never passed review and never got the SSRF check.
             if not is_safe_cq_param(raw):
                 self._record("send_image", raw, {}, "DENIED", "URL 里含 CQ 码分隔符")
                 raise ToolError("这个图片地址里含 [ ] & 或逗号/空白，不能作为 CQ 参数，拒绝发送。")
@@ -377,7 +405,7 @@ class LocalTools:
             self._record("send_image", raw, {}, "DENIED", f"不支持的协议 {parsed.scheme}")
             raise ToolError("只支持本地文件路径或 http/https 链接。")
         else:
-            p = self._safe(raw)              # 越界会在这里抛
+            p = self._safe(raw)              # out-of-root paths raise right here
             if not p.is_file():
                 self._record("send_image", str(p), {}, "FAILED", "文件不存在")
                 raise ToolError(f"文件不存在：{p}")
@@ -390,11 +418,12 @@ class LocalTools:
             if not kind:
                 self._record("send_image", str(p), {"bytes": size}, "DENIED", "不是图片")
                 raise ToolError("这个文件按内容判断不是图片。")
-            # 本机路径交给 OneBot 时用 file:// URI，避免它按相对路径找错地方
+            # Local paths go to OneBot as file:// URIs so it cannot mis-resolve a relative path
             payload = f"[CQ:image,file=file:///{str(p).replace(chr(92), '/')}]"
             detail = {"via": "path", "bytes": size, "kind": kind}
 
-        # 配文是模型写的，同样要转义 —— 否则 caption="[CQ:at,qq=all] 快来" 就是全员轰炸。
+        # The caption is model-written as well, so it is escaped too — otherwise
+        # caption="[CQ:at,qq=all] come quick" is an @everyone bomb.
         cap = escape_cq(caption.strip())
         msg = payload if not cap else f"{cap}\n{payload}"
         try:
@@ -415,6 +444,8 @@ class LocalTools:
             infos = socket.getaddrinfo(host, None)
         except Exception:
             return False
+        # Every resolved address must be public: a single private answer is enough to refuse,
+        # so a name whose A records point at 127.0.0.1 cannot slip through this check.
         for info in infos:
             try:
                 ip = ipaddress.ip_address(info[4][0])
@@ -425,17 +456,20 @@ class LocalTools:
                 return False
         return True
 
-    # ---------- 群管理 ----------
-    # 只在「管理员直接跟机器人说话」那条路上可用（autoreply 的 _handle_task 才会
-    # 设 target_group）。闲聊那条路没有这个工具，模型也不能指定目标群。
+    # ---------- Group management ----------
+    # Only available on the "an admin talks to the bot directly" path (only autoreply's
+    # _handle_task sets target_group). The idle-chat path does not have this tool, and the
+    # model cannot name a target group either.
     MANAGE_ACTIONS = ("mute", "unmute", "kick", "rename", "card", "whole_ban")
-    MUTE_MAX_SECONDS = 30 * 24 * 3600      # QQ 单次禁言上限 30 天
+    MUTE_MAX_SECONDS = 30 * 24 * 3600      # QQ caps a single mute at 30 days
 
     async def manage_group(self, action: str = "", user_id: str = "",
                            duration_seconds: int = 0, value: str = "") -> dict:
-        """群管理。和目标群一样，**权限面由调用方兜底**：没有 target_group 就拒绝。
+        """Group management. As with the target group, **the caller is the backstop for the
+        permission surface**: no target_group means refusal.
 
-        不做 leave（退群）—— 那是不可逆且影响全群的，留给人在客户端点。
+        No leave (quitting the group) — that is irreversible and affects the whole group, so
+        it is left for a human to click in their client.
         """
         act = (action or "").strip().lower()
         if act not in self.MANAGE_ACTIONS:
@@ -458,7 +492,7 @@ class LocalTools:
         if needs_user and not uid:
             raise ToolError("这个动作需要 user_id（对方 QQ 号）。")
         if act == "mute" and dur <= 0:
-            # set_group_ban 的 duration=0 是**解除禁言**，不是禁言 0 秒 —— 别搞反。
+            # duration=0 in set_group_ban **unmutes**, not a 0-second mute — do not invert it.
             raise ToolError("禁言必须给 duration_seconds（大于 0）；要解除请用 unmute。")
         if act == "mute":
             dur = min(dur, self.MUTE_MAX_SECONDS)
@@ -466,7 +500,8 @@ class LocalTools:
         if act == "rename" and not (value or "").strip():
             raise ToolError("改群名需要 value。")
 
-        # 角色核对：QQ 不允许对群主操作；同级管理员之间也常常互相动不了。
+        # Role check: QQ does not allow acting on the group owner, and admins of the same
+        # rank usually cannot act on each other either.
         if needs_user:
             target = None
             try:
@@ -507,12 +542,13 @@ class LocalTools:
             raise ToolError("执行失败：" + str(exc)[:150]) from None
 
         self._record("manage_group", act, detail, "SUCCEEDED", str(result)[:120])
-        # 审计只说明「请求发出去了」—— 是否真生效要回查，别替服务端打包票
+        # The audit only proves the request was sent — whether it actually took effect needs
+        # a follow-up check; do not vouch for the server.
         return {"done": True, "action": act, "group_id": gid, "user_id": uid,
                 "duration_seconds": dur, "result": result,
                 "note": "这是接口返回值，不保证已生效；要确认请回查成员角色或禁言状态。"}
 
-    # ---------- 给模型看的 schema ----------
+    # ---------- Schemas exposed to the model ----------
     @staticmethod
     def schemas() -> list[dict]:
         return [
@@ -586,13 +622,15 @@ class LocalTools:
         ]
 
     async def dispatch_async(self, name: str, args: dict) -> dict:
-        """**异步分发**：同步工具一律丢到线程池，绝不阻塞事件循环。
+        """**Async dispatch**: synchronous tools are always pushed onto the thread pool and
+        never block the event loop.
 
-        历史教训：run_command 是同步 subprocess.run，直接在 async 里调用会把
-        整个服务卡住 —— 一个 21 秒的 curl 期间，HTTP 和 WebSocket 全部无响应。
+        Lesson from history: run_command is a synchronous subprocess.run, and calling it
+        straight from async froze the whole service — during one 21-second curl, both HTTP
+        and WebSocket were unresponsive.
         """
-        # send_image 自己就是异步的（要 await HTTP），不能再套线程 ——
-        # 丢进线程池只会拿到一个没人 await 的协程。
+        # send_image is async on its own (it awaits HTTP), so it cannot be wrapped in a
+        # thread — dropping it into the pool only yields a coroutine nobody awaits.
         if name == "send_image":
             return await self.send_image(**(args or {}))
         if name == "manage_group":
@@ -603,6 +641,7 @@ class LocalTools:
         fn = {"list_dir": self.list_dir, "read_file": self.read_file,
               "write_file": self.write_file, "search_files": self.search_files,
               "run_command": self.run_command, "fetch_url": self.fetch_url}.get(name)
+        # An unknown name is the model's mistake too; report it as a tool error, not as a crash.
         if fn is None:
             raise ToolError(f"未知工具 {name}")
         try:

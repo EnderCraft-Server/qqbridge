@@ -1,7 +1,9 @@
-"""内置 Agent 循环：让 bot 自己调工具干活，不依赖任何外部 Agent 宿主。
+"""Built-in Agent loop: lets the bot call tools for itself, with no external agent
+host involved.
 
-一次 run() = 最多 N 步的「模型 → 工具 → 回填 → 模型」循环，直到模型不再调工具
-或达到步数上限。每一步都落审计，工具自身的读写另有 agent.log。
+One run() = a "model -> tools -> feed back -> model" loop of at most N steps,
+until the model stops calling tools or the step cap is reached. Every step is
+audited; the tools' own reads and writes go to agent.log separately.
 """
 from __future__ import annotations
 
@@ -12,7 +14,8 @@ from .llm import LLM, LLMError
 
 log = logging.getLogger("qqbridge.agentloop")
 
-DEFAULT_MAX_STEPS = 30      # 别用步数卡死任务；靠工具自身的超时兜底
+DEFAULT_MAX_STEPS = 30      # do not strangle a task with the step count; per-tool
+                            # timeouts are the real backstop
 
 
 class AgentLoop:
@@ -33,13 +36,16 @@ class AgentLoop:
 
     async def run(self, system: str, task: str, *, history: list[dict] | None = None,
                   max_tokens: int | None = None, tools=None) -> dict:
-        """跑一次完整的工具循环，返回 {text, steps, tool_calls, log}。
+        """Run one full tool loop, returning {text, steps, tool_calls, log}.
 
-        max_tokens 会在每一步都生效 —— 学术模式要放开长度，普通派活仍然沿用默认值。
+        max_tokens applies to every step -- academic mode needs the cap lifted,
+        ordinary dispatching keeps the default.
 
-        tools 可以传一份**本轮专用的副本**（见 LocalTools.for_target）。默认用
-        self.tools。这一条是并发安全的关键：目标会话不能放在共享实例上，
-        否则两个后台任务会互相覆盖 target_group，把操作打到别的群。
+        tools may be a **copy dedicated to this turn** (see LocalTools.for_target).
+        Defaults to self.tools. That is the key to concurrency safety: the target
+        conversation must not live on a shared instance, otherwise two background
+        tasks overwrite each other's target_group and send operations into the
+        wrong group.
         """
         if not self.llm.configured:
             raise LLMError("模型未配置：无法运行内置 Agent。")
@@ -51,7 +57,8 @@ class AgentLoop:
 
         trace: list[dict] = []
         self.runs += 1
-        fail_seen: dict = {}       # 同一个调用反复失败就别再耗步数了
+        fail_seen: dict = {}       # stop burning steps on a call that keeps failing
+                                   # the same way
         for step in range(1, self.max_steps + 1):
             self.steps += 1
             out = await self.llm.chat(messages, tools=tl.schemas(),
@@ -65,7 +72,8 @@ class AgentLoop:
                                           "text": text[:200]}, "SUCCEEDED")
                 return {"text": text, "steps": step, "tool_calls": trace}
 
-            # 回填 assistant 的 tool_calls
+            # Echo the assistant's tool_calls back into the history, otherwise the
+            # following tool messages have nothing to attach to.
             messages.append({"role": "assistant", "content": text or None, "tool_calls": calls})
             for call in calls:
                 name = ((call.get("function") or {}).get("name")) or ""
@@ -73,9 +81,12 @@ class AgentLoop:
                 try:
                     args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
                 except ValueError:
+                    # Malformed arguments: pass an empty dict so the tool can
+                    # complain about the missing fields instead of losing the step.
                     args = {}
                 try:
-                    # 走 async 分发：阻塞工具在线程池里跑，不卡事件循环
+                    # Dispatch through the async path: blocking tools run in a
+                    # thread pool, so the event loop is not stalled
                     result = await tl.dispatch_async(name, args)
                     ok = True
                 except Exception as exc:
@@ -94,8 +105,10 @@ class AgentLoop:
                 messages.append({"role": "tool", "tool_call_id": call.get("id") or name,
                                  "content": json.dumps(result, ensure_ascii=False)[:20000]})
 
-            # 同一个调用带着同样的参数连续失败 3 次 = 死循环。
-            # 之前就是这样：命令被黑名单误杀，模型换个写法接着试，把 30 步全烧光。
+            # Same call with the same arguments failing 3 times in a row = an
+            # infinite loop. That is exactly what used to happen: a command was
+            # killed by the blacklist, the model rephrased it and tried again, and
+            # all 30 steps were burned.
             if fail_seen and max(fail_seen.values()) >= 3:
                 worst = max(fail_seen, key=lambda k: fail_seen[k]).split(":")[0]
                 text = await self._wrap_up(
@@ -105,8 +118,9 @@ class AgentLoop:
                 return {"text": text or "这条我卡住了，换个说法我再试。",
                         "steps": step, "tool_calls": trace}
 
-        # 步数用尽：不要往群里丢「（步骤用尽，未得到最终答复）」这种废话，
-        # 再问一次模型要一句人话（不带工具），至少告诉用户卡在哪。
+        # Out of steps: do not drop "(step limit reached, no final answer)" filler
+        # into the group; ask the model once more for a plain sentence (no tools),
+        # so at least the user learns where it got stuck.
         text = await self._wrap_up(messages, f"已经用完 {self.max_steps} 步工具调用")
         self._audit("agent_run", {"steps": self.max_steps, "reason": "max_steps",
                                   "text": text[:200]}, "TRUNCATED")
@@ -114,7 +128,9 @@ class AgentLoop:
                 "steps": self.max_steps, "tool_calls": trace}
 
     async def _wrap_up(self, messages: list[dict], why: str) -> str:
-        """收尾提问：不带工具再问一次，要一句能直接发进群的人话。"""
+        """Wrap-up question: ask once more without tools, for one plain sentence that
+        can go straight into the group.
+        """
         try:
             out = await self.llm.chat(messages + [{"role": "user", "content":
                 f"【系统】{why}，不要再调用任何工具。"

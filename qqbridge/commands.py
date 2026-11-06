@@ -1,4 +1,4 @@
-"""群内命令：/stop /start /auto。只有管理员能用，命令本身不进入队列。"""
+"""In-group commands: /stop /start /auto. Admin-only, and never queued."""
 from __future__ import annotations
 
 COMMANDS = {
@@ -6,7 +6,8 @@ COMMANDS = {
     "/start": "manual",
     "/auto": "auto",
 }
-# 提示语：命令必须有回执，否则用户不知道生效没有
+# Reply text: a command must acknowledge, otherwise the user cannot tell whether
+# it took effect
 REPLIES = {
     "stopped": "已停止当前会话的自动接话功能，并已停止所有agent请求",
     "auto": "已开启对话自动接话功能，并接受所有agent请求",
@@ -19,10 +20,11 @@ def reply_for(mode: str) -> str:
 
 
 def parse(text: str) -> str | None:
-    """返回目标运行模式（auto/stopped/manual）；不是控制命令则返回 None。"""
+    """Return the target mode (auto/stopped/manual); None if this is not a control command."""
     raw = (text or "").strip()
     if not raw:
         return None
+    # Only the first token counts, so "/stop please" still works.
     head = raw.split()[0].lower()
     return COMMANDS.get(head)
 

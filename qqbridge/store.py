@@ -45,12 +45,16 @@ class Store:
             db.executescript(SCHEMA)
 
     def connect(self):
+        # row_factory=Row gives dict-like rows; the timeout lets a concurrent
+        # writer wait for the lock instead of failing with "database is locked".
         conn = sqlite3.connect(self.path, timeout=15)
         conn.row_factory = sqlite3.Row
         return conn
 
     # ---------- messages ----------
     def add_message(self, rec: dict):
+        # segments is a Python list; SQLite has no list type, so serialize it.
+        # The lock serializes writers because every call opens its own connection.
         with self._lock, self.connect() as db:
             db.execute(
                 "INSERT INTO messages(event_id,at,group_id,user_id,sender,message_id,text,segments,is_self,mentions_me)"
@@ -61,6 +65,8 @@ class Store:
             )
 
     def recent(self, group_id: str, limit: int = 30) -> list:
+        # Pull newest-first so LIMIT applies to the newest rows, then flip back
+        # into chronological order for the reader.
         with self.connect() as db:
             rows = db.execute(
                 "SELECT * FROM messages WHERE group_id=? ORDER BY at DESC LIMIT ?",
@@ -69,10 +75,13 @@ class Store:
         return [dict(r) for r in reversed(rows)]
 
     def recent_events(self, limit: int = 200) -> list:
-        """最近的消息（跨群），按 event_id 升序，形状和 EventBus 里的记录一致。
+        """Recent messages across groups, ascending by event_id, shaped exactly like
+        the records held by EventBus.
 
-        给启动回填用：进程重启后环形缓冲是空的，控制台会显示「暂无消息」，
-        看起来像机器人没在收消息 —— 其实库里全都有，只是没灌回去。
+        Used for the startup backfill: after a process restart the ring buffer is
+        empty and the console shows "no messages yet", which looks like the bot is
+        not receiving anything -- in fact the database has them all, they were
+        just never fed back in.
         """
         with self.connect() as db:
             rows = db.execute(
@@ -104,6 +113,7 @@ class Store:
         return out
 
     def search(self, query: str, group_id: str = "", limit: int = 20) -> list:
+        # LIKE with the query wrapped in %...%: a substring match, not a prefix.
         sql = "SELECT * FROM messages WHERE text LIKE ?"
         args = [f"%{query}%"]
         if group_id:
@@ -161,6 +171,7 @@ class Store:
             return [dict(r) for r in db.execute("SELECT * FROM audit ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
 
     def seen(self, key: str):
+        # Results are stored as JSON so callers can cache arbitrary structures.
         with self.connect() as db:
             row = db.execute("SELECT result FROM dedupe WHERE key=?", (key,)).fetchone()
         return json.loads(row["result"]) if row else None

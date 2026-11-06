@@ -1,4 +1,4 @@
-"""配置 .env 文件"""
+"""Configure the .env file."""
 
 import re
 import sys
@@ -14,10 +14,11 @@ env_lines = list()
 for line in env_example_lines:
     line.replace("\n", "")
     print(line)
-    if line[0] == "#": # 注释
+    if line[0] == "#": # comment
         continue
 
-    # 一行应该由输入配置的文字的格式应该为：大写字母和下划线组成的配置项目 + '=' + '<' + 配置说明 + '>'
+    # A line that prompts for input is shaped like:
+    # upper-case/underscore config key + '=' + '<' + description + '>'
     # [A-Z]
     if re.match(".+=<.*>", line):
         equal_index = line.find("=")
@@ -27,6 +28,8 @@ for line in env_example_lines:
         config_value = input(f"输入配置值：")
         env_lines.append(f"{config_name}={config_value}")
     else:
+        # Blank lines and literal values (no <...> placeholder) are copied through
+        # untouched so the generated .env keeps .env.example's layout.
         env_lines.append(line)
 print("配置完成，正在写入：")
 for line in env_lines:

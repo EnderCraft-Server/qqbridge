@@ -1,7 +1,8 @@
-"""自带的模型客户端：OpenAI 兼容的 /chat/completions。
+"""Built-in model client: an OpenAI-compatible /chat/completions caller.
 
-bot 自己持有 api_base / api_key / model，不依赖任何外部 Agent 宿主。
-只依赖 httpx，不引入额外 SDK。
+The bot holds its own api_base / api_key / model, so it does not depend on any
+external Agent host being around.
+Only httpx is required -- no vendor SDK is pulled in.
 """
 from __future__ import annotations
 
@@ -31,7 +32,8 @@ class LLM:
         self.timeout = timeout
         self.max_tokens = max_tokens
         self.temperature = temperature
-        # thinking=disabled 关掉思考链（省 token、省时间）；要开就设 enabled
+        # thinking=disabled turns the reasoning chain off (saves tokens and time);
+        # set enabled to turn it back on
         self.thinking = (thinking or "").strip().lower()
         self.reasoning_effort = (reasoning_effort or "").strip().lower()
         self.last_error = ""
@@ -75,10 +77,12 @@ class LLM:
     async def chat(self, messages: list[dict], tools: list[dict] | None = None,
                    *, max_tokens: int | None = None,
                    temperature: float | None = None) -> dict:
-        """一次非流式对话。返回 {text, tool_calls, usage}。
+        """One non-streaming chat call. Returns {text, tool_calls, usage}.
 
-        max_tokens / temperature 可以按次覆盖实例默认值 —— 学术模式要放开长度，
-        但闲聊那边仍然该省，所以只能按调用点给，不能全局调。
+        max_tokens / temperature may override the instance defaults per call --
+        academic mode needs the length cap lifted, but chit-chat should still stay
+        cheap, so they can only be supplied at the call site, never changed
+        globally.
         """
         if not self.configured:
             raise LLMError("模型未配置：需要在 .env 里填 LLM_API_BASE / LLM_API_KEY / LLM_MODEL。")
@@ -89,7 +93,7 @@ class LLM:
             "temperature": self.temperature if temperature is None else float(temperature),
             "stream": False,
         }
-        # DeepSeek 的思考开关：thinking.type = enabled/disabled
+        # DeepSeek's thinking switch: thinking.type = enabled/disabled
         if self.thinking in ("enabled", "disabled"):
             body["thinking"] = {"type": self.thinking}
         if self.reasoning_effort in ("low", "high", "max") and self.thinking != "disabled":
@@ -100,13 +104,15 @@ class LLM:
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         t0 = time.time()
         try:
-            # 别直接用 httpx 默认值：trust_env=True 会走系统代理，
-            # 代理一挂整个机器人就哑了。net.arequest 会自动退回直连。
+            # Do not use httpx defaults here: trust_env=True goes through the
+            # system proxy, and once the proxy is dead the whole bot goes mute.
+            # net.arequest falls back to a direct connection automatically.
             resp = await net.arequest("POST", url, json=body, headers=headers,
                                       timeout=self.timeout)
             resp.raise_for_status()
             data = resp.json()
         except httpx.HTTPStatusError as exc:
+            # Trim the error body: a provider may answer with a long HTML page.
             detail = exc.response.text[:300] if exc.response is not None else ""
             self.last_error = f"HTTP {exc.response.status_code}: {detail}"
             raise LLMError(self.last_error) from None
@@ -115,6 +121,7 @@ class LLM:
             raise LLMError(self.last_error) from None
 
         self.calls += 1
+        # Accumulate usage so the console panel can show a running cost estimate.
         usage = data.get("usage") or {}
         self.prompt_tokens += int(usage.get("prompt_tokens") or 0)
         self.completion_tokens += int(usage.get("completion_tokens") or 0)

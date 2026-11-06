@@ -1,20 +1,27 @@
-"""统一的出口 HTTP 客户端策略。
+"""Unified egress policy for outbound HTTP clients.
 
-踩过的坑（2026-10-25）：宿主机开着梯子（系统代理 127.0.0.1:7897），
-机器人进程是从带着 HTTPS_PROXY 的终端里启的。梯子关掉之后，
-httpx 默认 trust_env=True 会把所有请求（包括 api.deepseek.com）丢给那个
-已经没人监听的代理，于是每一条都 ConnectError: All connection attempts failed，
-整个机器人哑掉 —— 自动说说、接话、Agent 全挂，只有兜底短句还能发出去。
+The pitfall (2026-10-25): the host machine had a VPN client running (system proxy
+127.0.0.1:7897), and the bot process was started from a terminal carrying
+HTTPS_PROXY. Once the VPN was shut down, httpx's default trust_env=True sent every
+request (api.deepseek.com included) to that proxy with nobody listening anymore,
+so each one raised ConnectError: All connection attempts failed and the whole bot
+went mute -- auto-chat, replies and Agent all dead, only the fallback canned lines
+could still go out.
 
-onebot.py 之前为回环地址单独打过补丁（回环绝不走代理），但那只能救本机服务；
-真正对外的那几个客户端（模型、看图、抓网页、控制台图片代理）还是裸的默认值。
+onebot.py had already been patched separately for loopback addresses (loopback
+never goes through a proxy), but that only saved local services; the real
+outbound clients (model, image reading, web fetching, console image proxy) were
+still running on bare defaults.
 
-这里的规矩：
-  1. **回环地址永远直连**，代理帮不上忙还会挡路。
-  2. **远端地址先按系统代理走，连不上就自动退回直连**，并把结果记住：
-     之后所有请求都按上次成功的路径走，不会每次都在死代理上耗一个超时。
-  3. 两种都不通时，把真实原因（含代理地址）抛出去，别再报一句
-     不知所云的 "All connection attempts failed"。
+The rules here:
+  1. **Loopback addresses always go direct**, a proxy cannot help and may well get
+     in the way.
+  2. **Remote addresses try the system proxy first and fall back to a direct
+     connection when that fails**, and the outcome is remembered: every request
+     after that follows the path that last succeeded, instead of burning a full
+     timeout on the dead proxy each time.
+  3. When neither works, raise the real reason (proxy address included) instead of
+     yet another baffling "All connection attempts failed".
 """
 from __future__ import annotations
 
@@ -26,7 +33,8 @@ import httpx
 
 log = logging.getLogger("qqbridge.net")
 
-# 远端地址上一次是怎么连通的：None=还没探过，"proxy"/"direct"=记住的结论
+# How the remote connection last succeeded: None = not probed yet,
+# "proxy"/"direct" = the remembered verdict
 _REMOTE_MODE: str | None = None
 
 _CONN_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError,
@@ -44,14 +52,15 @@ def is_loopback(host: str) -> bool:
 
 
 def _order(host: str) -> list[bool]:
-    """按什么顺序试 trust_env。True = 用环境里的代理。"""
+    """Which order to try trust_env in. True = use the proxy from the environment."""
     if is_loopback(host):
-        return [False]                 # 回环一律直连，没有第二种可能
+        return [False]                 # loopback is always direct, no second option
     if _REMOTE_MODE == "direct":
         return [False, True]
     if _REMOTE_MODE == "proxy":
         return [True, False]
-    return [True, False]               # 没探过：先尊重系统设置，失败再直连
+    return [True, False]               # never probed: honour the system setting first,
+                                       # retry direct on failure
 
 
 def _remember(host: str, trust_env: bool) -> None:
@@ -59,6 +68,7 @@ def _remember(host: str, trust_env: bool) -> None:
     if is_loopback(host):
         return
     mode = "proxy" if trust_env else "direct"
+    # Only log on an actual change, otherwise a stable setup would spam the log.
     if _REMOTE_MODE != mode:
         if _REMOTE_MODE is not None:
             log.warning("出口策略切换：%s（%s）", mode,
@@ -86,9 +96,10 @@ async def arequest(method: str, url: str, *, headers: dict | None = None,
                    json=None, params=None, data=None, timeout: float = 15.0,
                    follow_redirects: bool = False,
                    proxy: str | None = None) -> httpx.Response:
-    """发一个请求，代理不通用时自动退回直连。"""
+    """Send a request, falling back to a direct connection when the proxy does not work."""
     host = (urlparse(url).hostname or "").lower()
     last: Exception | None = None
+    # Try each strategy in order; the one that works is remembered for next time.
     for trust_env in _order(host):
         try:
             async with httpx.AsyncClient(**_kwargs(timeout, follow_redirects,
@@ -108,7 +119,7 @@ async def arequest(method: str, url: str, *, headers: dict | None = None,
 def request(method: str, url: str, *, headers: dict | None = None,
             timeout: float = 20.0, follow_redirects: bool = True,
             proxy: str | None = None) -> httpx.Response:
-    """同步版，给 agenttools 的 fetch_url 这类同步工具用。"""
+    """Synchronous version, for sync tools such as agenttools' fetch_url."""
     host = (urlparse(url).hostname or "").lower()
     last: Exception | None = None
     for trust_env in _order(host):
@@ -127,5 +138,5 @@ def request(method: str, url: str, *, headers: dict | None = None,
 
 
 def mode() -> str:
-    """当前远端出口策略，给状态面板用。"""
+    """Current remote egress policy, for the status panel."""
     return _REMOTE_MODE or "unknown"

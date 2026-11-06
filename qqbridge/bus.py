@@ -22,47 +22,53 @@ class EventBus:
                  rules=None, watch_groups=None, control=None, store=None):
         self._lock = threading.RLock()
         self._events = deque(maxlen=size)
-        self._dropped = 0            # 被环形缓冲挤掉的条数（可观测）
+        self._dropped = 0            # events squeezed out of the ring buffer (observability)
         # Durable id sequence + cursor. Both live in the store when one is supplied, so a
         # restart resumes where it left off instead of rewinding to 1. Without this, an
-        # An external poller keeps its own monotonic cursor and sees every
-        # new id as "already processed", and silently stops waking anyone until it is restarted.
+        # external poller keeps its own monotonic cursor, sees every new id as "already
+        # processed", and silently stops waking anyone until it is restarted.
         self._store = store
-        # 事件 id：只用于展示/审计/外部 poller 的游标，**不再承担"处理到哪了"的职责**。
+        # Event id: only for display/audit and the external poller's cursor. It **no longer
+        # tracks "how far we processed"**.
         self._seq_value = max(self._load_int("bus.seq", 0), self._seed_from_history())
         self._seq = itertools.count(self._seq_value + 1)
         if self._seq_value:
             self._save_int("bus.seq", self._seq_value)
 
-        # ---------- 已处理水位线：时间戳，不是 id 游标 ----------
-        # 为什么弃用 id 游标：它是单调的 max()，而且会被持久化。任何一次
-        # mark_processed(大数) —— 模型编一个、或者把别的数字当参数传进来 ——
-        # 都会把水位推到未来永远够不到的地方，同时清空队列，然后**永久静默**：
-        # 读接口一切正常，机器人再也不说话，重启也救不回来（实测复现过）。
+        # ---------- processed watermark: a timestamp, not an id cursor ----------
+        # Why the id cursor was dropped: it was a monotonic max() and it was persisted. Any
+        # mark_processed(large number) — the model inventing one, or some other number being
+        # passed as the argument — pushed the watermark into a future that could never be
+        # reached and cleared the queue at the same time, and then it **went permanently
+        # silent**: every read API looked fine, the bot simply never spoke again, and a
+        # restart could not rescue it (reproduced in testing).
         #
-        # 换成时间戳之后，结构上就堵死了这条路：
-        #   1) 水位只能推到**缓冲里真实存在的那条消息**的时间上，推不过去；
-        #   2) push 保证 at 严格递增且互不相同，所以不存在并列导致的漏看/重看。
+        # A timestamp closes that path structurally:
+        #   1) the watermark can only be pushed to the time of **a message that really exists
+        #      in the buffer**; it cannot go past it;
+        #   2) push guarantees `at` is strictly increasing and unique, so no ties can cause a
+        #      missed or repeated read.
         self._seen_at = self._load_float("bus.seen_at", 0.0)
-        # ---------- 按会话（群 / 私聊）各记各的水位线 ----------
-        # 原来只有一个全局水位：A 群处理完把水位推过去，B 群里比它旧的消息
-        # 就再也不会被看到了 —— 而且上下文取的是全局最近 N 条，
-        # A 群的话题会混进 B 群的判断里（实测回复过另一个群的梗）。
-        # 现在每个会话一份水位线，互不影响。
+        # ---------- one watermark per session (group / private chat) ----------
+        # There used to be a single global watermark: once group A was handled and the
+        # watermark moved, older messages in group B were never seen again — and the context
+        # was the global last N messages, so group A's topic leaked into group B's judgement
+        # (reproduced: it replied with another group's meme).
+        # Now each session has its own watermark and they do not affect each other.
         self._seen_by_key: dict[str, float] = self._load_json("bus.seen_by_key", {})
-        self._last_ts = 0.0          # 上一个事件的 at，用来保证严格递增
+        self._last_ts = 0.0          # at of the previous event; keeps `at` strictly increasing
 
         self._last_own_send = 0.0
         self.cooldown = cooldown_seconds
         self.self_id = self_id
         self.rules = rules
-        # 只监控这些群；空集合表示全部群
+        # Only watch these groups; an empty set means all groups.
         self.watch_groups = set(str(g) for g in (watch_groups or []))
-        # 运行时控制（/stop 挂起）。为 None 时视为不暂停。
+        # Runtime control (/stop suspension). None means not paused.
         self.control = control
-        # 注：原来的 _pending_high/mid/low 三个 id 列表已删除。
-        # 它们只增不减（被挤出环形缓冲的 id 永远留在里面），
-        # 而且优先级完全可以从事件自身算出来 —— 没必要维护一份会腐烂的副本。
+        # Note: the old _pending_high/mid/low id lists are gone. They only ever grew (ids
+        # evicted from the ring buffer stayed in them forever), and priority can be computed
+        # from the event itself — no need to maintain a copy that rots.
 
     # ---------- durable state ----------
     def _load_int(self, key: str, default: int = 0) -> int:
@@ -106,6 +112,7 @@ class EventBus:
             if raw in (None, ""):
                 return default
             val = json.loads(raw) if isinstance(raw, str) else raw
+            # Guard against a corrupt or legacy value of the wrong shape.
             return val if isinstance(val, type(default)) else default
         except (TypeError, ValueError):
             return default
@@ -116,6 +123,7 @@ class EventBus:
 
     def _next_id(self) -> int:
         """Allocate the next event id, durably, so ids never repeat across restarts."""
+        # Persist before handing the id out, so a crash right after cannot hand it out twice.
         self._seq_value += 1
         self._save_int("bus.seq", self._seq_value)
         return next(self._seq)
@@ -149,9 +157,9 @@ class EventBus:
 
         sender = event.get("sender") or {}
         topic = str(event.get("message_type") or "group")
-        # at 必须**严格递增且互不相同**：水位线是时间戳，要是两条撞上同一个值，
-        # 用 > 比较就会漏掉其中一条。time.time() 在 Windows 上分辨率不够，
-        # 所以显式兜一下。
+        # at must be **strictly increasing and unique**: the watermark is a timestamp, so if
+        # two events landed on the same value, a > comparison would miss one of them.
+        # time.time() does not have enough resolution on Windows, hence the explicit nudge.
         now = time.time()
         with self._lock:
             if now <= self._last_ts:
@@ -178,34 +186,42 @@ class EventBus:
             hit = self.rules.match(record["text"]) if self.rules else None
             record["keyword_hit"] = hit
             if self.watch_groups and record["group_id"] not in self.watch_groups and record["message_type"] == "group":
-                return record          # 落库但绝不入队，完全不唤醒
+                return record          # stored, but never queued: no wakeup at all
             if len(self._events) == self._events.maxlen:
                 self._dropped += 1
+                # Log the first drop and then every 100th, so a full buffer cannot flood the log.
                 if self._dropped == 1 or self._dropped % 100 == 0:
                     log.warning("环形缓冲已满（%d），累计挤掉 %d 条；完整历史在 SQLite 里",
                                 self._events.maxlen, self._dropped)
             self._events.append(record)
-            # 不再往 _pending_* 里塞 id：待处理与否完全由「at > 水位线」决定，
-            # 优先级从事件字段现算。少一份会腐烂的副本，就少一类不一致。
+            # No more pushing ids into _pending_*: pending-ness is decided entirely by
+            # "at > watermark", and priority is computed from the event fields. One less copy
+            # that can rot, one less class of inconsistency.
         return record
 
     def note_own_send(self):
         with self._lock:
+            # Remember when we last spoke, for the cooldown logic.
             self._last_own_send = time.time()
 
     def backfill(self, records: list) -> int:
-        """启动时把库里的历史消息灌回环形缓冲，让控制台一开机就有东西看。
+        """Feed historical messages from the DB back into the ring buffer at startup, so the
+        console has something to show from the moment it boots.
 
-        重启后缓冲是空的，控制台显示「暂无消息」，看着像机器人没在收消息 ——
-        其实库里一条不少，只是没灌回来。
+        After a restart the buffer is empty and the console shows "no messages", which looks
+        like the bot is not receiving anything — while the DB is actually intact, it just was
+        not reloaded.
 
-        两种记录都收：
-          id <= cursor  已经处理过的，照常展示
-          id >  cursor  上次没来得及处理的（正好在关机前那一下），**只展示、不补回**
-        —— 重启后去回一条几小时前的消息，比漏掉它更奇怪。
-        所以顺手把游标推过去，避免 autoreply 把它们当新消息重新回一遍。
+        Both kinds of records are accepted:
+          id <= cursor  already processed, displayed as usual
+          id >  cursor  left over from before the previous shutdown; **displayed only, never
+                        replayed** — answering a message from hours ago after a restart is
+                        stranger than missing it.
+        So the watermark is pushed past them as well, keeping autoreply from treating them as
+        new messages and answering them all over again.
 
-        群过滤条件和 push 保持一致，否则控制台会看到实时路径永远看不到的群。
+        The group filter matches push, otherwise the console would show groups the live path
+        never sees.
         """
         added: list = []
         unprocessed = 0
@@ -213,6 +229,7 @@ class EventBus:
             have = {e["id"] for e in self._events}
             for rec in sorted(records, key=lambda r: r.get("id") or 0):
                 eid = int(rec.get("id") or 0)
+                # Skip junk ids and anything already buffered (backfill is idempotent).
                 if eid <= 0 or eid in have:
                     continue
                 gid = str(rec.get("group_id") or "")
@@ -224,13 +241,15 @@ class EventBus:
                 added.append(rec)
                 have.add(eid)
             if added:
-                # 必须整体重排：新事件可能已经先进了缓冲，
-                # 直接 append 历史会变成 [新, 旧, 旧…]，控制台里顺序全乱。
+                # Must re-sort the whole thing: new events may already be in the buffer, and
+                # appending history directly would give [new, old, old...], scrambling the
+                # console order.
                 merged = sorted(list(self._events) + added, key=lambda r: r.get("id") or 0)
                 self._events.clear()
                 self._events.extend(merged[-self._events.maxlen:])
-            # 回填的历史一律"已看过"：重启后去回一条几小时前的消息，
-            # 比漏掉它更奇怪。水位线推到最新那条历史的时间即可。
+            # Backfilled history always counts as "already seen": answering a message from
+            # hours ago after a restart is stranger than missing it. Pushing the watermark to
+            # the newest historical timestamp is enough.
             newest_at = max((r.get("at") or 0.0) for r in self._events) if self._events else 0.0
             if newest_at > self._seen_at:
                 self._seen_at = newest_at
@@ -241,25 +260,28 @@ class EventBus:
                      if unprocessed else "")
         return len(added)
 
-    # ---------- 会话（群 / 私聊） ----------
+    # ---------- sessions (group / private chat) ----------
     @staticmethod
     def key_of(ev: dict) -> str:
-        """一条消息属于哪个会话。群聊用群号，私聊用对方 QQ 号。"""
+        """Which session a message belongs to. Group chat keys on the group id, private chat
+        on the other side's QQ number."""
         return str(ev.get("group_id") or ev.get("user_id") or "")
 
     def _seen_for(self, key: str) -> float:
-        """这个会话的水位线。没有记录时退回全局水位（升级时不重放历史）。"""
+        """This session's watermark. Falls back to the global one when there is no record
+        (so an upgrade does not replay history)."""
         if key in self._seen_by_key:
             return self._seen_by_key[key]
         return self._seen_at
 
-    # ---------- 批量视图（接话循环用这个，不再按条取） ----------
+    # ---------- batch views (the reply loop uses these, never per-message) ----------
     def unseen(self, limit: int = 200, key: str | None = None) -> list:
-        """水位线之后新来的消息，按时间升序。
+        """Messages newer than the watermark, in ascending time order.
 
-        这是接话循环唯一的时间线：一次拿到一整段，而不是一条一条地取。
-        不包含自己的发言 —— 自己说的不用回。
-        key 给定时只看这个会话。
+        This is the only timeline the reply loop uses: it takes a whole segment at once
+        instead of one message at a time.
+        Our own messages are excluded — nothing to answer there.
+        When key is given, only that session is considered.
         """
         with self._lock:
             cut = self._seen_for(key) if key is not None else self._seen_at
@@ -268,12 +290,13 @@ class EventBus:
                     and (key is None or self.key_of(e) == key)][:limit]
 
     def unseen_by_key(self, limit: int = 200) -> dict:
-        """按会话分桶的未读消息：{key: [事件…]}，每个桶按时间升序。
+        """Unread messages bucketed by session: {key: [events...]}, each bucket in time order.
 
-        接话循环按桶逐个处理 —— 一个群一段独立会话，
-        不再把所有群的消息揉成一批交给模型。
+        The reply loop handles the buckets one at a time — one group is one independent
+        conversation, no more merging every group's messages into one batch for the model.
         """
         with self._lock:
+            # Walking the buffer in order keeps each bucket in ascending time order.
             out: dict[str, list] = {}
             for e in self._events:
                 if e.get("is_self"):
@@ -286,39 +309,47 @@ class EventBus:
 
     def context(self, limit: int = 40, max_age: float = 0.0,
                 key: str | None = None) -> list:
-        """给模型看的上下文：最近 limit 条（**含自己说过的话**），按 id 升序。
+        """The context shown to the model: the last limit messages (**including our own**), in
+        id order.
 
-        只看「新消息」是不够的 —— 得知道在聊什么，才知道这句要不要接。
-        key 给定时**只取这个会话的**：A 群的上下文绝不能出现在 B 群的判断里。
+        Only looking at "new messages" is not enough — you have to know what is being talked
+        about to decide whether to join.
+        When key is given, **only this session's** messages are taken: group A's context must
+        never appear in group B's judgement.
 
-        max_age > 0 时再按时间切一刀：只保留最近 max_age 秒内的。
-        只按条数限制有个坑 —— 群里一安静，40 条能横跨好几小时，
-        模型就拿着几小时前的语境去接现在的话，看起来像答非所问。
+        max_age > 0 cuts it again by time: keep only the last max_age seconds.
+        A count-only limit has a trap — once the group goes quiet, 40 messages can span hours,
+        and the model then answers today's message with hours-old context, which reads as a
+        non-sequitur.
         """
         with self._lock:
             events = [e for e in self._events if key is None or self.key_of(e) == key]
+        # Copy under the lock, then filter outside it: the time check touches no shared state.
         if max_age > 0:
             cut = time.time() - max_age
             fresh_ev = [e for e in events if (e.get("at") or 0) >= cut]
-            # 全被时间切没了就退回按条数：宁可给点旧上下文，也别给空
+            # If the time cut clears everything, fall back to count: some old context
+            # beats none.
             events = fresh_ev or events
         return events[-limit:]
 
     def _save_by_key(self) -> None:
-        # 群会越来越多，别让这张表无限长；留最近活跃的 200 个
+        # Groups keep piling up, so cap this table; keep the 200 most recently active ones.
         if len(self._seen_by_key) > 200:
             keep = sorted(self._seen_by_key.items(), key=lambda kv: kv[1])[-200:]
             self._seen_by_key = dict(keep)
         self._save_json("bus.seen_by_key", self._seen_by_key)
 
     def mark_seen_at(self, through_at: float, key: str | None = None) -> float:
-        """把水位线推到 through_at —— **永远不会超过缓冲里最新那条的时间**。
+        """Push the watermark to through_at — **never past the newest event in the buffer**.
 
-        这是整套机制的安全阀。以前是 `self._processed = max(_, through_id)`，
-        没有任何上界，于是一个编出来的大 id 就能把水位推到未来、
-        顺手清空队列、还持久化下来 —— 机器人从此永久静默。
-        现在就算传进来一个荒谬的值，也只会被钳到"最新收到的那条"为止，
-        最多是让当前这批不需要再回了，绝不会吃掉还没到的消息。
+        This is the safety valve of the whole mechanism. It used to be
+        `self._processed = max(_, through_id)` with no upper bound at all, so one invented
+        large id pushed the watermark into the future, cleared the queue on the way, and was
+        persisted — the bot went permanently silent from then on.
+        Now even an absurd value is clamped to "the newest message received", which at worst
+        means this batch no longer needs an answer; it can never swallow messages that have
+        not arrived yet.
         """
         with self._lock:
             newest = max((e["at"] for e in self._events
@@ -336,17 +367,19 @@ class EventBus:
             return self._seen_by_key.get(key, self._seen_at)
 
     def mark_looked(self, through_id: int, key: str | None = None) -> float:
-        """按事件 id 推进水位线（批处理路径用）。
+        """Advance the watermark by event id (used by the batch path).
 
-        **id 找不到就什么都不做** —— 这是关键：调用方拿到的 id 一定来自
-        poll_events / unseen，所以正常路径必然找得到；找不到说明那个 id 是编的，
-        这时唯一正确的反应是不动，而不是"大概推到那儿吧"。
+        **If the id is not found, do nothing** — that is the key point: ids the caller gets
+        always come from poll_events / unseen, so the normal path is guaranteed to find them;
+        not finding one means the id was invented, and the only correct reaction is to stay
+        put, not to "push it roughly over there".
         """
         rec = self._get(int(through_id))
         if rec is None:
             log.warning("mark_looked(%s)：缓冲里没有这个 id，水位线不动", through_id)
             return self._seen_at
-        # 没显式给 key 就用这条消息自己的会话，避免拿 A 群的消息推 B 群的水位
+        # With no explicit key, use this message's own session, so group A's message cannot
+        # move group B's watermark.
         return self.mark_seen_at(rec["at"], key or self.key_of(rec))
 
     # ---------- read ----------
@@ -360,7 +393,7 @@ class EventBus:
         with self._lock:
             events = list(self._events)
             unseen = [e for e in events if e["at"] > self._seen_at and not e["is_self"]]
-            # 优先级现算，不再依赖一份会腐烂的 id 列表
+            # Priority is computed on the spot; no dependency on a copy that rots.
             high = [e for e in unseen if e.get("mentions_me")]
             mid = [e for e in unseen if not e.get("mentions_me") and e.get("keyword_hit")]
             low = [e for e in unseen if not e.get("mentions_me") and not e.get("keyword_hit")]
@@ -368,8 +401,8 @@ class EventBus:
         return {
             "stored": len(events),
             "last_id": events[-1]["id"] if events else 0,
-            # 兼容字段：报水位线处那条事件的 id（没有就是 0）。
-            # 真正的"处理到哪了"现在是 seen_at（时间戳）。
+            # Compatibility field: the id of the event sitting at the watermark (0 if none).
+            # The real "how far we processed" is seen_at (a timestamp) now.
             "cursor": next((e["id"] for e in reversed(events) if e["at"] <= seen_at), 0),
             "seen_at": seen_at,
             "last_at": events[-1]["at"] if events else 0.0,
@@ -386,11 +419,12 @@ class EventBus:
         }
 
     def pending(self, include_low: bool = True, limit: int = 50) -> list:
-        """水位线之后、值得处理的事件；非阻塞。
+        """Events after the watermark that are worth handling; non-blocking.
 
-        优先级（@ > 关键词 > 普通闲聊）现算，并且**总是包含自己发言**，
-        调用方（poll_events）自己按需要过滤 —— 这一点和以前一致。
-        include_low=False 时只给高/中优先级。
+        Priority (@ > keyword > ordinary chatter) is computed on the spot, and **our own
+        messages are always included** so the caller (poll_events) can filter as needed —
+        same as before.
+        include_low=False returns only high/medium priority.
         """
         with self._lock:
             cut = self._seen_at
@@ -402,25 +436,29 @@ class EventBus:
         return out[:max(0, int(limit))]
 
     def since(self, cursor: int = 0, limit: int = 100, include_low: bool = True) -> list:
-        """**纯读**：返回 id > cursor 的事件。include_low=False 时只给"值得处理"的。
+        """**Pure read**: return events with id > cursor. include_low=False gives only the
+        "worth handling" ones.
 
-        这里永不修改状态 —— 游标的推进只发生在 mark_processed。
+        This never mutates state — the cursor only advances in mark_processed.
         """
         with self._lock:
             events = [e for e in self._events if e["id"] > cursor]
+        # Our own messages always count as worth handling, so external pollers still see them.
         if not include_low:
             events = [e for e in events
                       if e.get("mentions_me") or e.get("keyword_hit") or e["is_self"]]
         return events[:limit]
 
     def mark_processed(self, through_id: int) -> float:
-        """按事件 id 推进水位线（MCP poll_events 那条路径用）。
+        """Advance the watermark by event id (used by the MCP poll_events path).
 
-        **找不到这个 id 就什么都不做。** 这是弃用 id 游标之后的核心保证：
-        以前 `max(processed, through_id)` 没有任何上界，编一个 99999999 就能
-        把水位推到未来、清空队列、再持久化 —— 机器人从此永远收不到消息，
-        连重启都救不回来（实测复现过）。
-        现在水位只能落在**缓冲里真实存在的那条消息**上，编的 id 找不到就直接忽略。
+        **If the id is not found, do nothing.** This is the core guarantee after dropping the
+        id cursor: `max(processed, through_id)` used to have no upper bound, so an invented
+        99999999 pushed the watermark into the future, cleared the queue, and persisted it —
+        the bot never received a message again and no restart could save it (reproduced in
+        testing).
+        Now the watermark can only land on **a message that really exists in the buffer**; an
+        invented id is simply ignored.
         """
         rec = self._get(int(through_id))
         if rec is None:

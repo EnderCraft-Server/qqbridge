@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
-"""接话逻辑自测：按会话分桶 + 多条发送 + 派活直连 Agent。
+"""Auto-reply logic self-test: per-conversation buckets, multi-part sends, dispatch.
 
-  - 闲聊：按群分桶，一个群一段独立会话，上下文不跨群
-  - 攒一段再判断，处理完整批才推进这个会话自己的水位线
-  - 派活：管理员 @ 它 / 私聊 -> 直接叫内置 Agent，不进批处理
-  - 回复可以有多条，程序分几次发出去
+  - Chit-chat: bucketed per group, one independent conversation per group, with no
+    context crossing between groups
+  - Collect a stretch of messages before deciding; this conversation's own watermark
+    only advances once the whole batch has been handled
+  - Dispatch: an admin @-mention / private message -> the built-in agent is called
+    directly, bypassing batch processing
+  - A reply may consist of several parts, sent as separate messages
 
-运行：python tests/test_autoreply.py
+Run: python tests/test_autoreply.py
 """
 import asyncio
 import sys
@@ -30,10 +33,13 @@ class FakeLLM:
         self.calls = []
 
     async def chat(self, messages, tools=None, **kw):
+        # Records every prompt and hands back the scripted raw text in order, so the
+        # assertions can tell how many times the model was asked.
         self.calls.append(messages)
         return {"text": self.replies.pop(0) if self.replies else ""}
 
 
+# Audit sink mirroring Store.audit(); states() makes it easy to assert on one action.
 class FakeStore:
     def __init__(self):
         self.records = []
@@ -46,7 +52,7 @@ class FakeStore:
 
 
 class FakeBus:
-    """按会话记水位线，和真 EventBus 的行为对齐。"""
+    """Records a watermark per conversation, mirroring the real EventBus."""
 
     def __init__(self, events):
         self.events = events
@@ -56,9 +62,12 @@ class FakeBus:
 
     @staticmethod
     def key_of(e):
+        # Bucket key: the group id for group chats, the peer QQ for private chats.
         return str(e.get("group_id") or e.get("user_id") or "")
 
     def unseen_by_key(self, limit=200):
+        # Self messages never count as unseen, and the watermark is a timestamp:
+        # anything at or before it has already been looked at.
         out = {}
         for e in self.events:
             if e.get("is_self"):
@@ -73,12 +82,16 @@ class FakeBus:
         return self.unseen_by_key(limit).get(key, [])
 
     def context(self, limit=40, max_age=0.0, key=None):
+        # Read-only window used to build the prompt; every call is recorded so the
+        # test can prove no group's context ever holds another group's messages.
         evs = [e for e in self.events if key is None or self.key_of(e) == key]
         evs = evs[-limit:]
         self.contexts.append(evs)
         return evs
 
     def mark_looked(self, through_id, key=None):
+        # Move one conversation's watermark to the timestamp of the given message id.
+        # max() matters: an event arriving out of order must not move it backwards.
         for e in self.events:
             if e["id"] == through_id:
                 k = key or self.key_of(e)
@@ -87,6 +100,7 @@ class FakeBus:
         return 0.0
 
     def mark_processed(self, through_id):
+        # The legacy single-key entry point still fans out to the per-key one.
         return self.mark_looked(through_id)
 
     def note_own_send(self):
@@ -117,6 +131,8 @@ class FakeAgentLoop:
         return {"text": self.text, "steps": 1, "tool_calls": []}
 
 
+# One normalized event. The timestamp defaults to the id, so ordering matches the
+# order in which the events were built.
 def ev(i, text="在吗", *, uid="12345", mention=False, gid="1060667115",
        mtype="group", sender="路人", at=None):
     return {"id": i, "at": at if at is not None else float(i), "group_id": gid,
@@ -125,6 +141,8 @@ def ev(i, text="在吗", *, uid="12345", mention=False, gid="1060667115",
             "segments": [{"type": "text", "text": text}]}
 
 
+# Wire up the whole pipeline with every delay at zero, so a single _tick() is
+# deterministic and the test never has to wait on a timer.
 def run(events, replies, *, agent_text="干完了", agent_loop=None):
     llm = FakeLLM(replies)
     store = FakeStore()
@@ -139,6 +157,7 @@ def run(events, replies, *, agent_text="干完了", agent_loop=None):
 
 
 def sent(bot):
+    # Group sends only; private replies go out with a different action.
     return [m for m in bot.msgs if m["action"] == "send_group_msg"]
 
 
@@ -213,6 +232,8 @@ assert not loop.tasks, "管理员闲聊不该被当成派活"
 assert not bot.msgs
 ok.append("边界：管理员在群里闲聊（没 @）走批处理，不会被当成命令")
 
+# The newest event just arrived, so the 3s settle window has not elapsed yet: this
+# tick must return without even asking the model.
 llm = FakeLLM(['{"replies": ["接"], "reason": "x"}'])
 store, bus, bot = FakeStore(), FakeBus([ev(1, "刚发的", at=time.time())]), FakeBot()
 agent = QqAgent(llm, "p", store=store)
@@ -230,6 +251,7 @@ assert clean_reply('{"reply": "第一行\\n第二行"}')[0] == "第一行\n第�
 assert clean_reply('{"reply": "hi", ') == ("", "failed")
 assert tidy_plain("a  \n\n\n\nb") == "a\n\nb"
 ok.append("多行纯文本完整保留、坏 JSON 依旧沉默")
+
 
 print("\n".join("PASS  " + x for x in ok))
 print("ALL PASS")

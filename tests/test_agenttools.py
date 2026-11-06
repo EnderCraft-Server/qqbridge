@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
-"""内置 Agent 自测：命令黑名单别误杀、卡住时别往群里发废话。
+"""Built-in agent self-test: the command blacklist must not hit innocent commands,
+and the agent must not post filler into the group when it gets stuck.
 
-起因是群里的真实翻车：模型想查系统信息，命令写成
+It started with a real failure in the group: the model wanted to inspect the system
+and wrote the command
   systeminfo | ... | Format-List | Out-String
-结果被黑名单拒了 —— 因为 r"\bformat\b" 本意挡「格式化磁盘」，
-却把 PowerShell 的 Format-List / Format-Table 全命中了。
-模型换着写法反复重试，30 步烧光，最后往群里发了句「（步骤用尽，未得到最终答复）」。
+but the blacklist rejected it -- because r"\bformat\b" was meant to block
+"format a disk", yet it also matched PowerShell's Format-List / Format-Table.
+The model kept retrying with different spellings, burned all 30 steps, and finally
+posted "（步骤用尽，未得到最终答复）" into the group.
 
-运行：python tests/test_agenttools.py
+Run: python tests/test_agenttools.py
 """
 import asyncio
 import json
@@ -22,7 +25,7 @@ from qqbridge.agenttools import LocalTools
 
 ok = []
 
-# ---------- 1. 黑名单：该放的放，该拦的拦 ----------
+# ---------- 1. Blacklist: let through what should pass, block what must be blocked ----------
 tmp = Path(tempfile.mkdtemp(prefix="qqbridge_tools_"))
 tools = LocalTools(tmp)
 
@@ -53,6 +56,9 @@ SHOULD_BLOCK = [
     "rm -rf /",
     r"reg delete HKLM\Software\Foo",
 ]
+# Only the safety-policy message counts as a rejection. Any other exception (a
+# timeout, a missing binary, an ordinary command failure) is a different problem
+# and must not be read as "blocked", or this test could pass for the wrong reason.
 misjudged = []
 for c in SHOULD_PASS:
     try:
@@ -70,7 +76,11 @@ for c in SHOULD_BLOCK:
 assert not misjudged, "\n".join(misjudged)
 ok.append(f"命令黑名单：{len(SHOULD_PASS)} 条只读命令放行（含 Format-List/Table），{len(SHOULD_BLOCK)} 条危险命令拦住")
 
-# ---------- 2. 路径越界 ----------
+# ---------- 2. Path traversal ----------
+# Containment has to hold even though this path points at a real, readable file:
+# the refusal is about the resolved path leaving the root, not about permissions.
+# NB: the first assertion after the call is a tautology (it ends in "or True"), so
+# the second one is what actually pins the behavior down.
 try:
     tools.read_file("../../../../Windows/win.ini")
     raise AssertionError("越界读居然通过了")
@@ -80,7 +90,7 @@ except Exception as exc:
 ok.append("路径越界被拒绝")
 
 
-# ---------- 3. 死循环检测：同一个调用反复失败就停下来 ----------
+# ---------- 3. Repeat-failure detection: stop when the same call keeps failing ----------
 class ScriptLLM:
     configured = True
 
@@ -88,16 +98,19 @@ class ScriptLLM:
         self.script = list(script)
 
     async def chat(self, messages, tools=None, *, max_tokens=None, temperature=None):
-        # agentloop 现在会按次传 max_tokens（学术模式要放开长度），fake 得跟上。
+        # agentloop now passes max_tokens per call (academic mode needs a higher
+        # limit), so the fake has to accept and ignore it.
         return self.script.pop(0) if self.script else {"text": ""}
 
 
+# A tool layer that always raises the safety-policy error: exactly the situation
+# that used to make the loop retry until every step was gone.
 class FakeTools:
     def schemas(self):
         return [{"type": "function", "function": {"name": "run_command", "parameters": {}}}]
 
     async def dispatch_async(self, name, args):
-        raise RuntimeError("该命令被安全策略拒绝。")     # 一直失败
+        raise RuntimeError("该命令被安全策略拒绝。")     # always fails
 
 
 class FakeStore:
@@ -108,13 +121,16 @@ class FakeStore:
         self.rows.append({"action": action, "state": state, "params": params})
 
 
+# One run_command tool call. Case 3a repeats the same arguments every time, which is
+# what trips the repeat detector; 3b varies them so it reaches the step limit.
 def tool_call(step, args="same"):
     return {"text": "", "tool_calls": [{"id": f"c{step}", "type": "function",
             "function": {"name": "run_command",
                          "arguments": json.dumps({"command": args})}}]}
 
 
-# 3a. 同样的参数连续失败 -> 提前收尾，不是把步数烧光
+# 3a. The same arguments failing over and over -> wrap up early instead of burning
+# every step
 store = FakeStore()
 llm = ScriptLLM([tool_call(1), tool_call(2), tool_call(3), {"text": "这命令被安全策略挡了，我换个法子。"}])
 loop = AgentLoop(llm, FakeTools(), max_steps=30, store=store)
@@ -124,7 +140,8 @@ assert out["text"] == "这命令被安全策略挡了，我换个法子。", out
 assert store.rows and store.rows[-1]["state"] == "STOPPED", store.rows
 ok.append("同样的工具调用反复失败 -> 第 3 次就停下并要一句人话（不再烧光步数）")
 
-# 3b. 步数真的用尽时，给的是人话，不是「（步骤用尽，未得到最终答复）」
+# 3b. When the steps really do run out, the user gets a human sentence, not the
+# old "（步骤用尽，未得到最终答复）" filler
 store = FakeStore()
 script = [tool_call(i, args=f"cmd{i}") for i in range(1, 4)]
 script.append({"text": "查到一半断了，你要的是 CPU 还是内存？"})
@@ -135,11 +152,12 @@ assert "步骤用尽" not in out["text"], "还在发那句废话：" + out["text
 assert out["text"].startswith("查到一半断了"), out["text"]
 ok.append("步数用尽 -> 再问一次模型要一句人话，不再发「（步骤用尽，未得到最终答复）」")
 
-# 3c. 正常收尾不受影响
+# 3c. A normal finish is unaffected
 store = FakeStore()
 llm = ScriptLLM([{"text": "", "tool_calls": [{"id": "c1", "type": "function", "function": {
     "name": "run_command", "arguments": json.dumps({"command": "nonexistent-tool"})}}]},
     {"text": "搞定了"}])
+# Same fake, but the tool call now succeeds, so the happy path can be checked.
 class OkTools(FakeTools):
     async def dispatch_async(self, name, args):
         return {"ok": True, "stdout": "x"}

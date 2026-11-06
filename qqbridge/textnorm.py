@@ -1,32 +1,39 @@
-"""发出前的文字规整。
+"""Text cleanup before sending.
 
-群里说话和写文章不是一回事。这些讲究是真的会影响「像不像人」：
-  - 句尾挂个「。」特别像客服播报，真人打字很少收句号
-  - 「...」是键盘省略号，「。。。」才是中文语境里的无语/尴尬
-  - 一段话塞进一条消息，再短也像在念稿；拆成几条分开发才像在打字
+Talking in a group chat is not the same as writing an article. These details
+genuinely change how human it reads:
+  - A trailing "。" sounds exactly like a customer-service announcement; real
+    people rarely type a full stop
+  - "..." is a keyboard ellipsis, while "。。。" is what speechlessness/awkwardness
+    looks like in a Chinese-language chat
+  - A whole paragraph crammed into one message reads like reading a script, no
+    matter how short; splitting it into several messages feels like typing
 
-所以这些**不靠 persona 去劝模型**（劝了也不稳定），而是在代码里兜住：
-模型怎么写都行，发出去之前统一过一遍。
+So this is **not delegated to the persona by asking the model nicely** (that is
+unreliable anyway); it is enforced in code: the model may write however it likes,
+everything goes through one pass before it is sent.
 """
 from __future__ import annotations
 
 import re
 
-# 一条消息最多拆几段。拆太碎会刷屏，3 条是「补一句、改口」的自然上限。
+# Max number of messages to split into. Splitting too finely spams the group;
+# 3 is the natural ceiling for "one more thing" / "actually, a correction".
 MAX_PARTS = 3
 
 
 def tidy_outgoing(text: str) -> str:
-    """单条消息的规整：省略号、句尾句号。"""
+    """Tidy one message: ellipses and the trailing full stop."""
     s = str(text or "").strip()
     if not s:
         return ""
 
-    # 省略号统一成中文的三个句号；英文点号和 unicode 省略号都算
+    # Normalize ellipses to three Chinese full stops; ASCII dots and the unicode
+    # ellipsis both count
     s = re.sub(r"\.{3,}", "。。。", s)
     s = re.sub(r"[…]+", "。。。", s)
 
-    # 句尾不收句号。但「。。。」「。。」是故意的语气，别动
+    # No trailing full stop. But "。。。" / "。。" is a deliberate tone, leave it be
     if s.endswith("。") and not s.endswith("。。"):
         s = s[:-1].rstrip()
     if s.endswith(".") and not s.endswith(".."):
@@ -35,14 +42,17 @@ def tidy_outgoing(text: str) -> str:
 
 
 def split_messages(*candidates) -> list[str]:
-    """把模型给的东西整理成「要分几次发」。
+    """Turn whatever the model returned into "how many messages to send".
 
-    两种来源都收：
-      - 模型直接给数组（首选）
-      - 模型给了一整段、里面带换行（老格式 / 它没听格式）
-    一条多行、或者数组里某一项自带换行，都会在这里被拆开。
-    整体最多 MAX_PARTS 条，超出的并到最后一条里，避免刷屏。
+    Two sources are accepted:
+      - the model returns an array directly (preferred)
+      - the model returns one paragraph with newlines in it (legacy format / it
+        ignored the format instruction)
+    A multi-line item, or an array element that itself contains newlines, is
+    split apart here. At most MAX_PARTS messages overall; anything beyond that is
+    merged into the last one so the group does not get spammed.
     """
+    # Flatten both input shapes into a plain list of strings first.
     raw: list[str] = []
     for item in candidates:
         if item is None:
@@ -52,6 +62,8 @@ def split_messages(*candidates) -> list[str]:
         else:
             raw.append(str(item))
 
+    # One line becomes one message; empties are dropped so a blank line never
+    # turns into an empty send.
     parts: list[str] = []
     for chunk in raw:
         for line in str(chunk).replace("\r", "").split("\n"):
@@ -59,6 +71,8 @@ def split_messages(*candidates) -> list[str]:
             if line:
                 parts.append(line)
 
+    # Overflow is folded into the last slot: neither dropped silently nor spilled
+    # out as extra messages.
     if len(parts) > MAX_PARTS:
         parts = parts[:MAX_PARTS - 1] + [" ".join(parts[MAX_PARTS - 1:])]
     return parts

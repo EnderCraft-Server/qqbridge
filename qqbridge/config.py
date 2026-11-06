@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 
 
-# 这些值等同于「没配」：曾经的默认值和常见占位符。
+# Values that count as "not configured": former defaults and common placeholders.
 _WEAK_TOKENS = {
     "", "change-me", "changeme", "change_me", "default", "token",
     "password", "123456", "admin", "secret", "your-token", "xxx",
@@ -17,22 +17,27 @@ _WEAK_TOKENS = {
 
 
 def _resolve_mcp_token() -> str:
-    """取 MCP 令牌；缺失或用了弱默认值时，生成一个并落盘到旁边的小文件。
+    """Return the MCP token; when it is missing or a weak default, generate one
+    and persist it to a small sidecar file next to the project.
 
-    为什么不改 .env：
-    这里是 import 时期运行的。在这里重写 .env 等于让"导入模块"这个动作
-    去改用户的生产配置，而且会把原来的令牌覆盖掉。
-    我自己就在这上面踩了一次：一个测试进程把 .env 里的 MCP_TOKEN 换成了新的，
-    而 DSH 那边配的还是旧令牌 —— MCP 连接直接断掉。配置文件不能被库里的代码偷偷改。
+    Why not rewrite .env:
+    this runs at import time. Rewriting .env here would mean the act of
+    "importing a module" mutates the user's production config, and it would
+    overwrite the previous token. I got burned by exactly this: a test process
+    replaced MCP_TOKEN in .env with a fresh value while DSH was still configured
+    with the old one -- the MCP connection dropped on the spot. Config files must
+    never be silently changed by library code.
 
-    为什么不直接拒绝启动：那会把「没配 token」变成「服务起不来」，
-    对已经跑着的部署是硬中断。
+    Why not simply refuse to start: that turns "token not configured" into
+    "service will not boot", which is a hard outage for deployments that are
+    already running.
     """
     raw = (os.environ.get("MCP_TOKEN") or "").strip()
     if raw and raw.lower() not in _WEAK_TOKENS:
         return raw
 
-    # 侧车文件：不碰 .env，但重启后令牌不变（否则 MCP 客户端每次都要重配）
+    # Sidecar file: .env is left alone, yet the token survives a restart
+    # (otherwise the MCP client would have to be reconfigured every single time)
     side = ROOT / "data" / ".mcp_token"
     try:
         if side.is_file():
@@ -56,6 +61,7 @@ def _resolve_mcp_token() -> str:
 
 
 def _bool(name: str, default: bool = False) -> bool:
+    """Read a boolean env var; unset or empty falls back to *default*."""
     raw = (os.environ.get(name) or "").strip().lower()
     if not raw:
         return default
@@ -63,6 +69,7 @@ def _bool(name: str, default: bool = False) -> bool:
 
 
 def _int(name: str, default: int) -> int:
+    """Read an int env var; a garbage value falls back to *default*, not an exception."""
     try:
         return int((os.environ.get(name) or "").strip() or default)
     except ValueError:
@@ -70,7 +77,7 @@ def _int(name: str, default: int) -> int:
 
 
 def admins() -> set:
-    """管理员：可以执行 /stop /start /auto。留空则退回 OWNER_IDS。"""
+    """Admins: allowed to run /stop /start /auto. Empty falls back to OWNER_IDS."""
     raw = os.environ.get("ADMIN_IDS") or ""
     return {x.strip() for x in raw.replace("，", ",").split(",") if x.strip()}
 
@@ -82,9 +89,10 @@ def owners() -> set:
 
 class Config:
     def __init__(self):
-        # 实例级根目录。persist_permissions() 曾经直接用模块级 ROOT，
-        # 结果测试里改 config.ROOT 拦不住它，把测试值写进了仓库真实的 .env。
-        # 现在只认 self.ROOT，改一处就够。
+        # Per-instance root directory. persist_permissions() used to read the
+        # module-level ROOT directly, so overriding config.ROOT in a test could
+        # not intercept it and it wrote test values into the repository's real
+        # .env. Now only self.ROOT counts, so there is one place to change.
         self.ROOT = ROOT
         self.http = (os.environ.get("ONEBOT_HTTP") or "http://127.0.0.1:3000").rstrip("/")
         self.ws = (os.environ.get("ONEBOT_WS") or "ws://127.0.0.1:3001").strip()
@@ -99,27 +107,33 @@ class Config:
         self.allow_manage = _bool("ALLOW_MANAGE", False)
         self.owners = owners()
         self.admins = admins() or self.owners
-        # MCP / 控制台共用令牌。**绝不能有众所周知的默认值** ——
-        # 原来这里回退成 "change-me"，而它同时是控制台会话令牌和 MCP bearer：
-        # 谁都能拿它改 OWNER_IDS / ALLOW_SEND / ALLOW_MANAGE、重写 LLM key、派 agent。
-        # 没配就现生成一个强随机值并落盘，同时告警。
+        # Token shared by MCP and the console. **It must never have a well-known
+        # default** -- this used to fall back to "change-me", which doubled as the
+        # console session token and the MCP bearer: anyone could use it to change
+        # OWNER_IDS / ALLOW_SEND / ALLOW_MANAGE, rewrite the LLM key, or dispatch
+        # agents. When unset we mint a strong random value, persist it, and warn.
         self.mcp_token = _resolve_mcp_token()
-        # 自带模型
+        # Built-in model
         self.llm_api_base = (os.environ.get("LLM_API_BASE") or "https://api.deepseek.com").rstrip("/")
         self.llm_api_key = (os.environ.get("LLM_API_KEY") or os.environ.get("DEEPSEEK_API_KEY") or "").strip()
         self.llm_model = (os.environ.get("LLM_MODEL") or "deepseek-chat").strip()
         self.llm_max_tokens = _int("LLM_MAX_TOKENS", 2048)
-        # 群里的图片：取回来喂给视觉模型（模型名里带 vision 才真正生效）
+        # Images posted in the group: fetched and fed to the vision model (only
+        # really takes effect when the model name contains "vision")
         self.vision_enabled = _bool("VISION_ENABLED", True)
-        # 群里发的链接：抓回正文再判断（闲聊路径没有工具，否则链接永远被无视）
+        # Links posted in the group: fetch the body first, then decide (the
+        # chit-chat path has no tools, so links would otherwise always be ignored)
         self.link_preview = _bool("LINK_PREVIEW", True)
-        # 发图前用视觉模型核验内容（安全 + 是否符合预期用途）。默认开，
-        # 关掉等于允许未经任何人过目的图直接进群 —— 出过萝莉图的事，别关。
+        # Run the vision model over an image before sending (safety, plus does it
+        # match the intended use). On by default; turning it off means images
+        # nobody vetted go straight into the group -- we have had an incident with
+        # inappropriate images of minors before, do not turn this off.
         self.send_image_review = _bool("SEND_IMAGE_REVIEW", True)
-        # 学术模式：命中学术/技术提问时，关掉群友人设并放开长度上限
+        # Academic mode: on an academic/technical question, drop the group-chat
+        # persona and lift the length cap
         self.academic_mode = _bool("ACADEMIC_MODE", True)
         self.llm_academic_max_tokens = _int("LLM_ACADEMIC_MAX_TOKENS", 8192)
-        # 学术答案不按群聊长度截断（群聊默认 800 字）
+        # Academic answers are not truncated to chat length (chat defaults to 800 chars)
         self.academic_reply_chars = _int("ACADEMIC_REPLY_CHARS", 6000)
         self.llm_thinking = (os.environ.get("LLM_THINKING") or "disabled").strip().lower()
         self.llm_reasoning_effort = (os.environ.get("LLM_REASONING_EFFORT") or "").strip().lower()
@@ -129,15 +143,18 @@ class Config:
             self.llm_temperature = float(self.llm_temperature_raw)
         except ValueError:
             self.llm_temperature = 1.0
-        # system prompt：文件优先，便于热改
+        # System prompt: the file wins, so it can be hot-edited
         self.system_prompt_file = (os.environ.get("SYSTEM_PROMPT_FILE") or "data/system_prompt.md").strip()
-        # 是否让 bot 自己决定接话（关掉则只做 MCP 工具，不主动发言）
+        # Whether the bot decides for itself when to join in (off = MCP tools
+        # only, never speaks unprompted)
         self.auto_reply = _bool("AUTO_REPLY", True)
-        # 内置 Agent：允许模型读写文件、执行命令（替代外部 Agent 宿主）
+        # Built-in Agent: lets the model read/write files and run commands
+        # (replaces an external agent host)
         self.agent_enabled = _bool("AGENT_ENABLED", True)
         self.agent_root = (os.environ.get("AGENT_ROOT") or str(ROOT)).strip()
-        # 单次任务的工具调用上限。默认给得比较松：真正兜底的是 autoreply 的
-        # agent_timeout（90 秒）和 agentloop 里的死循环检测，不是这个数字。
+        # Tool-call cap for a single task. Deliberately loose: the real backstops
+        # are autoreply's agent_timeout (90 seconds) and the loop detection in
+        # agentloop, not this number.
         self.agent_max_steps = _int("AGENT_MAX_STEPS", 60)
 
         raw_watch = (os.environ.get("WATCH_GROUPS") or "").strip()
@@ -160,6 +177,9 @@ class Config:
             "LLM_MODEL": self.llm_model,
             "AUTO_REPLY": "true" if self.auto_reply else "false",
         }
+        # Merge line by line instead of rewriting the file: keys we own are
+        # replaced in place, everything else (comments, ordering, the user's own
+        # settings) is preserved byte for byte.
         seen = set()
         out = []
         for line in lines:
@@ -169,6 +189,7 @@ class Config:
                 seen.add(key)
             else:
                 out.append(line)
+        # Keys that were not present at all get appended at the end.
         for key, val in want.items():
             out.append(f"{key}={val}")
         path.write_text("\n".join(out) + "\n", encoding="utf-8")

@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
-"""出口 HTTP 策略自测：代理挂了不能把机器人一起拖死。
+"""Outbound HTTP policy self-test: a dead proxy must not drag the bot down with it.
 
-2026-10-25 的真实故障：梯子关掉之后，httpx 默认 trust_env=True 仍然把所有请求
-丢给已经没人监听的 127.0.0.1:7897，于是每一条都
-ConnectError: All connection attempts failed —— 模型、看图、抓网页一起哑。
+The real incident on 2026-10-25: after the VPN was turned off, httpx still had
+trust_env=True by default and kept handing every request to 127.0.0.1:7897, where
+nothing was listening any more, so every single call ended in
+ConnectError: All connection attempts failed -- the model, image viewing and web
+fetching all went silent at once.
 
-这里钉三件事：
-  1. 回环地址永远直连，哪怕环境里塞了个死代理
-  2. 远端地址遇到死代理会自动退回直连
-  3. 策略会记住上次成功的路径，不会每次都在死代理上耗一个超时
+Three things are pinned down here:
+  1. Loopback addresses always go direct, even with a dead proxy in the environment
+  2. Remote addresses fall back to a direct connection when the proxy is dead
+  3. The policy remembers the last successful path, so it does not burn a timeout on
+     the dead proxy every time
 
-运行：python tests/test_net.py
+Run: python tests/test_net.py
 """
 import asyncio
 import os
@@ -37,6 +40,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, *args):
+        # Silence the default stderr access log so the test output stays readable.
         pass
 
 
@@ -46,6 +50,8 @@ def serve():
     return srv, srv.server_address[1]
 
 
+# Best-effort non-loopback IPv4 address: only the remote-path cases need it, so a
+# machine without one simply skips them.
 def lan_ip() -> str:
     try:
         ip = socket.gethostbyname(socket.gethostname())
@@ -54,7 +60,7 @@ def lan_ip() -> str:
         return ""
 
 
-# ---------- 1. 回环判定 ----------
+# ---------- 1. Loopback detection ----------
 assert net.is_loopback("127.0.0.1")
 assert net.is_loopback("localhost")
 assert net.is_loopback("::1")
@@ -63,7 +69,7 @@ assert not net.is_loopback("api.deepseek.com")
 assert not net.is_loopback("192.168.1.10")
 ok.append("回环判定正确（127.0.0.1 / localhost / ::1 都算）")
 
-# ---------- 2. 策略顺序 ----------
+# ---------- 2. Policy order ----------
 assert net._order("127.0.0.1") == [False], "回环只该有直连一种可能"
 net._REMOTE_MODE = None
 assert net._order("api.deepseek.com") == [True, False], "没探过时先尊重系统代理"
@@ -74,9 +80,10 @@ assert net._order("api.deepseek.com") == [True, False], "记住代理后应当�
 net._REMOTE_MODE = None
 ok.append("出口顺序：回环只有直连；远端按上次成功的路径走")
 
+# Bound on 0.0.0.0 so the same server is also reachable through the LAN IP.
 srv, port = serve()
 try:
-    # ---------- 3. 环境里塞个死代理，回环照样通 ----------
+    # ---------- 3. A dead proxy in the env, loopback still works ----------
     os.environ["HTTP_PROXY"] = "http://127.0.0.1:1"
     os.environ["HTTPS_PROXY"] = "http://127.0.0.1:1"
     os.environ["ALL_PROXY"] = "http://127.0.0.1:1"
@@ -86,21 +93,24 @@ try:
     assert resp.status_code == 200 and resp.text == "hello-from-fake-server", resp.text
     ok.append("回环：环境里有死代理也直连成功（不会把 127.0.0.1 丢给代理）")
 
-    # ---------- 4. 远端：死代理 -> 自动退回直连 ----------
+    # ---------- 4. Remote: dead proxy -> automatic fallback to direct ----------
     ip = lan_ip()
     if ip:
+        # Reset the memoized mode: it is process-global state left over from case 2.
         net._REMOTE_MODE = None
         resp = asyncio.run(net.arequest("GET", f"http://{ip}:{port}/", timeout=8))
         assert resp.status_code == 200, resp.status_code
         assert net.mode() == "direct", f"回退之后应当记住直连，实际 {net.mode()}"
-        # 记性：再发一次应当直接走直连，不再先撞代理
+        # Memory: the next request should go direct at once, without hitting the proxy first
         resp = asyncio.run(net.arequest("GET", f"http://{ip}:{port}/", timeout=8))
         assert resp.status_code == 200
         ok.append(f"远端（{ip}）：死代理连不上 -> 自动退回直连，并记住这个选择")
     else:
         ok.append("远端回退：跳过（本机拿不到非回环地址）")
 
-    # ---------- 5. 两种都不通时，报错要说人话 ----------
+    # ---------- 5. When neither path works, the error must still be readable ----------
+    # The AssertionError raised below must not be swallowed by the broad handler, which
+    # is why it is caught and re-raised separately first.
     try:
         asyncio.run(net.arequest("GET", "http://127.0.0.1:1/", timeout=2))
         raise AssertionError("对着没人监听的端口居然成功了？")
@@ -111,6 +121,7 @@ try:
         assert "Connect" in msg or "连接失败" in msg, msg
         ok.append("全都不通时抛出可读的错误，而不是一句 All connection attempts failed")
 finally:
+    # Restore the environment even if an assertion fired above.
     for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
         os.environ.pop(k, None)
     srv.shutdown()
