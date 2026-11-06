@@ -1,9 +1,11 @@
-"""控制台认证与协议。
+"""Console authentication and agreement protocol.
 
-- 首次访问必须同意《使用须知》与《最终用户许可协议》
-- 同意后设置管理员账号密码；之后每次进后台都要登录
-- 密码用 PBKDF2-SHA256 加盐存储，永不落明文
-- 登录态是内存里的随机 token（重启即失效），放在 HttpOnly Cookie
+- On first visit the user must accept the Terms of Use and the End User License Agreement
+- After accepting, they set the admin username and password; every later console visit
+  requires a login
+- Passwords are salted and stored with PBKDF2-SHA256, never in plaintext
+- Login state is a random token held in memory (gone on restart), carried in an HttpOnly
+  cookie
 """
 from __future__ import annotations
 
@@ -18,7 +20,7 @@ from pathlib import Path
 log = logging.getLogger("qqbridge.auth")
 
 AGREEMENT_VERSION = "1.0"
-SESSION_TTL = 7 * 24 * 3600          # 登录态有效期：7 天
+SESSION_TTL = 7 * 24 * 3600          # session lifetime: 7 days
 
 TERMS = """# 使用须知
 
@@ -121,6 +123,9 @@ EULA = """# 最终用户许可协议（EULA）
 
 
 def _hash(password: str, salt: str) -> str:
+    # 200k PBKDF2 rounds: slow enough to make an offline dictionary attack expensive, yet
+    # still fast enough for an interactive login. The salt is persisted as hex text, hence
+    # the bytes.fromhex() before it goes into the KDF.
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
                                bytes.fromhex(salt), 200_000).hex()
 
@@ -128,11 +133,13 @@ def _hash(password: str, salt: str) -> str:
 class Auth:
     def __init__(self, path: Path):
         self.path = path
+        # token -> expiry timestamp. Deliberately in-memory only: a restart invalidates
+        # every session, which is the safe default for a single-user local tool.
         self.sessions: dict[str, float] = {}
         self.data: dict = {}
         self.load()
 
-    # ---------- 持久化 ----------
+    # ---------- Persistence ----------
     def load(self):
         if self.path.is_file():
             try:
@@ -143,12 +150,16 @@ class Auth:
         return self.data
 
     def save(self):
+        # ensure_ascii=False keeps non-ASCII (e.g. Chinese) usernames readable in the file
+        # instead of turning them into \uXXXX escapes.
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=1), encoding="utf-8")
 
-    # ---------- 状态 ----------
+    # ---------- State ----------
     @property
     def agreed(self) -> bool:
+        # The stored version has to match the current one, so bumping AGREEMENT_VERSION in
+        # the code makes every existing install re-consent to the new terms.
         return bool(self.data.get("agreed_at")) and \
             self.data.get("agreement_version") == AGREEMENT_VERSION
 
@@ -165,8 +176,9 @@ class Auth:
             "agreed_at": self.data.get("agreed_at"),
         }
 
-    # ---------- 首次初始化 ----------
+    # ---------- First-time setup ----------
     def accept(self, username: str, password: str):
+        # Setup runs exactly once; afterwards only change_password() may touch credentials.
         if self.agreed and self.has_account:
             raise ValueError("已初始化，不能重复设置。")
         username = (username or "").strip()
@@ -185,7 +197,7 @@ class Auth:
         self.save()
         return self.state()
 
-    # ---------- 登录 ----------
+    # ---------- Login ----------
     def login(self, username: str, password: str) -> str:
         if not (self.agreed and self.has_account):
             raise ValueError("尚未完成初始化。")
@@ -193,6 +205,7 @@ class Auth:
             raise ValueError("用户名或密码错误。")
         expect = self.data.get("pwd_hash", "")
         got = _hash(password or "", self.data.get("salt", ""))
+        # Constant-time compare, so response timing does not leak how much of the hash matched.
         if not hmac.compare_digest(expect, got):
             raise ValueError("用户名或密码错误。")
         token = secrets.token_urlsafe(32)
@@ -206,6 +219,8 @@ class Auth:
         if exp is None:
             return False
         if exp < time.time():
+            # Expired tokens are dropped here rather than by a background sweeper, so the
+            # dict only holds sessions that someone actually tried to use again.
             self.sessions.pop(token, None)
             return False
         return True
@@ -219,7 +234,9 @@ class Auth:
             raise ValueError("原密码错误。")
         if len(new or "") < 8:
             raise ValueError("新密码至少 8 位。")
+        # A fresh salt goes with the new password as well, so a hash leaked before the
+        # change is worthless.
         salt = secrets.token_hex(16)
         self.data.update({"salt": salt, "pwd_hash": _hash(new, salt)})
         self.save()
-        self.sessions.clear()          # 改密后强制重新登录
+        self.sessions.clear()          # force a fresh login after a password change

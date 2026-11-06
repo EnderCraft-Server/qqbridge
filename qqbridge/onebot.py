@@ -37,15 +37,17 @@ class OneBot:
 
     # ---------- lifecycle ----------
     def _trust_env(self) -> bool:
-        """要不要让 httpx 读系统代理设置。
+        """Whether httpx should read the system proxy settings.
 
-        **回环地址一律不走代理。** 踩过的坑：宿主机开了梯子（系统代理
-        127.0.0.1:7897）之后，httpx 默认 trust_env=True 会把
-        http://127.0.0.1:3000/get_login_info 也丢给代理，
-        而代理不转发回环地址 -> ConnectError: All connection attempts failed
-        -> 拿不到 self_id -> @ 消息全部识别不出来。
+        **Loopback addresses never go through a proxy.** The pitfall: once the host
+        machine turned on a VPN (system proxy 127.0.0.1:7897), httpx's default
+        trust_env=True also handed http://127.0.0.1:3000/get_login_info to the
+        proxy, and the proxy does not forward loopback addresses ->
+        ConnectError: All connection attempts failed -> self_id could not be
+        fetched -> every @ message became unrecognizable.
 
-        OneBot 挂在本机时不需要代理；挂在远端时才跟随系统设置。
+        OneBot on the local machine needs no proxy; only a remote one follows the
+        system settings.
         """
         host = (urlparse(self.http).hostname or "").lower()
         if host in ("127.0.0.1", "localhost", "::1", "[::1]"):
@@ -77,6 +79,7 @@ class OneBot:
             try:
                 await self._ws_task
             except (asyncio.CancelledError, Exception):
+                # Swallow everything: shutdown must never raise.
                 pass
         if self._client:
             await self._client.aclose()
@@ -96,20 +99,27 @@ class OneBot:
         )
         resp.raise_for_status()
         data = resp.json()
+        # OneBot reports logical failures as status != "ok", with wording/retcode
+        # explaining why; raise with that rather than a bare HTTP error.
         if data.get("status") != "ok":
             raise OneBotError(f"{action}: {data.get('wording') or data.get('retcode')}")
         return data.get("data")
 
     # ---------- WebSocket ----------
     async def _ws_loop(self):
-        """常驻事件流。三条纪律：
+        """Persistent event stream. Three rules:
 
-        1. connected 必须随时反映真实状态 —— 控制台右上角的「QQ 已连接」是排查
-           「收不到消息」的第一入口，它撒谎的话后面全是白费功夫。
-        2. 每次重连之前都要睡一下。原来正常断开（服务端主动关）走的是 async for
-           自然结束那条路，不经过 except，于是不 sleep 直接重连：
-           对方要是「接了立刻关」，这里就成了死循环猛敲对面。
-        3. 退避只有连着活得够久才重置，否则短连接会把退避重置成 1 秒，同样等于没有。
+        1. connected must reflect the real state at all times -- the "QQ connected"
+           badge in the top-right of the console is the first place anyone looks
+           when "no messages arrive"; if it lies, everything after that is wasted
+           effort.
+        2. Always sleep before reconnecting. A clean disconnect (the server closing
+           on purpose) used to run the async for loop to its natural end, bypassing
+           except, and then reconnect with no sleep: if the peer "accepts and
+           immediately closes", this becomes a hot loop hammering the other side.
+        3. Backoff is only reset once the connection has lived long enough;
+           otherwise a short-lived connection resets it to 1 second, which again
+           amounts to no backoff at all.
         """
         backoff = 1.0
         headers = self._ws_headers()
@@ -140,7 +150,8 @@ class OneBot:
             finally:
                 self.connected = False
 
-            # 活过 30 秒才算「连上了」，短命连接继续按退避往上翻
+            # Only a connection that survived 30 seconds counts as "connected";
+            # short-lived ones keep pushing the backoff up
             if time.monotonic() - started > 30.0:
                 backoff = 1.0
             try:

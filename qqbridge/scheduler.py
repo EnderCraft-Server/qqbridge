@@ -18,9 +18,9 @@ log = logging.getLogger("qqbridge.scheduler")
 
 DEFAULTS = {
     "enabled": False,
-    "interval_seconds": 300,     # 用户指定：每隔多久看一次群
-    "min_gap_seconds": 30,       # 两次唤醒之间的硬下限
-    "quiet_hours": [],           # 例如 ["23:30", "07:00"]
+    "interval_seconds": 300,     # user-specified: how often to look at the group
+    "min_gap_seconds": 30,       # hard lower bound between two wakes
+    "quiet_hours": [],           # e.g. ["23:30", "07:00"]
     "max_turns_per_hour": 60,
 }
 
@@ -37,9 +37,10 @@ class Scheduler:
         self.turns: list[dict] = []
         self._task = None
         self._stop = asyncio.Event()
-        # 设置一改就戳一下，让循环立刻按新间隔重新排期。
-        # 否则把间隔从 300 秒改成 10 秒，用户还得再等最多 300 秒才看到变化，
-        # 表现就是「控制台改了没用」。
+        # Nudge this whenever settings change so the loop reschedules immediately
+        # with the new interval. Otherwise changing the interval from 300s to 10s
+        # makes the user wait up to another 300s to see anything, which reads as
+        # "changing it in the console does nothing".
         self._wake = asyncio.Event()
         self._dirty = True
         self.load()
@@ -66,12 +67,13 @@ class Scheduler:
         interval = max(5.0, float(self.settings.get("interval_seconds") or 60))
         self.next_run = time.time() + interval
         self._dirty = True
-        self._wake.set()          # 唤醒循环，让改动马上生效
+        self._wake.set()          # wake the loop so the change takes effect now
         return self.settings
 
     # ---------- quiet hours ----------
     @staticmethod
     def _minutes(hhmm: str) -> int | None:
+        """Parse "HH:MM" into minutes since midnight; None when malformed."""
         try:
             h, m = str(hhmm).split(":")
             return int(h) * 60 + int(m)
@@ -82,6 +84,7 @@ class Scheduler:
         spans = self.settings.get("quiet_hours") or []
         if not spans:
             return False
+        # Local time on purpose: quiet hours follow the box's clock, not UTC.
         lt = time.localtime(now or time.time())
         cur = lt.tm_hour * 60 + lt.tm_min
         for span in spans:
@@ -119,9 +122,11 @@ class Scheduler:
                 interval = float(self.settings.get("interval_seconds") or 60)
             except (TypeError, ValueError):
                 interval = 60.0
+            # Never poll faster than every 5 seconds, whatever the settings say.
             interval = max(5.0, interval)
 
-            # 刚改过设置（或刚启动）就立刻跑一轮，不等满一个周期
+            # Settings just changed (or we just started): run a round right away
+            # instead of waiting out a full interval
             wait = 0.0 if self._dirty else interval
             self._dirty = False
             self.next_run = time.time() + wait
@@ -130,7 +135,7 @@ class Scheduler:
                 try:
                     await asyncio.wait_for(self._wake.wait(), timeout=wait)
                     self._wake.clear()
-                    self._dirty = True      # 设置变了，用新间隔重新排期
+                    self._dirty = True      # settings changed, reschedule with the new interval
                     continue
                 except asyncio.TimeoutError:
                     pass
@@ -147,6 +152,7 @@ class Scheduler:
             gap = time.time() - self.last_run
             if gap < float(self.settings.get("min_gap_seconds") or 0):
                 continue
+            # Sliding one-hour window behind the max_turns_per_hour cap.
             recent = [t for t in self.turns if time.time() - t["at"] < 3600]
             if len(recent) >= int(self.settings.get("max_turns_per_hour") or 999):
                 log.info("scheduler: hourly cap reached")
@@ -167,6 +173,7 @@ class Scheduler:
             "reason": "pending" if pending else "idle",
         }
         self.turns.append(turn)
+        # Keep only the last 200 turns; this is in-memory history, not a log.
         self.turns = self.turns[-200:]
         if pending:
             log.info("wake: %d pending event(s)", len(pending))

@@ -1,14 +1,18 @@
-"""群里发的图片：取回来、转成模型能看的形式。
+"""Images posted in the group: fetch them, and turn them into something the model can see.
 
-为什么不能直接把图片 URL 丢给模型：
-QQ 图床是**签名过的临时链接**（URL 里带 rkey）。让模型服务商自己去拉，
-一是它未必出得去（图床在国内），二是 rkey 会过期 —— 等模型去取的时候可能已经 403。
-所以这里自己下载、转成 base64 内联进请求。
+Why the image URL cannot simply be handed to the model:
+the QQ image CDN serves **signed, short-lived links** (the URL carries an rkey). If the
+model provider fetched them itself, first it might not even be able to reach them (the
+CDN lives in mainland China), and second the rkey expires -- by the time the model asks
+for the file it may already be a 403. So we download the bytes ourselves and inline them
+into the request as base64.
 
-主机白名单与 /api/image 保持一致，防止把内网地址喂进模型请求（SSRF）。
+The host allowlist is kept identical to /api/image so that internal addresses can never
+be fed into a model request (SSRF).
 
-用量控制：图片很贵（一张几百到上千 token）。只带**本轮新来的**几张，
-历史消息里的图片不重复送 —— 上一轮看过就看过了。
+Usage control: images are expensive (a few hundred to a thousand-plus tokens each). Only
+the **newly arrived** images of this turn are attached; images from history are not sent
+again -- once a previous turn has seen them, that is enough.
 """
 from __future__ import annotations
 
@@ -22,32 +26,35 @@ from . import net
 
 log = logging.getLogger("qqbridge.vision")
 
-# 与 server.py 的 /api/image 同一份白名单
+# Same allowlist as /api/image in server.py
 IMAGE_HOST_OK = ("multimedia.nt.qq.com.cn", "multimedia.qpic.cn", "gchat.qpic.cn")
 IMAGE_SUFFIX_OK = (".qpic.cn", ".qq.com")
-IMAGE_MAX_BYTES = 6 * 1024 * 1024      # 单张上限
-MAX_IMAGES_PER_TURN = 3                # 一轮最多带几张
+IMAGE_MAX_BYTES = 6 * 1024 * 1024      # per-image size cap
+MAX_IMAGES_PER_TURN = 3                # how many images one turn may attach
 
-# 复用同一张图时别反复下载
+# Avoid re-downloading when the same image is reused
 _cache: dict[str, str] = {}
 
 
 def _host_allowed(url: str) -> str:
-    """返回允许的主机名；不允许则返回空串。"""
+    """Return the allowed hostname, or an empty string when it is not allowed."""
     parsed = urlparse(url or "")
     host = (parsed.hostname or "").lower()
     if parsed.scheme != "https" or not host:
         return ""
     if not (host in IMAGE_HOST_OK or host.endswith(IMAGE_SUFFIX_OK)):
         return ""
-    # 纯数字主机（IP）一律拒绝
+    # Reject numeric-only hosts (raw IPs) outright
     if host.replace(".", "").isdigit():
         return ""
     return host
 
 
 async def fetch_data_url(url: str) -> str | None:
-    """下载一张图，返回 data:image/...;base64,... —— 失败返回 None，绝不抛。"""
+    """Download one image and return a data:image/...;base64,... URL; None on failure.
+
+    Never raises: every failure mode is reported the same way, as None.
+    """
     host = _host_allowed(url)
     if not host:
         log.info("vision: 拒绝非白名单图床 %s", (url or "")[:60])
@@ -70,9 +77,11 @@ async def fetch_data_url(url: str) -> str | None:
         return None
     ctype = (resp.headers.get("content-type") or "image/jpeg").split(";")[0].strip()
     if not ctype.startswith("image/"):
-        # QQ 常常报 .jpg 实际是 PNG/GIF，按 magic bytes 兜一下
+        # QQ often labels a PNG/GIF as .jpg, so fall back to sniffing the magic bytes
         ctype = _sniff(body) or "image/jpeg"
     data_url = "data:%s;base64,%s" % (ctype, base64.b64encode(body).decode())
+    # Crude bound: once the cache grows past 40 entries it is dropped wholesale, so a
+    # long-running process cannot leak memory through an ever-growing dict of base64 blobs.
     if len(_cache) > 40:
         _cache.clear()
     _cache[url] = data_url
@@ -80,6 +89,7 @@ async def fetch_data_url(url: str) -> str | None:
 
 
 def _sniff(b: bytes) -> str:
+    # Magic-byte sniffing only; returns "" when nothing matches and the caller falls back.
     if b[:8] == b"\x89PNG\r\n\x1a\n":
         return "image/png"
     if b[:3] == b"GIF":
@@ -92,13 +102,13 @@ def _sniff(b: bytes) -> str:
 
 
 def image_urls_in(ev: dict) -> list[str]:
-    """一条消息里带的图片地址。"""
+    """The image URLs carried by one message."""
     out = []
     for seg in ev.get("segments") or []:
         if seg.get("type") == "image" and seg.get("url"):
             out.append(seg["url"])
     if not out and ev.get("text"):
-        # 退化路径：没解析出 segments 时从 CQ 码里抠
+        # Fallback path: no segments were parsed, so dig the URLs out of the CQ codes
         import re
         out = re.findall(r"\[CQ:image,[^\]]*url=([^,\]]+)", ev["text"])
     return out
@@ -106,11 +116,12 @@ def image_urls_in(ev: dict) -> list[str]:
 
 async def collect_for_turn(events: list[dict], fresh_from: int = 0,
                            limit: int = MAX_IMAGES_PER_TURN) -> list[dict]:
-    """挑出这一轮要喂给模型的图片。
+    """Pick the images to feed to the model this turn.
 
-    只取 id > fresh_from 的新消息，最多 limit 张（超了就丢最旧的，
-    图片太贵，宁可漏看也不能让一轮请求无限膨胀）。
-    返回 [{"sender":..., "id":..., "data_url":...}]。
+    Only messages with id > fresh_from are considered, and at most "limit" images are
+    kept; the oldest ones are dropped when over the cap (images are expensive, so it is
+    better to miss one than to let a single request grow without bound).
+    Returns [{"sender":..., "id":..., "data_url":...}].
     """
     picked: list[dict] = []
     for ev in events:
@@ -132,10 +143,12 @@ async def collect_for_turn(events: list[dict], fresh_from: int = 0,
     return out
 
 
-# ---------- 发图前的校验 ----------
-# 出过事：有人让 bot 发「宛平南路六百号」的照片，它随手抓了一张萝莉图发进群。
-# 根因是发送前**没有任何人看过这张图** —— 模型只是把一条链接/路径转手丢出去。
-# 这一步补上「先看一眼」：既查安不安全，也查是不是要的那张。
+# ---------- Review before sending an image ----------
+# This went wrong once: someone asked the bot for a photo of "No. 600 Wanping South
+# Road" and it casually grabbed some random anime-girl picture and posted it to the group.
+# Root cause: before sending, **nobody had ever looked at the image** -- the model just
+# passed a link or a path straight through. This step adds "take a look first": it checks
+# both whether the image is safe and whether it is the one that was asked for.
 
 REVIEW_SYSTEM = (
     "你是群聊机器人的发图审核员。你的判断直接决定这张图会不会被发到 QQ 群里。\n"
@@ -150,12 +163,13 @@ REVIEW_SYSTEM = (
 
 
 def _as_bool(v):
-    """把审核模型的输出转成 True/False；认不出来返回 None（= 判不通过）。
+    """Coerce the reviewer's output to True/False; None means unrecognized (= reject).
 
-    **不能只判 is True。** 实测过：模型回 {"unsafe": "true", "match": "false"}
-    （字符串而不是布尔，弱模型很常见）时，unsafe is True 和 match is False
-    两个判断全部落空，等于整道发图闸门被无声绕过 —— 危险图照样发出去。
-    所以这里显式认字符串，认不出来一律 fail closed。
+    **Testing "is True" alone is not enough.** This was hit in practice: when the model
+    answers {"unsafe": "true", "match": "false"} (strings rather than booleans, very common
+    with weak models) both the "unsafe is True" and "match is False" checks fall through,
+    which silently bypasses the whole image gate -- the dangerous picture goes out anyway.
+    So the strings are recognized explicitly here, and anything unrecognized fails closed.
     """
     if isinstance(v, bool):
         return v
@@ -170,7 +184,7 @@ def _as_bool(v):
 
 
 async def to_data_url(image: str) -> str | None:
-    """把「本地文件路径」或「http(s) 图片链接」变成 data URL。失败返回 None。"""
+    """Turn a local file path or an http(s) image link into a data URL. None on failure."""
     raw = (image or "").strip()
     if not raw:
         return None
@@ -188,10 +202,10 @@ async def to_data_url(image: str) -> str | None:
         return None
     if not body or len(body) > IMAGE_MAX_BYTES:
         return None
-    # _sniff 返回的是**完整 MIME**（image/png）。之前这里又拼了一次 "image/"，
-    # 拼出 data:image/image/png —— 模型直接 400「unsupported image」，
-    # 于是本地图片永远过不了核验、永远发不出去。URL 那条路走的是 HTTP
-    # content-type 所以没事，只有本地文件踩了这个坑。
+    # _sniff already returns a **full MIME type** (image/png). This code used to prepend
+    # "image/" a second time, producing data:image/image/png -- the model then answered 400
+    # "unsupported image", so local images could never pass the review and could never be
+    # sent. The URL path uses the HTTP content-type and was fine; only local files hit this.
     mime = _sniff(body[:16])
     if not mime:
         return None
@@ -201,10 +215,11 @@ async def to_data_url(image: str) -> str | None:
 
 
 async def review(data_url: str, expect: str = "") -> dict:
-    """让视觉模型看一眼这张图，返回 {ok, desc, unsafe, match, reason}。
+    """Have the vision model look at the image; returns {ok, desc, unsafe, match, reason}.
 
-    ok=False 表示**不要发**。校验不可用时**一律判不通过**（fail closed）——
-    宁可发不出去，也不要因为「看不了」就把没过目的图丢进群。
+    ok=False means **do not send**. When the review is unavailable the verdict is
+    **always reject** (fail closed) -- better to send nothing than to drop an unvetted
+    image into the group just because it could not be looked at.
     """
     from .config import config
     from .llm import LLM, LLMError
@@ -222,8 +237,8 @@ async def review(data_url: str, expect: str = "") -> dict:
             ]},
         ], max_tokens=400)
     except Exception as exc:
-        # 把真实原因带上 —— 只写异常类型的话，排查时完全看不出是
-        # 「图太大」「格式不对」还是「网络不通」。
+        # Keep the real reason -- with only the exception type there is no way to tell
+        # during debugging whether it was "image too large", "bad format" or "network down".
         detail = str(exc).strip().replace("\n", " ")[:200]
         log.warning("vision: 发图前核验失败：%s | %s", type(exc).__name__, detail)
         return {"ok": False, "desc": "", "unsafe": None, "match": None,
@@ -231,6 +246,8 @@ async def review(data_url: str, expect: str = "") -> dict:
 
     import json as _json
     text = (out.get("text") or "").strip()
+    # Models often wrap the JSON in prose or a code fence, so grab the outermost {...}
+    # block rather than parsing the whole reply; anything unparseable simply becomes {}.
     found = re.search(r"\{[\s\S]*\}", text)
     data = {}
     if found:
@@ -256,6 +273,6 @@ async def review(data_url: str, expect: str = "") -> dict:
 
 
 def vision_enabled() -> bool:
-    """模型名里带 vision 才启用 —— 否则塞图片过去只会报错。"""
+    """On only when the model name mentions vision -- otherwise images just cause errors."""
     from .config import config
     return bool(getattr(config, "vision_enabled", True)) and "vision" in (config.llm_model or "").lower()

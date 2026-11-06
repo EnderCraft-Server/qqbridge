@@ -1,7 +1,9 @@
-"""自带的群聊 Agent：上下文管理 + 自主决定是否接话 + 发言。
+"""The built-in group-chat agent: context management + deciding on its own whether to
+chime in + speaking.
 
-设计：每个群一份独立历史（互不污染），只喂最近的若干条；被唤醒时让模型判断
-"要不要接、接什么"，返回 JSON，避免把整段推理发到群里。
+Design: one independent history per group (so groups never pollute each other), and only the
+most recent few messages are fed in; when woken, the model decides "whether to join in, and
+with what", returning JSON, so a whole chain of reasoning never reaches the group.
 """
 from __future__ import annotations
 
@@ -38,16 +40,18 @@ reply 里只放你要发到群里的那句原话，不要带动作描写、不�
 
 
 class History:
-    """一个群的滚动历史。"""
+    """Rolling history for one group."""
 
     def __init__(self, size: int = 30):
         self.lines: deque = deque(maxlen=size)
 
     def add(self, who: str, text: str, *, self_msg: bool = False):
         text = (text or "").strip().replace("\n", " ")
+        # Drop empty messages and raw CQ payloads; fold newlines so one message stays one line.
         if not text or text.startswith("[CQ:"):
             return
         tag = "我" if self_msg else who
+        # 300 chars per message is plenty for context and keeps every turn cheap.
         self.lines.append({"role": "user", "content": f"{tag}: {text[:300]}"})
 
     def messages(self) -> list[dict]:
@@ -70,12 +74,13 @@ class QqAgent:
         self.system_prompt = system_prompt or DEFAULT_SYSTEM
 
     def history(self, key: str) -> History:
+        # Histories are created lazily, so an idle group costs nothing until it speaks.
         if key not in self.histories:
             self.histories[key] = History(self.history_size)
         return self.histories[key]
 
     def observe(self, ev: dict):
-        """把收到的消息写进对应群的历史（不触发模型）。"""
+        """Append an incoming message to the right group history (does not call the model)."""
         key = ev.get("group_id") or ev.get("user_id") or "?"
         self.history(key).add(ev.get("sender", "?"), ev.get("text", ""),
                               self_msg=bool(ev.get("is_self")))
@@ -95,24 +100,29 @@ class QqAgent:
         }
 
     async def decide_batch(self, batch: list[dict], *, fresh_from: int = 0) -> dict:
-        """**整段**判断：把最近一段对话交给模型，让它决定要不要插一句。
+        """**Whole-segment** decision: hand the latest stretch of conversation to the model and
+        let it decide whether to add a line.
 
-        和按条 decide() 的根本区别：看的是「这一段」，不是「这一条」。
-        人就是这个节奏 —— 隔一会儿扫一眼，判断整段值不值得接，
-        而不是被每一条消息牵着回一句。这比逐条调 engagement 靠谱得多。
+        The fundamental difference from per-message decide(): it looks at "this stretch", not
+        "this message". That is the human rhythm — glance at the phone every so often and judge
+        whether the whole stretch is worth joining, instead of being dragged into a reply by
+        every single message. This is far more reliable than tuning engagement per message.
 
-        fresh_from 之前的消息只是上下文（已经看过的），之后的是这次新冒出来的。
+        Messages before fresh_from are context only (already seen); the ones after it are what
+        just came in this time.
 
-        只负责「闲聊要不要接、接什么」。**不判断有没有活要干** ——
-        那件事由 autoreply 直接分派给内置 Agent，不掺和到这里来：
-        Agent 是多步带工具的东西，让它在批量闲聊的 JSON 里捎带决定，
-        既是两套逻辑搅在一起，也容易把该干的活降级成一句敷衍。
+        It only handles "chat: join or not, and with what". **It does not decide whether there
+        is work to do** — autoreply dispatches that straight to the built-in Agent instead of
+        mixing it in here: the Agent is a multi-step thing with tools, and making it tack that
+        decision onto a batched-chat JSON both tangles two kinds of logic together and tends
+        to downgrade the actual task into one perfunctory line.
 
-        返回 {reply, reason, key, parse, fresh, mention}。
+        Returns {reply, reason, key, parse, fresh, mention}.
         """
         if not self.llm.configured:
             raise LLMError("模型未配置。")
 
+        # All messages in a batch belong to one group; take it from the last event.
         key = (batch[-1].get("group_id") or "?") if batch else "?"
 
         lines = []
@@ -122,6 +132,7 @@ class QqAgent:
         for ev in batch:
             who = "我" if ev.get("is_self") else (ev.get("sender") or ev.get("user_id") or "?")
             text = render_text(ev)
+            # Message ids are monotonic per group, so "id > fresh_from" is the new/seen split.
             is_fresh = ev.get("id", 0) > fresh_from
             if is_fresh:
                 fresh_count += 1
@@ -150,8 +161,8 @@ class QqAgent:
         if fresh_count > 0 and not fresh_mention:
             hint += "\n\n（这一段里没有人 @ 你。）"
 
-        # 学术模式：只拿「新来的那几条」判断 —— 旧上下文里出现过一道题，
-        # 不该让后面十句闲聊都被答成论文。
+        # Academic mode: judge from "just the new messages" only — once a question appears in
+        # old context, the next ten lines of chit-chat must not all be answered like a paper.
         academic_on, academic_why = False, ""
         if config.academic_mode:
             academic_on, academic_why = academic.detect("\n".join(fresh_texts))
@@ -168,16 +179,18 @@ class QqAgent:
             max_tokens = None
             reply_limit = 800
 
-        # 群里发的图片：取回来一起喂给视觉模型。只带本轮新来的那几张 ——
-        # 历史里的图不重复送，否则每轮都在为同一张图付 token。
+        # Images posted in the group: fetch them and feed them to the vision model as well.
+        # Only the ones new to this turn — historical images are not resent, otherwise we would
+        # pay tokens for the same image every turn.
         images = []
         if vision.vision_enabled():
             try:
                 images = await vision.collect_for_turn(batch, fresh_from)
             except Exception:
                 log.exception("vision: 收集图片失败，本轮按纯文本处理")
-        # 消息里带链接：抓回正文再判断。带工具的 Agent 那条路管理员才走得通，
-        # 闲聊这条路本来没有任何取网页的手段，链接就永远被无视了。
+        # Links in messages: fetch the body first, then decide. The tool-using Agent path is
+        # only reachable by an admin, so the chit-chat path had no way at all to fetch a page
+        # and links were simply ignored forever.
         pages = []
         if config.link_preview:
             try:
@@ -216,6 +229,10 @@ class QqAgent:
         raw = out.get("text") or ""
         data, how = parse_decision(raw)
         reply, reason = "", ""
+        # Must be initialised up front: the "failed" branch below skips the splitting
+        # entirely, and the counters/return at the end still read it. Without this a
+        # truncated model reply raised UnboundLocalError instead of degrading to silence.
+        parts: list = []
         if how == "failed":
             log.warning("decide_batch: 输出解析失败，改判沉默。原文前 200 字：%s", raw[:200])
             if self.store:
@@ -229,11 +246,11 @@ class QqAgent:
             arr = data.get("replies")
             if isinstance(arr, list):
                 raw_parts.extend(arr)
-            one = (data.get("reply") or "").strip()      # 兼容只给一条的老格式
+            one = (data.get("reply") or "").strip()      # also accept the old single-reply format
             if one:
                 raw_parts.append(one)
             if academic_on:
-                # 学术回答不该被拆成几条、也不该去掉句末标点
+                # academic answers stay unsplit and keep their terminal punctuation
                 joined, _ = clean_reply(json.dumps(
                     {"reply": "\n".join(str(x) for x in raw_parts)}, ensure_ascii=False))
                 parts = [joined[:reply_limit]] if joined else []
@@ -243,7 +260,7 @@ class QqAgent:
                     cleaned, _ = clean_reply(piece)
                     if cleaned:
                         parts.append(cleaned[:reply_limit])
-            reply = "\n".join(parts)                    # 兼容字段：合并视图
+            reply = "\n".join(parts)                    # compat field: the merged view
         if parts:
             self.replies += len(parts)
         else:
@@ -255,16 +272,17 @@ class QqAgent:
                 "academic": academic_on, "academic_why": academic_why}
 
     async def decide(self, ev: dict, *, force: bool = False) -> dict:
-        """让模型决定这条要不要接。返回 {reply, reason}。"""
+        """Let the model decide whether to take this message. Returns {reply, reason}."""
         if not self.llm.configured:
             raise LLMError("模型未配置。")
 
         key = ev.get("group_id") or ev.get("user_id") or "?"
         hist = self.history(key)
-        # 当前这条已由 observe 写入历史；再拼一条指令
+        # This message was already appended by observe; here we only add an instruction
         ctx = hist.messages()[-self.history_size:]
-        # 默认应该是沉默：没点名、没命中关键词、也没人问你的时候，
-        # 明确告诉模型「不必每条都接，挑你真正想说的那条」，它才会真的挑。
+        # Silence should be the default: when you were not mentioned, nothing hit a keyword,
+        # and nobody asked you, only an explicit "you do not have to answer everything, pick
+        # the one you actually want to say" makes the model really pick.
         if ev.get("mentions_me"):
             hint = "有人 @ 了你，必须回一句。"
         elif ev.get("keyword_hit"):
@@ -275,7 +293,7 @@ class QqAgent:
         if force:
             hint += "（群主点名让你说话）"
 
-        # 学术模式（单条路径同样适用）
+        # Academic mode (applies to the single-message path too)
         academic_on, academic_why = False, ""
         if config.academic_mode:
             academic_on, academic_why = academic.detect(ev.get("text") or "")
@@ -291,6 +309,7 @@ class QqAgent:
 
         messages = [
             {"role": "system", "content": system_content},
+            # Unpack the history inline; the final user message carries the instruction.
             *ctx,
             {"role": "user", "content": (
                 f"【系统】{hint}\n"
@@ -323,14 +342,15 @@ class QqAgent:
 
 
 def parse_decision(raw: str) -> tuple[dict, str]:
-    """把模型输出解析成 {reply, reason}。
+    """Parse model output into {reply, reason}.
 
-    返回 (data, how)，how 取值：
-      ok       直接就是合法 JSON
-      fenced   剥掉 markdown 代码块后是合法 JSON
-      embedded 从文本里抠出第一个 {...} 后解析成功
-      plain    不是 JSON，当纯文本回复
-      failed   看着像 JSON 但解析不了 —— 调用方必须改判沉默，绝不能发出去
+    Returns (data, how), where how is one of:
+      ok       already valid JSON
+      fenced   valid JSON once the markdown code fence is stripped
+      embedded the first {...} block carved out of the text parsed successfully
+      plain    not JSON at all, treat as a plain-text reply
+      failed   looks like JSON but will not parse — the caller must turn this into silence and
+               must never send it out
     """
     text = (raw or "").strip()
     if not text:
@@ -356,10 +376,11 @@ def parse_decision(raw: str) -> tuple[dict, str]:
         if obj is not None:
             return obj, "fenced"
 
-    # 从文本里抠第一个大括号块（模型偶尔会在 JSON 前后加话）
+    # Carve out the first brace block (the model sometimes adds words around its JSON)
     start = stripped.find("{")
     if start >= 0:
         depth, end = 0, -1
+        # Bracket-depth scan instead of a regex, so nested objects are captured whole.
         for idx in range(start, len(stripped)):
             ch = stripped[idx]
             if ch == "{":
@@ -374,13 +395,14 @@ def parse_decision(raw: str) -> tuple[dict, str]:
             if obj is not None:
                 return obj, "embedded"
 
-    # 到这里说明没解析出 JSON。区分「本来就是纯文本」和「像 JSON 但坏了」
+    # Nothing parsed as JSON by now. Tell "plain text all along" apart from "broken JSON".
     looks_like_json = stripped[:1] in ("{", "[") or '"reply"' in stripped
     if looks_like_json:
         return {"reply": "", "reason": "JSON 解析失败"}, "failed"
     return {"reply": tidy_plain(stripped), "reason": "纯文本回复"}, "plain"
 
 
+# Order matters: the specific types must be rewritten before the catch-all stripper below.
 CQ_LABEL = [
     (re.compile(r"\[CQ:image,[^\]]*\]"), "[图片]"),
     (re.compile(r"\[CQ:face,[^\]]*\]"), "[表情]"),
@@ -392,20 +414,24 @@ CQ_LABEL = [
 ]
 
 
-# ---------- CQ 码防护 ----------
-# OneBot 收到字符串 message 就会解析里面的 [CQ:xxx] 段。而我们的正文来自模型，
-# 模型又受群消息影响 —— 等于**群友可以间接让机器人发出任意 CQ 码**：
-#   caption = "[CQ:at,qq=all] 快来"        -> 全员轰炸
+# ---------- CQ code hardening ----------
+# OneBot parses any [CQ:xxx] segment inside a string message. Our body text comes from the
+# model, and the model is influenced by group messages — so **a group member can indirectly
+# make the bot emit arbitrary CQ codes**:
+#   caption = "[CQ:at,qq=all] come quick"  -> @everyone bomb
 #   image = "https://a/x.png] [CQ:image,file=http://127.0.0.1:5700/b"
-#     -> 第一张过了审核，第二张完全没过审核、也没做 SSRF 校验就一起发出去了
-# 所以：正文一律转义；确实要发 CQ 码的地方（发图）自己拼，并且把参数卡死。
+#     -> the first image passed review; the second went out unreviewed, with no SSRF check
+# So: body text is always escaped; wherever we really do emit CQ codes (sending an image) we
+# build them ourselves and pin the parameters down.
 _CQ_ESCAPE = (("&", "&amp;"), ("[", "&#91;"), ("]", "&#93;"))
 
 
 def escape_cq(text: str) -> str:
-    """转义正文里的 CQ 码分隔符，让它按字面显示而不是被当成指令。
+    """Escape CQ-code delimiters in body text so they display literally instead of becoming
+    instructions.
 
-    顺序不能反：& 必须最先换，否则会把后面替换出来的 &#91; 再转一遍。
+    The order cannot be reversed: & must be replaced first, otherwise the &#91; produced by
+    later replacements gets escaped a second time.
     """
     out = str(text or "")
     for ch, rep in _CQ_ESCAPE:
@@ -414,10 +440,11 @@ def escape_cq(text: str) -> str:
 
 
 def is_safe_cq_param(value: str) -> bool:
-    """能不能安全地塞进 CQ 码的参数位。
+    """Whether this can be safely spliced into a CQ-code parameter slot.
 
-    任何能提前闭合 CQ 码的字符（[ ] & ,）一律不接受 —— 不接受就拒绝发送，
-    而不是"清洗一下凑合用"，因为清洗过的 URL 多半已经不是原来那张图了。
+    Anything that can close a CQ code early ([ ] & ,) is rejected outright — rejected means
+    the send is refused, not "sanitize it and make do", because a sanitized URL is most
+    likely no longer the image that was meant.
     """
     v = str(value or "")
     if not v or any(c in v for c in "[]&,") or any(c in v for c in " \t\r\n"):
@@ -426,11 +453,11 @@ def is_safe_cq_param(value: str) -> bool:
 
 
 def render_text(ev: dict) -> str:
-    """把一条消息渲染成给模型看的文本。
+    """Render one message as text for the model to read.
 
-    优先用已经解析好的 segments —— 图片、表情只留个标记，
-    别把一长串 CQ 码塞进上下文，既费 token 又干扰判断。
-    没有 segments 时退回对 raw_message 做替换。
+    Prefer the already-parsed segments — images and emoji become mere markers; a long
+    CQ-code string is not stuffed into the context, which both costs tokens and disturbs
+    judgement. Falls back to substituting on raw_message when there are no segments.
     """
     parts: list[str] = []
     for seg in ev.get("segments") or []:
@@ -453,15 +480,18 @@ def render_text(ev: dict) -> str:
         for pat, rep in CQ_LABEL:
             text = pat.sub(rep, text)
         text = text.strip()
+    # One line, 300 chars max: this text is fed to the model, not shown to a human.
     return (text or "[非文字内容]").replace("\n", " ")[:300]
 
 
 def tidy_plain(text: str) -> str:
-    """整理纯文本回复：**保留换行**，只清行尾空白、把连续空行压成一个，最后卡长度。
+    """Tidy a plain-text reply: **keep line breaks**, only strip trailing whitespace,
+    collapse runs of blank lines into one, and finally cap the length.
 
-    以前这里写的是 stripped.splitlines()[0][:200] —— 只取第一行。
-    于是模型写好的多行回答被砍成开头那一句，群里只剩一个「？」或者「宿主机状态：」，
-    看着像机器人在敷衍。QQ 消息本来就能换行，没必要砍。
+    This used to be stripped.splitlines()[0][:200] — first line only. So a multi-line answer
+    the model had written properly got chopped down to its opening sentence, and the group
+    was left with a "?" or "host status:", which looks like the bot is fobbing people off.
+    QQ messages can contain line breaks anyway, so there is no reason to chop.
     """
     lines = [ln.rstrip() for ln in (text or "").strip().splitlines()]
     out: list[str] = []
@@ -473,12 +503,13 @@ def tidy_plain(text: str) -> str:
 
 
 def clean_reply(raw: str) -> tuple[str, str]:
-    """发送前的最后一道净化：保证进群的永远是一句人话，不会是 JSON。
+    """The last wash before sending: what reaches the group is always human text, never JSON.
 
-    不管是 chat 模式还是 agent 模式，模型都可能吐 JSON —— 前者因为提示词要求，
-    后者因为复用了同一份提示词。这里统一兜住。
+    Whether it is chat mode or agent mode, the model can spit out JSON — the former because
+    the prompt asks for it, the latter because it reuses the same prompt. This catches all
+    of it.
 
-    返回 (要发送的文本, 判定结果)。判定为 failed 时文本为空 = 沉默。
+    Returns (text to send, verdict). On a failed verdict the text is empty = silence.
     """
     text, how = parse_decision(raw)
     if how == "ok":
@@ -487,18 +518,19 @@ def clean_reply(raw: str) -> tuple[str, str]:
         return (text.get("reply") or "").strip(), how
     if how == "plain":
         return (text.get("reply") or "").strip(), how
-    # failed：像 JSON 但解析不了 —— 宁可沉默
+    # failed: looks like JSON but will not parse — prefer silence
     return "", how
 
 
 def load_system_prompt(path: Path, fallback: str = "") -> str:
-    """system prompt 回退链：
+    """system prompt fallback chain:
 
-    1. 配置指定的文件（默认 data/system_prompt.md，用户自己改的那份）
-    2. 仓库自带的 prompts/default_persona.md
-    3. 代码里的 DEFAULT_SYSTEM
+    1. The file named by config (default data/system_prompt.md, the one the user edits)
+    2. The repo's own prompts/default_persona.md
+    3. DEFAULT_SYSTEM in this module
 
-    这样用户改人格不会和仓库默认版本冲突；新克隆也有可用人格。
+    That way a user editing the persona never conflicts with the repo default version, and a
+    fresh clone still has a usable persona.
     """
     candidates = [path]
     try:

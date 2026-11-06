@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
-"""OneBot WebSocket 事件流自测。
+"""OneBot WebSocket event stream self-test.
 
-盯的是三件容易出错的事：
-  1. connected 必须随时反映真实状态 —— 控制台右上角那个「QQ 已连接」是排查
-     「收不到消息」的第一入口，它撒谎的话后面全是白费功夫。
-  2. 服务端「接了立刻关」时不能变成死循环猛敲对面（原来正常断开走的是
-     async for 自然结束那条路，不经过 except，于是不 sleep 直接重连）。
-  3. 事件要真的送到回调里。
+Three easy-to-get-wrong things are watched here:
+  1. connected must always reflect the real state -- the "QQ 已连接" badge in the top
+     right of the console is the first place to look when "no messages arrive", so
+     if it lies, everything debugged afterwards is wasted effort.
+  2. When the server "accepts and closes at once", the client must not turn into a
+     tight loop hammering the other side (a normal disconnect used to end naturally
+     through async for, never reaching except, so it reconnected without sleeping).
+  3. Events must actually reach the callback.
 
-运行：python tests/test_onebot.py
+Run: python tests/test_onebot.py
 """
 import asyncio
 import json
@@ -25,12 +27,15 @@ ok = []
 
 
 async def serve(handler):
+    # Port 0 lets the OS pick a free port; the real one is read back from the socket.
     server = await websockets.serve(handler, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
     return server, port
 
 
 async def stop_bot(bot, task):
+    # Stop the loop both ways, and swallow the cancellation so it never surfaces as a
+    # spurious test failure.
     bot._stop.set()
     task.cancel()
     try:
@@ -39,7 +44,7 @@ async def stop_bot(bot, task):
         pass
 
 
-# ---------- 1. 接了立刻关：不能疯转，且 connected 必须是 False ----------
+# ---------- 1. Accept-then-close: no busy loop, and connected must be False ----------
 async def case_immediate_close():
     conns = []
 
@@ -50,6 +55,7 @@ async def case_immediate_close():
     server, port = await serve(handler)
     try:
         bot = OneBot("http://127.0.0.1:1", f"ws://127.0.0.1:{port}")
+        # The stop flag may still be set from an earlier case; clear it before starting.
         bot._stop.clear()
         task = asyncio.create_task(bot._ws_loop())
         await asyncio.sleep(1.6)
@@ -59,12 +65,13 @@ async def case_immediate_close():
     finally:
         server.close()
         await server.wait_closed()
-    # 退避从 1 秒起：1.6 秒内最多重连 2~3 次。修之前是不 sleep 的疯转，会有几百次
+    # Backoff starts at 1s, so 1.6s allows at most 2-3 reconnects; before the fix it spun
+    # without sleeping and produced hundreds.
     assert n <= 4, f"服务端秒关时重连了 {n} 次，说明没有退避（会把自己和对面都拖垮）"
     return n
 
 
-# ---------- 2. 正常连接：connected=True，事件送达，断开后变回 False ----------
+# ---------- 2. Normal connect: connected=True, events delivered, False after close ----------
 async def case_connected_and_events():
     holder = {}
     got = []
@@ -73,6 +80,7 @@ async def case_connected_and_events():
         holder["ws"] = ws
         await ws.send(json.dumps({"post_type": "message", "time": 123, "raw_message": "hi",
                                   "user_id": 1, "group_id": 2}))
+        # Hold the connection open so the client stays connected for the assertions.
         await asyncio.sleep(30)
 
     server, port = await serve(handler)

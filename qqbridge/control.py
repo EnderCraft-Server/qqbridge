@@ -1,10 +1,12 @@
-"""运行时控制：/stop /start /auto 三种模式。
+"""Runtime control: the /stop /start /auto modes.
 
-- auto  : 默认。事件入队，插件按巡检间隔唤醒模型。
-- stopped: 强制静默。事件照常落库，但不入队、不唤醒，直到管理员重新开启。
-- manual: 手动模式。同样不自动唤醒，但保留队列供人工拉取。
+- auto  : default. Events are queued and the plugin wakes the model on its poll interval.
+- stopped: force silence. Events are still persisted, but never queued or woken,
+  until an admin turns it back on.
+- manual: manual mode. Also does not wake automatically, but keeps the queue for
+  a human to pull from.
 
-只有 ADMIN_IDS 里的账号能切换；每次变更记审计。
+Only the accounts in ADMIN_IDS may switch; every change is audited.
 """
 from __future__ import annotations
 
@@ -14,7 +16,8 @@ import time
 from pathlib import Path
 
 MODES = ("auto", "stopped", "manual")
-# 行为模式已改为全自动（管理员走 agent 路径、其他人走 chat），此字段仅保留兼容
+# Behaviour is fully automatic now (admins take the agent path, everyone else
+# chat); this field is kept only for compatibility
 AGENT_MODES = ("chat", "agent")
 
 
@@ -43,6 +46,7 @@ class Control:
                     self.at = d.get("at", 0.0)
                     self.reason = d.get("reason", "")
             except (OSError, ValueError):
+                # A missing or corrupt control file just keeps the defaults.
                 pass
         self._apply()
         return self.mode
@@ -54,11 +58,13 @@ class Control:
         }, ensure_ascii=False, indent=1), encoding="utf-8")
 
     def _apply(self):
-        """暂停时清空待处理队列，避免恢复后一次性爆发。
+        """Clear the pending queue while paused, so resuming does not burst.
 
-        水位线模型下，"清空队列"就是把水位推到最新那条 —— 之后 everything
-        都被视为已看过，恢复时不会再一次性炸出来。
-        注意是 mark_seen_at（带钳制），不是自己改 _seen_at：钳制逻辑只能有一处。
+        Under the watermark model, "clear the queue" just means pushing the
+        watermark up to the newest entry -- everything after that is treated as
+        already seen, so resuming will not flush it all out at once.
+        Note this is mark_seen_at (with its clamping), not writing _seen_at by
+        hand: the clamping logic may only exist in one place.
         """
         if self.mode == "stopped":
             with self.bus._lock:
@@ -76,6 +82,7 @@ class Control:
             self.mode = mode
             self.by = str(actor)
             self.at = time.time()
+            # Cap the free-text reason so one caller cannot bloat the control file.
             self.reason = reason[:200]
             self._apply()
             self.save()
@@ -84,13 +91,15 @@ class Control:
             return self.status()
 
     def set_agent_mode(self, agent_mode: str, actor: str = "", reason: str = ""):
-        """切换 chat / agent 行为模式。"""
+        """Switch the chat / agent behaviour mode."""
         if agent_mode not in AGENT_MODES:
             raise ValueError("模式必须是 chat 或 agent。")
         with self._lock:
             self.agent_mode = agent_mode
             self.by = str(actor)
             self.at = time.time()
+            # set() and set_agent_mode() share the same by/at/reason fields, so the
+            # audit record says who flipped the switch and why.
             self.reason = (reason or "")[:200]
             self.save()
             self.store.audit(str(actor), "switch:" + agent_mode, "runtime",

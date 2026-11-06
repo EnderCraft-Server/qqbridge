@@ -1,11 +1,12 @@
-"""自动接话循环：完全在 qqbridge 进程内跑，不依赖外部 Agent。
+"""Auto-reply loop: runs entirely inside the qqbridge process, no external Agent needed.
 
-流程：
-  事件总线（已有） → 按优先级取待处理 → 交给 QqAgent 决定要不要接
-  → 要接就 send_message → 记入历史 → 推进游标
+Flow:
+  event bus (already here) → take pending items by priority → hand them to QqAgent to decide
+  → if it wants to reply, send_message → record in history → advance the cursor
 
-与 MCP 工具的关系：两条路并存。auto_reply 打开时 bot 自己说话；
-外部 Agent 仍可通过 MCP 工具操作同一个队列（谁先 mark_processed 谁生效）。
+Relationship with the MCP tools: both paths coexist. When auto_reply is on the bot speaks
+for itself; an external Agent can still work the same queue through the MCP tools (whoever
+calls mark_processed first wins).
 """
 from __future__ import annotations
 
@@ -22,13 +23,15 @@ from .config import config
 
 log = logging.getLogger("qqbridge.autoreply")
 
-# 单条 QQ 消息的上限（留足余量）。超长内容按段落切开连发 —— 学术模式的答案
-# 动辄几千字，硬塞一条会被服务端拒掉或者直接截断。
+# Upper bound for one QQ message (with plenty of headroom). Oversized content is split at
+# paragraph boundaries and sent as several messages — academic-mode answers run to thousands
+# of characters, and forcing one into a single message gets rejected or truncated by the server.
 SEND_CHUNK = 1800
 
 
 def split_message(text: str, limit: int = SEND_CHUNK) -> list[str]:
-    """把长文本按段落边界切成若干条，尽量不切在句子中间。"""
+    """Split long text at paragraph boundaries into several messages, avoiding cuts
+    in the middle of a sentence."""
     text = (text or "").strip()
     if len(text) <= limit:
         return [text] if text else []
@@ -41,13 +44,14 @@ def split_message(text: str, limit: int = SEND_CHUNK) -> list[str]:
             continue
         if buf:
             chunks.append(buf)
-        # 单段本身超长：硬切
+        # A single paragraph is itself over the limit: hard cut.
         while len(para) > limit:
             chunks.append(para[:limit])
             para = para[limit:]
         buf = para
     if buf:
         chunks.append(buf)
+    # Drop whitespace-only chunks that paragraph splitting may leave behind.
     return [c for c in chunks if c.strip()]
 
 
@@ -69,40 +73,45 @@ class AutoReply:
         self.enabled = enabled
         self.idle_seconds = idle_seconds
         self.max_per_minute = max_per_minute
-        # 攒一段再看的节奏：最后一条之后静默多久出手；群里一直热闹时最多等多久
+        # Pacing for "accumulate a bit, then look": how long to stay quiet after the last
+        # message before acting, and the longest we wait while the group keeps chattering.
         self.settle_seconds = settle_seconds
         self.max_batch_age = max_batch_age
         self.batch_limit = batch_limit
         self.context_size = context_size
-        # 上下文除了「最近多少条」，还限「最近多少秒」—— 只看条数时，群里一慢下来
-        # 40 条能横跨好几小时，模型就会拿着几小时前的语境去接现在的话。
+        # The context is bounded not only by "how many recent messages" but also by "how many
+        # recent seconds" — with a count-only limit, 40 messages can span hours once the group
+        # quiets down, and the model answers today's message with hours-old context.
         self.context_max_age = context_max_age
-        # 分多条发时，条与条之间停一下。一次全发完特别机械。
+        # When sending in parts, pause between them. Firing them all at once feels robotic.
         self.multi_send_gap = multi_send_gap
-        # 积压太久就丢掉，只接最近的：回一条三分钟前的消息比不回更糟。
+        # An overly old backlog is dropped and only the recent part answered: replying to a
+        # message from three minutes ago is worse than not replying.
         self.max_backlog_age = max_backlog_age
-        # 派活的 agent loop 可能跑满 agent_timeout，绝不能堵着接话循环。
+        # The dispatched agent loop can run for agent_timeout; never block the reply loop on it.
         self.max_concurrent_tasks = max_concurrent_tasks
         self._bg_tasks: set = set()
-        # 并发满时的等待队列。**有界**：无限排下去等于把内存交出去。
+        # Wait queue for when concurrency is full. **Bounded**: an unbounded queue just hands
+        # over the memory.
         self._task_queue: deque = deque()
-        self.max_pending_tasks = 8
+        self.max_pending_tasks = 8   # hard cap on the wait queue
         self._task = None
         self._stop = asyncio.Event()
         self._sent: list[float] = []
-        self._fail_count: dict[int, int] = {}      # ev.id -> 连续失败次数
-        self.max_retry = 3
+        self._fail_count: dict[int, int] = {}      # ev.id -> consecutive failure count
+        self.max_retry = 3   # consecutive failures before a batch is skipped
         self.last_action = ""
         self.last_at = 0.0
         self.errors = 0
 
-    # ---------- 限流 ----------
+    # ---------- rate limiting ----------
     def _rate_ok(self) -> bool:
         now = time.time()
+        # Sliding 60-second window: forget timestamps older than a minute, then check the count.
         self._sent = [t for t in self._sent if now - t < 60]
         return len(self._sent) < self.max_per_minute
 
-    # ---------- 生命周期 ----------
+    # ---------- lifecycle ----------
     async def start(self):
         self._stop.clear()
         self._task = asyncio.create_task(self._loop())
@@ -116,7 +125,7 @@ class AutoReply:
                 await self._task
             except (asyncio.CancelledError, Exception):
                 pass
-        # 后台的派活也要收干净，别让它关停之后还往群里发消息
+        # Cancel background dispatched work too, so nothing posts to the group after shutdown.
         self._task_queue.clear()
         for t in list(self._bg_tasks):
             t.cancel()
@@ -136,15 +145,17 @@ class AutoReply:
             "agent": self.agent.status() if self.agent else {},
         }
 
-    # ---------- 主循环 ----------
+    # ---------- main loop ----------
     async def _loop(self):
         log.info("autoreply loop started (enabled=%s)", self.enabled)
         while not self._stop.is_set():
             try:
+                # Wait for idle_seconds, or wake up right away when stop() is signalled.
                 await asyncio.wait_for(self._stop.wait(), timeout=self.idle_seconds)
                 break
             except asyncio.TimeoutError:
                 pass
+            # Disabled, or paused through /stop: idle without consuming anything.
             if not self.enabled or not self.control_allows():
                 continue
             try:
@@ -152,7 +163,7 @@ class AutoReply:
             except Exception as exc:
                 self.errors += 1
                 log.exception("autoreply tick failed")
-                # 卡住保护：同一条反复失败就跳过它，别把整条队列堵死
+                # Stuck guard: skip a message that keeps failing rather than blocking the queue.
                 try:
                     pending = self.bus.pending(include_low=True, limit=1)
                     if pending:
@@ -173,19 +184,21 @@ class AutoReply:
         try:
             return not self.control.paused()
         except Exception:
+            # A broken control object must not wedge the loop: fail open.
             return True
 
     async def _run_task(self, task: str, gid: str = "") -> str:
-        """把模型认出来的活交给内置 Agent 去干，返回要发到群里的那句话。
+        """Hand the work the model identified to the built-in Agent and return the line to post.
 
-        gid 是这一轮的会话：agent 的 send_image 只能发到这里。
-        目标由我们设，模型没有选择权 —— 不给它"发到哪个群"这个参数。
+        gid is this round's session: the agent's send_image can only post there.
+        We set the target; the model gets no say — it is never given a "which group" parameter.
         """
         if not self.agent_loop:
             return ""
-        # 每个 run 拿一份自己的工具副本 —— 目标会话绝不能写在共享实例上。
-        # 以前是 self.agent_loop.tools.target_group = gid，两个后台任务并发时
-        # 后一个会把前一个覆盖掉，于是 A 群的禁言/发图落到 B 群（实测复现过）。
+        # Each run gets its own copy of the tools — the target session must never live on a
+        # shared instance. It used to be self.agent_loop.tools.target_group = gid, and with two
+        # background tasks running at once the later one overwrote the earlier one, so group A's
+        # mute/send_image landed in group B (reproduced in testing).
         try:
             run_tools = self.agent_loop.tools.for_target(gid)
         except AttributeError:
@@ -208,7 +221,8 @@ class AutoReply:
             "                            expect 必填：这张图应该是什么。系统会先看图核验，\n"
             "                            不安全或和图对不上都会被打回，别硬发。\n"
         )
-        # 派活里也可能是学术题（管理员 @ 一道数学题）。命中就换学术人设并放开长度。
+        # The dispatched work may also be an academic question (an admin @-ing a math problem).
+        # On a hit, switch to the academic persona and lift the length cap.
         academic_on, academic_why = False, ""
         if config.academic_mode:
             academic_on, academic_why = academic.detect(task)
@@ -242,15 +256,15 @@ class AutoReply:
             return ""
 
     async def _send(self, target: dict, gid: str, replies, reason: str):
-        """发到群里。replies 可以是字符串，也可以是「分几次发」的列表。
+        """Post to the group. replies may be a string, or a list of "send in several parts".
 
-        多条之间要真的隔开：一条一条蹦出来才像人在打字，
-        一次性连发三条反而更像程序在吐数据。
+        Parts must really be spaced out: popping out one at a time looks like a person typing,
+        while firing three at once looks more like a program dumping data.
         """
         raw = [replies] if isinstance(replies, str) else list(replies or [])
         parts = [tidy_outgoing(p) for p in raw]
         parts = [p for p in parts if p]
-        # 单条仍可能超过服务端上限（学术模式的长回答），继续按段落切
+        # A single part can still exceed the server limit (long academic answers); keep splitting.
         chunks: list[str] = []
         for p in parts:
             chunks.extend(split_message(p) if len(p) > SEND_CHUNK else [p])
@@ -258,21 +272,26 @@ class AutoReply:
             return
         reply = "\n".join(chunks)
         try:
+            # A private message is typed "private" or carries no group id; send it through the
+            # private API.
             private = target.get("message_type") == "private" or not target.get("group_id")
             for i, part in enumerate(chunks):
                 if i:
-                    # 补一句的停顿：固定间隔 + 一点随机，别让节奏太齐整
+                    # Pause before a follow-up part: fixed gap plus a little jitter, so the
+                    # rhythm does not feel too even.
                     await asyncio.sleep(self.multi_send_gap + random.uniform(0.0, 0.8))
-                # **出去之前必须转义 CQ 码。** 正文是模型产的，而模型又受群消息影响：
-                # 群友只要诱导它输出 "[CQ:at,qq=all]" 就能全员轰炸，或者塞一个
-                # [CQ:image,file=...] 绕过发图审核。转义之后这些只会按字面显示。
+                # **CQ codes must be escaped before anything goes out.** The body is
+                # model-generated and the model is influenced by group messages: a member only
+                # has to coax it into emitting "[CQ:at,qq=all]" to ping everyone, or slip in a
+                # [CQ:image,file=...] to bypass image review. After escaping they are literal.
                 safe_part = escape_cq(part)
                 if private:
                     await self.bot.call("send_private_msg", user_id=int(target["user_id"]),
                                         message=safe_part)
                 else:
                     await self.bot.call("send_group_msg", group_id=int(gid), message=safe_part)
-                self._sent.append(time.time())      # 每一条都计入限流
+                self._sent.append(time.time())      # every message counts toward the rate limit
+            # Let the bus know we just spoke, for its own-send cooldown.
             self.bus.note_own_send()
             self.agent.note_own(gid, reply)
             self.store.audit("auto", "auto_reply", gid,
@@ -284,13 +303,15 @@ class AutoReply:
             self.errors += 1
             self.last_action = f"发送失败: {exc}"
             log.warning("autoreply send failed: %s", exc)
+    # Fixed line of last resort when we are @-ed and even the extra ask produced nothing.
     FORCED_FALLBACK = "在，你说。"
-    # 派活队列彻底溢出时的回执。宁可说一句"忙不过来"，也不能让人干等。
+    # Receipt for a completely overflowing dispatch queue. Better one "I am swamped" than silence.
     TASK_OVERFLOW_REPLY = "这边活排满了，过会儿再说。"
 
     async def _forced_reply(self, ev: dict) -> str:
-        """被 @ 时的硬兜底：模型没给话就再问一次，只要一句人话。
-        再不行用固定短句 —— 被点名还不吭声，用户只会觉得机器人死了。"""
+        """Hard fallback when @-ed: if the model gave nothing, ask once more for one plain line.
+        If that still fails, use a fixed sentence — staying silent when named only convinces
+        users the bot is dead."""
         who = ev.get("sender") or ev.get("user_id") or "有人"
         key = ev.get("group_id") or ev.get("user_id") or "?"
         try:
@@ -313,11 +334,12 @@ class AutoReply:
         return self.FORCED_FALLBACK
 
     async def _tick(self):
-        """按会话分桶，一群一段，各处理各的。
+        """Bucket by session: one segment per group, each handled on its own.
 
-        以前是把**所有群**的未读揉成一个批次：上下文取的是全局最近 N 条，
-        于是 A 群的梗会混进 B 群的判断，回复还发给最后一条所在的那个群。
-        现在每个群一份独立会话，水位线也各记各的。
+        It used to merge **every group's** unread into a single batch: the context was the
+        global last N messages, so group A's memes leaked into group B's judgement, and the
+        reply still went to the group of the last message. Now each group has its own session
+        and its own watermark.
         """
         if not self.agent or not self.agent.llm.configured:
             return
@@ -332,23 +354,28 @@ class AutoReply:
                 log.exception("会话 %s 处理失败，跳过（不影响其它群）", key)
 
     async def _tick_session(self, key: str, fresh: list):
-        """单个会话的一段未读消息。
+        """One segment of unread messages for a single session.
 
-        批量接话：隔一会儿扫一眼整段，而不是一条一条地接。
+        Batched replying: look at the whole segment every so often instead of answering one
+        message at a time.
 
-        以前是按条处理 —— 取 pending[0]，处理完把游标推到它的 id。
-        那一套带来两个问题：一是「跳着处理会把中间的消息一起划掉」这类游标 bug，
-        二是天然把机器人变成复读机：每条消息都被单独判断一次要不要回，
-        于是就开始逐条调 engagement，越调越拧巴。
+        It used to handle messages one by one — take pending[0], then push the cursor to its
+        id. Two problems came with that: cursor bugs like "processing out of order sweeps away
+        the messages in between", and it naturally turned the bot into a repeater: every
+        message was judged separately on whether to answer it, so engagement had to be tuned
+        per message and got more and more twisted.
 
-        人不是这个节奏。现在是：攒一段 → 整段交给模型 → 回一句或者沉默 →
-        处理完整批才推进标记。标记只会落在「模型真的看过的那条」上，
-        结构上就不可能跳读。
+        People are not on that tempo. Now: accumulate a segment → hand the whole segment to the
+        model → answer once or stay silent → advance the mark only after the whole batch is
+        handled. The mark only ever lands on "a message the model actually saw", so skipping
+        ahead is structurally impossible.
         """
-        # 积压太久就丢掉旧的，只接最近的。
-        # 上游一旦卡住（agent 跑满超时、模型变慢），积压会一直涨；等轮到某条时
-        # 它已经是几分钟前的了 —— 回一条三分钟前的消息，比不回更像坏了。
-        # 这里只对「整批里最老的那几条」动手，且保留至少一条，避免全丢。
+        # Drop the old part of the backlog and answer only the recent part.
+        # Once upstream stalls (agent hits its timeout, model slows down) the backlog keeps
+        # growing; by the time a message gets its turn it is already minutes old — answering a
+        # three-minute-old message looks more broken than not answering at all.
+        # Only the oldest entries of the batch are trimmed, and at least one is always kept,
+        # so nothing disappears entirely.
         max_age = getattr(self, "max_backlog_age", 120.0)
         if max_age > 0 and len(fresh) > 1:
             cut = time.time() - max_age
@@ -361,24 +388,28 @@ class AutoReply:
                                   "max_age": max_age}, "SKIPPED")
                 fresh = kept
 
-        # 派活的那条路**不进批处理**。Agent 自己就是多步带工具的，
-        # 让它在「这段闲聊要不要接」的批量决策里捎带决定，是两套逻辑搅在一起，
-        # 也容易把该干的活降级成一句敷衍。判据很直接：管理员在跟它说话
-        # （@ 了它，或者私聊）＝ 派活，直接叫 Agent 过来。
+        # The dispatch path **does not go through batch processing**. The Agent is itself a
+        # multi-step tool user; letting it decide "should I join this chit-chat" inside the
+        # batch decision mixes two logics and tends to degrade real work into one perfunctory
+        # line. The test is direct: an admin talking to it (@-ing it, or a private message)
+        # means dispatch, so call the Agent in right away.
         for ev in fresh:
             if self._wants_agent(ev):
-                # 先把整批记进历史（纯内存，很快），再接活 —— 这样接话循环
-                # 立刻就能看到最新语境，不用等 agent 干完。
+                # Record the whole batch in history first (pure memory, fast), then take the
+                # work — the reply loop then sees the latest context immediately instead of
+                # waiting for the agent to finish.
                 for e in fresh:
                     self.agent.observe(e)
-                # 扔后台：agent loop 最长要跑 agent_timeout(90s)，以前是 await 它，
-                # 于是整个接话循环停摆 90 秒，闲聊全排队，等轮到已经滞后好几分钟
-                # （实测 162 秒）。并发满时 _spawn_task 会排队，不再直接丢。
+                # Fire into the background: the agent loop can run for agent_timeout (90s) and
+                # this used to be awaited, which stalled the whole reply loop for 90 seconds;
+                # all the chit-chat queued up and was minutes behind by its turn (measured 162
+                # seconds). When concurrency is full, _spawn_task queues it rather than dropping.
                 scheduled = self._spawn_task(ev)
                 self.bus.mark_looked(fresh[-1]["id"], key)
                 if not scheduled:
-                    # 连等待队列都满了（极端积压）。水位线已经推进，所以不会重试，
-                    # 那就必须明确回一句 —— 否则用户等一个永远不会来的回复。
+                    # Even the wait queue is full (extreme backlog). The watermark has already
+                    # moved, so there will be no retry — we must answer explicitly, or the user
+                    # waits for a reply that never comes.
                     gid = ev.get("group_id") or ev.get("user_id") or ""
                     await self._send(ev, gid, self.TASK_OVERFLOW_REPLY, "派活队列溢出")
                 return
@@ -388,9 +419,10 @@ class AutoReply:
         oldest_at = fresh[0].get("at") or 0.0
         has_mention = any(e.get("mentions_me") for e in fresh)
 
-        # 攒一段再出手：最后一条之后先静默 settle 秒，免得有人话说到一半就插嘴。
-        # 被点名的不等 —— 叫你就该应。
-        # 群里一直热闹、永远静不下来的情况靠 max_batch_age 兜底，否则永远轮不到。
+        # Accumulate before acting: stay quiet for settle seconds after the last message so we
+        # do not cut into a sentence half-spoken. A mention does not wait — when called, answer.
+        # max_batch_age is the backstop for a group that never goes quiet, otherwise it would
+        # never be our turn.
         if not has_mention:
             if now - newest_at < self.settle_seconds and now - oldest_at < self.max_batch_age:
                 return
@@ -399,13 +431,14 @@ class AutoReply:
             log.info("autoreply: 每分钟上限，先攒着（积压 %d 条）", len(fresh))
             return
 
+        # If this decision succeeds, everything up to this id counts as handled.
         through = fresh[-1]["id"]
         try:
             decided = await self._compose(fresh, key)
         except Exception as exc:
             self.errors += 1
             log.exception("autoreply tick failed")
-            # 同一批连续失败就跳过它，别把后面的消息全堵死
+            # Skip a batch that keeps failing, so everything behind it does not get stuck.
             self._fail_count[through] = self._fail_count.get(through, 0) + 1
             if self._fail_count[through] >= self.max_retry:
                 log.warning("这一批连续失败 %d 次，跳过并推进标记（%s）",
@@ -419,14 +452,16 @@ class AutoReply:
         self._fail_count.pop(through, None)
         self.last_at = time.time()
 
+        # Reply to the newest message's conversation; the whole batch shares the same key.
         target = fresh[-1]
         gid = target.get("group_id") or target.get("user_id") or ""
-        # 模型可以一次给多条，交给 _send 分几次发出去
+        # The model can return several parts at once; _send sends them out over a few messages.
         replies = list(decided.get("replies") or [])
         if not replies and decided.get("reply"):
             replies = [decided["reply"]]
 
-        # 发送前最后一道净化：不管哪条路径产出的，看着像 JSON 就在这儿拦下
+        # Last purge before sending: whatever path produced it, anything that looks like JSON
+        # is stopped right here.
         cleaned: list[str] = []
         for part in replies:
             text, how = clean_reply(part)
@@ -436,8 +471,8 @@ class AutoReply:
                 log.warning("发送前净化：输出被判定为不可发送（%s），丢弃这一条", how)
         replies = cleaned
 
-        # 被 @ 就必须有回音：模型沉默、解析失败、超时、干活链路报错，统统兜底。
-        # 被点名还一声不吭，用户只会以为机器人死了。
+        # A mention must get an answer: model silence, parse failure, timeout, errors in the
+        # work path — all of them fall back. Staying mute when named convinces users the bot died.
         if not replies and has_mention:
             replies = [await self._forced_reply(target)]
             decided["reason"] = ((decided.get("reason") or "") + " ← @ 兜底").strip()
@@ -453,33 +488,37 @@ class AutoReply:
                              {"reason": why,
                               "academic": bool(decided.get("academic")),
                               "batch": len(fresh)}, "SUCCEEDED")
-        # 整批处理完才推进，而且只推进这个会话自己的水位线
+        # Advance only after the whole batch is handled, and only this session's own watermark.
         self.bus.mark_looked(through, key)
 
     @staticmethod
     def _wants_agent(ev: dict) -> bool:
-        """这条是不是在支使内置 Agent（带工具那种）。
+        """Whether this message is directing the built-in Agent (the tool-using one).
 
-        只有管理员开口才算数，而且必须是**在跟它说话**：@ 了它，或者私聊。
-        群里管理员之间闲聊不算 —— 否则又回到「管理员说啥都当命令」的老毛病，
-        那就是「冒泡」也会被回的根因。
+        Only an admin counts, and it must be **talking to it**: @-ing it, or a private
+        message. Chatter between admins in a group does not count — otherwise we are back to
+        the old "whatever an admin says is a command" bug, which is the root cause of
+        "bubbling" also getting a reply.
         """
         if str(ev.get("user_id") or "") not in config.admins:
             return False
         return bool(ev.get("mentions_me")) or ev.get("message_type") == "private"
 
     def _spawn_task(self, ev: dict) -> bool:
-        """把派活扔进后台，绝不阻塞接话循环。
+        """Throw the dispatched work into the background; never block the reply loop.
 
-        以前是 `await self._handle_task(...)`，agent loop 最长跑 agent_timeout(90s)，
-        这 90 秒里整个 `_loop` 停摆：闲聊不处理、水位线不推进，等它干完接着一条条
-        补，实测滞后到 162 秒。
+        It used to be `await self._handle_task(...)`, and the agent loop runs for up to
+        agent_timeout (90s). For those 90 seconds the whole `_loop` stalled: chit-chat went
+        unprocessed and the watermark did not move, then it caught up one by one afterwards —
+        measured lag reached 162 seconds.
 
-        **并发满时排队，不丢。** 原来的写法是并发满就 `return` 什么都不做，
-        而调用方已经先把水位线推过去了 —— 于是管理员 @ 了机器人，
-        任务没建、消息却已算处理完：**永无回复、无重试、无痕迹**。
-        现在满了就进等待队列，槽位一空立刻补上。
-        只有连队列都满（极端积压）才返回 False，由调用方明确告知用户。
+        **Queue when concurrency is full, do not drop.** The old code did `return` and nothing
+        when concurrency was full, while the caller had already advanced the watermark — so an
+        admin @-ed the bot, no task was created, and the message still counted as handled:
+        **never a reply, never a retry, never a trace**.
+        Now it goes into the wait queue and takes a slot the moment one frees up.
+        Only when even that queue is full (extreme backlog) does it return False, and the
+        caller tells the user explicitly.
         """
         self._drain_task_queue()
         if len(self._bg_tasks) >= self.max_concurrent_tasks:
@@ -499,27 +538,32 @@ class AutoReply:
         return True
 
     def _start_task(self, ev: dict):
+        # Keep a strong reference: asyncio only holds a weak one, so an unrooted task can be GC-ed.
         task = asyncio.create_task(self._handle_task(ev))
         self._bg_tasks.add(task)
         task.add_done_callback(self._on_task_done)
 
     def _on_task_done(self, task):
         self._bg_tasks.discard(task)
-        # 腾出槽位就立刻补下一个，别让队列干等
+        # A slot freed up: start the next one immediately, do not leave the queue waiting.
         self._drain_task_queue()
 
     def _drain_task_queue(self):
+        # Fill free slots from the queue in FIFO order: run on every dispatch attempt and
+        # whenever a task finishes.
         while self._task_queue and len(self._bg_tasks) < self.max_concurrent_tasks:
             self._start_task(self._task_queue.popleft())
 
     async def _handle_task(self, ev: dict):
-        """直接调用内置 Agent 干活，不走批量决策。
+        """Call the built-in Agent to do the work directly, skipping the batch decision.
 
-        历史已在调用方 observe 过，游标也已认领 —— 这里只管干和回。
+        The caller already observed the history and claimed the cursor — here it only does
+        the work and replies.
         """
         self.last_at = time.time()
         gid = ev.get("group_id") or ev.get("user_id") or ""
         who = ev.get("sender") or ev.get("user_id") or "?"
+        # Compact transcript of this session's last 12 messages, for the agent's context.
         convo = "\n".join(
             ("我" if x.get("is_self") else (x.get("sender") or "?")) + "：" + render_text(x)
             for x in self.bus.context(self.context_size, max_age=self.context_max_age,
@@ -545,9 +589,11 @@ class AutoReply:
                              {"reason": "agent 直派，无输出"}, "SUCCEEDED")
 
     async def _compose(self, fresh: list, key: str) -> dict:
-        """闲聊的批量决策。派活不走这里，见 _wants_agent / _handle_task。
+        """Batch decision for chit-chat. Dispatch does not come through here; see _wants_agent
+        and _handle_task.
 
-        上下文**只取这个会话的** —— A 群的对话不能出现在 B 群的判断里。
+        The context takes **only this session's** messages — group A's conversation must never
+        appear in group B's judgement.
         """
         for ev in fresh:
             self.agent.observe(ev)

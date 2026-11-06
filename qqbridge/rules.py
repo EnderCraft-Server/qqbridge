@@ -13,6 +13,8 @@ import json
 import re
 from pathlib import Path
 
+# Keywords that wake the model on the "keyword" tier; editable at runtime from
+# the console, so treat this list as a starting point rather than the truth.
 DEFAULT_KEYWORDS = [
     "机器人", "ai", "AI", "小鲸鱼", "大肥鱼", "deepseek", "DeepSeek",
     "帮我", "看下", "看看", "算一下", "解一下", "解释", "翻译",
@@ -34,6 +36,8 @@ class Rules:
                     self.keywords = [str(k) for k in data["keywords"]]
             except (OSError, ValueError):
                 pass
+        # Escape every keyword: they are literal strings supplied by an operator,
+        # not regular expressions. Compile once so matching stays cheap per event.
         self.patterns = [re.compile(re.escape(k), re.IGNORECASE) for k in self.keywords if k]
         return self
 
@@ -48,6 +52,8 @@ class Rules:
         return self.reload()
 
     def match(self, text: str) -> str | None:
+        # Return the pattern (= the escaped keyword) so callers can report which
+        # keyword fired; the caller only cares about "hit or not" otherwise.
         for pat in self.patterns:
             if pat.search(text or ""):
                 return pat.pattern

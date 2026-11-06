@@ -53,6 +53,8 @@ def build_tools(box: Toolbox, rules: Rules, sched: Scheduler, control: Control,
                 llm: LLM, agent: QqAgent, agent_loop: AgentLoop, local_tools: LocalTools):
     tools = []
 
+    # Registration helper: every @tool(...) appends one spec dict and returns the handler
+    # unchanged, so tests can still call the function directly in-process.
     def tool(name: str, description: str, schema: dict):
         def deco(fn):
             tools.append({"name": name, "description": description,
@@ -282,11 +284,15 @@ def build_tools(box: Toolbox, rules: Rules, sched: Scheduler, control: Control,
         if max_steps and int(max_steps) != agent_loop.max_steps:
             agent_loop.max_steps = max(1, min(int(max_steps), 20))
         system = agent.system_prompt + "\n\n你还可以使用工具读写文件、执行命令。改动前先看清楚目标。"
-        # 这条是外部 MCP 调用，**没有群上下文**：显式给它一份空目标的副本。
-        # 注意不能只把共享实例的字段清空 —— 清空发生在并发窗口之外，
-        # 正在跑的 autoreply 任务随时会把字段写成某个群，
-        # 于是 MCP 派出的 agent 就凭空获得了往那个群发图/群管理的能力。
-        # 要发图请用 MCP 的 send_image，要群管理请用 MCP 的 manage_group。
+        # This is an external MCP call with **no group context**: give it an explicit copy
+        # scoped to an empty target.
+        # Note: do not just clear the fields on the shared instance -- that clearing would
+        # happen outside the concurrency window, and a running autoreply task can write
+        # those fields back to some group at any moment, at which point the agent spawned
+        # by MCP would gain the ability to post images to / administer that group out of
+        # thin air.
+        # To send an image use the MCP send_image tool; for group management use the MCP
+        # manage_group tool.
         return await agent_loop.run(system, task, tools=local_tools.for_target(""))
 
     @tool("agent_log", "查看内置 Agent 的文件读写/命令执行日志。", {"type": "object",
@@ -318,14 +324,18 @@ def create_app() -> FastAPI:
               max_tokens=config.llm_max_tokens, temperature=config.llm_temperature,
               thinking=config.llm_thinking, reasoning_effort=config.llm_reasoning_effort,
               timeout=config.llm_timeout)
+    # Resolve the system prompt file: a relative value is anchored to the project root (the
+    # data dir's parent), a leading "/" means it is already absolute. The is_absolute() guard
+    # below covers drive-letter paths, which fail the "/" test but are absolute anyway.
     prompt_path = (config.data_dir.parent / config.system_prompt_file
                    if not config.system_prompt_file.startswith("/")
                    else __import__("pathlib").Path(config.system_prompt_file))
     if not prompt_path.is_absolute():
         prompt_path = config.data_dir.parent / config.system_prompt_file
     agent = QqAgent(llm, load_system_prompt(prompt_path, DEFAULT_SYSTEM), store=store)
-    # bot 必须在 local_tools 之前建 —— send_image 要用它。
-    # （之前顺序写反了，直接 UnboundLocalError，start.bat 一闪就退。）
+    # bot must be built before local_tools because send_image needs it.
+    # (The order used to be reversed; that raised UnboundLocalError straight away and
+    # made start.bat flash and exit.)
     bot = OneBot(config.http, config.ws, config.token, config.ws_token)
     local_tools = LocalTools(Path(config.agent_root) if config.agent_root else config.ROOT,
                              store, bot=bot)
@@ -346,6 +356,9 @@ def create_app() -> FastAPI:
         return [types.Tool(name=s["name"], description=s["description"], inputSchema=s["inputSchema"])
                 for s in specs]
 
+    # validate_input=False: argument checking is left to each handler (they all take **kw and
+    # apply their own defaults), so unknown keys from MCP clients are not rejected before the
+    # handler ever sees them.
     @protocol.call_tool(validate_input=False)
     async def call_tool(name: str, arguments: dict):
         from mcp import types
@@ -361,6 +374,9 @@ def create_app() -> FastAPI:
             log.exception("tool %s failed", name)
             return [types.TextContent(type="text", text=json.dumps({"error": str(exc), "error_code": "failed"}, ensure_ascii=False))]
 
+    # stateless=True: the transport keeps no per-session state, so a reconnecting client (or a
+    # retrying proxy) loses nothing. The allowlists must match the Host/Origin headers
+    # exactly, otherwise DNS-rebinding protection rejects the request.
     manager = StreamableHTTPSessionManager(
         protocol, json_response=True, stateless=True,
         security_settings=TransportSecuritySettings(
@@ -389,15 +405,17 @@ def create_app() -> FastAPI:
         global _MAIN_LOOP, _BOT
         _MAIN_LOOP = asyncio.get_running_loop()
         _BOT = bot
-        # 先回填再开工：反过来的话，WS 循环可能已经塞进来几条，
-        # 回填把游标推过去之后就留下几条没人管的僵尸 pending。
+        # Backfill first, then start work: the other way round, the WS loop may already
+        # have pushed a few events in, and the backfill would then advance the cursor past
+        # them, leaving a few zombie pending entries that nobody handles.
         try:
             bus.backfill(store.recent_events(config.ring_size))
         except Exception:
             log.exception("启动回填历史消息失败（控制台会从空列表开始）")
         await bot.start(on_event=lambda ev: _ingest(ev, bus, store, control))
-        # 关键：OneBot 启动后才拿得到自己的 QQ 号。bus 没有 self_id 的话，
-        # mentions_me 永远判 False —— @ 消息就进不了高优先级队列。
+        # Key point: our own QQ number is only known after OneBot has started. Without
+        # self_id on the bus, mentions_me is always False -- @-messages would never reach
+        # the high-priority queue.
         if bot.self_id:
             bus.self_id = str(bot.self_id)
             log.info("bus.self_id = %s（@ 判定已启用）", bus.self_id)
@@ -415,6 +433,8 @@ def create_app() -> FastAPI:
         await sched.stop()
         await bot.stop()
 
+    # The manager's run() context has to stay open for the whole app lifetime; park this task
+    # on an Event that is never set so the async-with block never exits on its own.
     async def _run_manager():
         async with manager.run():
             await asyncio.Event().wait()
@@ -433,7 +453,8 @@ def create_app() -> FastAPI:
     COOKIE = "qqbridge_session"
 
     def _ui_auth(request: Request):
-        """控制台接口的鉴权：优先登录态 cookie，其次兼容 mcp_token（脚本自动化）。"""
+        """Auth for console endpoints: prefer the login cookie, then accept mcp_token
+        (for scripted automation)."""
         hdr = request.headers.get("x-bridge-token")
         if hdr and config.mcp_token and hdr == config.mcp_token:
             return
@@ -442,7 +463,7 @@ def create_app() -> FastAPI:
             return
         raise HTTPException(401, "未登录或登录已过期")
 
-    # ---------- 登录 / 协议 ----------
+    # ---------- Login / agreements ----------
     def _set_session(response: Response, token: str):
         response.set_cookie(COOKIE, token, max_age=7 * 24 * 3600, httponly=True,
                             samesite="lax", path="/")
@@ -460,15 +481,15 @@ def create_app() -> FastAPI:
 
     @app.post("/api/auth/accept")
     async def auth_accept(request: Request, response: Response):
-        """首次进入：勾选同意协议 + 设置后台账号密码。"""
+        """First visit: accept the agreements + set the console account and password."""
         body = await request.json()
         if not body.get("agreed"):
             raise HTTPException(400, "需要先同意《使用须知》与《最终用户许可协议》")
         user = str(body.get("username") or "")
         pwd = str(body.get("password") or "")
         try:
-            auth.accept(user, pwd)          # 记录协议同意 + 建账号
-            token = auth.login(user, pwd)   # 随即建立登录态
+            auth.accept(user, pwd)          # record agreement + create account
+            token = auth.login(user, pwd)   # then establish the login session
         except ValueError as exc:
             raise HTTPException(400, str(exc))
         _set_session(response, token)
@@ -505,9 +526,11 @@ def create_app() -> FastAPI:
         store.audit("gui", "auth_password", auth.data.get("username", ""), {}, "SUCCEEDED")
         return {"ok": True}
 
-    # ---------- 图片代理 ----------
-    # QQ 图床的 rkey 是签名过的临时链接。让浏览器直连有两个风险：
-    # Referer 被挡、以及以后换域名。统一走后端取，顺便做主机白名单防 SSRF。
+    # ---------- Image proxy ----------
+    # The rkey of the QQ image CDN is a signed, temporary link. Pointing the browser
+    # straight at it carries two risks: the Referer gets blocked, and the domain may
+    # change later. So fetch everything through the backend, and add a host allowlist
+    # against SSRF while we are at it.
     IMAGE_HOST_OK = ("multimedia.nt.qq.com.cn", "multimedia.qpic.cn", "gchat.qpic.cn")
     IMAGE_SUFFIX_OK = (".qpic.cn", ".qq.com")
     IMAGE_MAX_BYTES = 12 * 1024 * 1024
@@ -542,6 +565,8 @@ def create_app() -> FastAPI:
             ctype = (resp.headers.get("content-type") or "image/jpeg").split(";")[0].strip()
             if not ctype.startswith("image/"):
                 raise HTTPException(415, f"返回的不是图片：{ctype}")
+            # Crude but sufficient memory bound: past 60 entries drop the whole cache. A real
+            # LRU would be nicer, but these URLs are short-lived anyway.
             if len(_img_cache) > 60:
                 _img_cache.clear()
             _img_cache[u] = (body, ctype)
@@ -567,7 +592,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/qzone/post")
     async def api_qzone_post(request: Request):
-        """立刻发一条（用于测试主题与口吻）。"""
+        """Post one immediately (to test the theme and tone)."""
         _ui_auth(request)
         body = {}
         try:
@@ -597,13 +622,14 @@ def create_app() -> FastAPI:
     @app.get("/api/events")
     async def api_events(request: Request, limit: int = 25):
         _ui_auth(request)
-        limit = max(1, min(int(limit), 200))     # 防负数 LIMIT 把整表倒出来
+        limit = max(1, min(int(limit), 200))     # negative LIMIT would dump the table
         with bus._lock:
             events = list(bus._events)[-limit:]
             seen_at = bus._seen_at
         out = []
         for e in events:
-            # 优先级现算：水位线之后的才算待处理，否则只是"库里的历史"
+            # Priority is computed on the fly: only events past the watermark count as
+            # pending; anything before it is just stored history.
             if e["is_self"] or e["at"] <= seen_at:
                 prio = "stored"
             elif e.get("mentions_me"):
@@ -622,6 +648,8 @@ def create_app() -> FastAPI:
         if control.paused():
             return {"events": [], "count": 0, "cursor": cursor, "empty": True,
                     "paused": True, "mode": control.mode}
+        # ?groups= overrides the configured watch list; an empty result here (no param and no
+        # configured groups) means "watch everything", which the `if wanted` below encodes.
         wanted = {g.strip() for g in groups.split(",") if g.strip()} or set(config.watch_groups)
         with bus._lock:
             events = [e for e in bus._events if e["id"] > cursor]
@@ -700,6 +728,8 @@ def create_app() -> FastAPI:
                     {"api_base": llm.api_base, "auto_reply": config.auto_reply}, "SUCCEEDED")
         return {"llm": llm.describe(), "auto_reply": config.auto_reply}
 
+    # Rewrite .env line by line so unrelated keys survive, and append when LLM_API_KEY is not
+    # there yet. The key ends up in plain text -- that is the convention this project uses.
     def _persist_key(key: str):
         env = config.ROOT / ".env"
         try:
@@ -756,8 +786,12 @@ def create_app() -> FastAPI:
 
     @app.get("/api/groups")
     async def api_groups(request: Request, refresh: int = 0):
-        """机器人实际加入的群，供控制台用勾选框选监控范围。
-        以前这里是让用户手打群号，打错、或者被 4 秒一次的刷新冲掉，就变成「改了没用」。"""
+        """Groups the bot has actually joined, so the console can pick the watched set
+        with checkboxes.
+
+        This used to make users type group numbers by hand; a typo, or the refresh every
+        4 seconds wiping the input, turned it into "I changed it and nothing happened".
+        """
         _ui_auth(request)
         try:
             rows = await box.list_groups(refresh=bool(refresh))
@@ -775,7 +809,8 @@ def create_app() -> FastAPI:
             out.append({"group_id": gid, "name": r.get("name") or "",
                         "member_count": r.get("member_count") or 0,
                         "watched": gid in watched})
-        # 配置里有、但机器人已不在（或接口没返回）的群，也要显示出来，免得看起来像被吞了
+        # Also show groups that are in the config but that the bot has left (or that the
+        # API did not return), so they do not look like they were swallowed.
         for gid in sorted(watched - seen):
             out.append({"group_id": gid, "name": "（不在机器人的群列表里）",
                         "member_count": 0, "watched": True})
@@ -803,12 +838,14 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health():
-        """**无鉴权**的存活探针 —— 所以只能给"活着没有"，不能给配置。
+        """An **unauthenticated** liveness probe -- so it may only say "is it alive", never
+        configuration.
 
-        以前这里直接返回 box.get_status()，里面含 config.describe()，
-        也就是 OWNER_IDS / ADMIN_IDS / 监控群号全都能被任何能连到这个端口的人读到。
-        而 OWNER_IDS 正是所有 MCP 写操作的授权凭据 —— 等于把"谁能下命令"
-        明文挂在网上。要完整状态请走 /api/status（有鉴权）。
+        This used to return box.get_status() directly, which contains config.describe(),
+        i.e. OWNER_IDS / ADMIN_IDS / the watched group numbers were all readable by anyone
+        who could reach this port. And OWNER_IDS is exactly the credential that authorizes
+        every MCP write operation -- that amounts to publishing "who may issue commands"
+        in plain text on the internet. For full state use /api/state (which is authenticated).
         """
         return JSONResponse({
             "ok": True,
@@ -823,6 +860,9 @@ def create_app() -> FastAPI:
             return await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
         await manager.handle_request(scope, receive, send)
 
+    # MCP lives under config.path. Register both the bare path and the trailing-slash form:
+    # clients differ on whether they append a slash, and a mismatch here shows up as a
+    # confusing 404 instead of an auth error.
     from starlette.routing import Mount
     app.router.routes.append(Mount(config.path, app=endpoint))
     app.router.routes.append(Mount(config.path + "/", app=endpoint))
@@ -830,23 +870,25 @@ def create_app() -> FastAPI:
     return app
 
 
-# 控制类回执需要从 WS 线程发消息：这里保存主循环与 bot 引用。
+# Control replies have to send messages from the WS thread, so cache the main event loop and
+# a bot reference here.
 _MAIN_LOOP = None
 _BOT = None
 
 
 def _reply(control, conversation: str, text: str):
-    """控制类回执：直接发出去，不进队列、不触发模型。"""
+    """Control reply: send it directly; it never enters the queue and never wakes the model."""
     try:
         conv = str(conversation or "")
         if not conv.isdigit():
             log.info("control reply (bad target): %s", text)
             return
-        is_group = int(conv) > 1000000000      # QQ 群号量级
+        is_group = int(conv) > 1000000000      # QQ group numbers are on this scale
         if _BOT is None or _MAIN_LOOP is None:
             log.info("control reply (bot not ready): %s", text)
             return
-        # 不等待结果：这是在 WebSocket 事件线程里，阻塞会拖住事件流。
+        # Do not wait for the result: we are on the WebSocket event thread, and blocking
+        # here would stall the event stream.
         fut = asyncio.run_coroutine_threadsafe(
             _BOT.call("send_group_msg" if is_group else "send_private_msg",
                       **({"group_id": int(conv)} if is_group else {"user_id": int(conv)}),
@@ -861,12 +903,12 @@ def _reply(control, conversation: str, text: str):
 
 def _ingest(event: dict, bus: EventBus, store: Store, control: "Control" = None):
     """Callback from the WebSocket thread: store + queue. Never touches the model."""
-    # 管理员命令在入队前拦下
+    # Intercept admin commands before they are queued
     if control is not None and event.get("post_type") == "message":
         raw = event.get("raw_message") or ""
         sender = str(event.get("user_id") or "")
 
-        # 运行开关：/stop 与 /auto（带明确回执）
+        # Run switch: /stop and /auto (with an explicit acknowledgement)
         target = commands.parse(raw)
         if target:
             gid = event.get("group_id") or event.get("user_id")
@@ -876,8 +918,10 @@ def _ingest(event: dict, bus: EventBus, store: Store, control: "Control" = None)
             control.set(target, actor=sender, reason=raw.strip()[:80])
             _reply(control, gid, commands.reply_for(target))
             log.info("control: %s -> %s by %s", raw.strip()[:20], target, sender)
-            return                  # 命令本身不入库、不入队
+            return                  # the command itself is neither stored nor queued
 
+    # Only message events come back from push(); anything else (heartbeats, notices) is
+    # dropped right here and never reaches the store.
     record = bus.push(event)
     if record:
         try:

@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""qqbridge 自测：控制台门禁（协议/登录）、自动说说、REST 路由。
+"""qqbridge self-test: console gate (agreement/login), Qzone auto-posting, REST routes.
 
-不依赖网络、不碰真实 data 目录：全部在临时目录里跑。
-运行：python tests/test_auth_qzone.py
+No network access and no touching the real data directory: everything runs inside a
+temporary directory.
+Run: python tests/test_auth_qzone.py
 """
 import json, sys, tempfile, time
 from pathlib import Path
@@ -58,34 +59,38 @@ q.save({"enabled": True, "mode": "interval", "interval_hours": 12, "min_gap_hour
         "quiet_hours": [], "order": "rotate", "active_themes": ["daily", "code"]})
 assert q.due() is True, "刚启用、没发过，应该到点"
 assert q.pick_theme()["id"] in ("daily", "code")
+# post_once() is a coroutine; asyncio is imported inline to keep this script linear.
 r = __import__("asyncio").run(q.post_once())
 assert r["ok"] and sent and sent[0][0] == "publish"
 assert sent[0][1]["text"] == "今天服务器又崩了一次，重启完发现是我自己改坏的。", sent[0]
 assert q.due() is False, "刚发过，min_gap 内不应再发"
 assert q.status()["posted"] == 1
-# 静默时段
+# Quiet hours; the window may wrap past midnight, so 02:00 is inside and 12:00 is out.
 q.save({"quiet_hours": [["23:30", "08:00"]]})
 assert q.in_quiet_hours(time.mktime(time.strptime("2024-01-01 02:00", "%Y-%m-%d %H:%M"))) is True
 assert q.in_quiet_hours(time.mktime(time.strptime("2024-01-01 12:00", "%Y-%m-%d %H:%M"))) is False
-# 每天时刻模式
+# Explicit times of day (daily mode)
 q.save({"mode": "daily", "daily_times": ["12:30", "21:00"], "quiet_hours": [], "enabled": True})
 assert q._next_in() is not None
-# 关掉就不发
+# Disabled means nothing is ever due
 q.save({"enabled": False})
 assert q.due() is False
-# 主题时间窗：深夜主题在白天不能被选中
+# Theme time windows: the late-night theme must not be pickable during the day
 q.save({"enabled": True, "mode": "interval", "order": "random", "quiet_hours": [],
         "active_themes": [t["id"] for t in q.cfg["themes"]]})
 def _at(hhmm):
     return time.mktime(time.strptime("2024-06-01 " + hhmm, "%Y-%m-%d %H:%M"))
 assert q.in_quiet_hours(_at("02:00")) is False
+# pick_theme is random, so each time of day is sampled 300 times: a single draw could
+# miss a theme purely by luck and make this test flaky.
 day = {q.pick_theme(_at("14:00"))["id"] for _ in range(300)}
 night = {q.pick_theme(_at("23:00"))["id"] for _ in range(300)}
 assert "late" not in day, "深夜主题不该出现在下午:" + str(day)
 assert "late" in night, "深夜主题应当出现在夜里:" + str(night)
 q.save({"quiet_hours": [["23:30", "08:00"]]})
 assert q.in_quiet_hours(_at("02:00")) is True and q.in_quiet_hours(_at("12:00")) is False
-# 关键回归：last_post_at 必须能跨重启读回来，否则每次重启都会立刻再发一条
+# Key regression: last_post_at has to survive a restart, otherwise every restart
+# posts another item right away
 q.save({"enabled": True, "mode": "interval", "interval_hours": 12, "min_gap_hours": 4,
         "quiet_hours": [], "last_post_at": time.time()})
 q2 = QzoneAuto(tmp / "qzone.json", FakeLLM(), FakeBot())
@@ -94,7 +99,7 @@ assert q2.due() is False, "刚发过、min_gap 内，重启后不应立刻再发
 assert q2.status()["posted"] == 1, "历史也要读得回来"
 ok.append("QzoneAuto: 到点判定/生成/发送/静默时段/主题时间窗/落库/重启不重复发 全部正确")
 
-# ---- 路由（不跑 lifespan，避免连 OneBot）----
+# ---- Routes (lifespan is never run, so no OneBot connection is attempted) ----
 tmp2 = tmp / "app"; tmp2.mkdir()
 config.data_dir = tmp2
 from qqbridge.server import create_app
@@ -105,6 +110,7 @@ r = c.get("/api/auth/state"); assert r.status_code == 200 and r.json()["agreed"]
 r = c.get("/api/auth/agreements")
 j = r.json()
 assert "无法保证" in j["terms"] and "EnderCraft" in j["eula"] + j["terms"], "协议要点缺失"
+# The gate in order: nothing accepted yet -> /api/state is 401 -> accept -> 200.
 r = c.get("/api/state"); assert r.status_code == 401, "未登录竟然能读 /api/state"
 r = c.post("/api/auth/accept", json={"username": "ender", "password": "pw12345678", "agreed": True})
 assert r.status_code == 200, r.text
@@ -119,7 +125,7 @@ r = c.post("/api/qzone", json={"themes": r.json()["themes"] + [{"id": "x1", "nam
 assert len(r.json()["themes"]) == n + 1
 r = c.post("/api/auth/accept", json={"username": "other", "password": "pw12345678", "agreed": True})
 assert r.status_code == 400, "重复初始化应当被拒绝"
-# 图片代理的主机白名单：不能变成任意 URL 的 SSRF 跳板
+# The image proxy's host allowlist: it must not become an SSRF hop for arbitrary URLs
 for bad in ["https://evil.example.com/a.png", "http://multimedia.nt.qq.com.cn/a.png",
             "https://127.0.0.1/a.png", "https://169.254.169.254/latest/meta-data/",
             "file:///C:/Windows/win.ini", ""]:
