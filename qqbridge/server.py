@@ -348,6 +348,15 @@ def create_app() -> FastAPI:
     specs = build_tools(box, rules, sched, control, llm, agent, agent_loop, local_tools)
     by_name = {s["name"]: s for s in specs}
 
+    # Fail with something actionable instead of the bare AttributeError that `mcp` 2.x
+    # produces here: its lowlevel Server dropped the list_tools()/call_tool() decorators
+    # in favour of add_request_handler(), and this module is written against the 1.x API.
+    if not hasattr(Server, "list_tools") or not hasattr(Server, "call_tool"):
+        raise RuntimeError(
+            "Unsupported mcp version: qqbridge needs the 1.x decorator API "
+            "(Server.list_tools / Server.call_tool). Run: "
+            'pip install "mcp>=1.0,<2"'
+        )
     protocol = Server("qqbridge", version="0.1.0", instructions=INSTRUCTIONS)
 
     @protocol.list_tools()
